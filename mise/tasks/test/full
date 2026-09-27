@@ -1,0 +1,4 @@
+#!/usr/bin/env ruby
+#MISE description="The addon's whole suite, the scale test on both engines and up to a million actors included"
+
+exec('mise', 'run', 'test', '--full')

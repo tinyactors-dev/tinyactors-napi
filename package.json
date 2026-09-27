@@ -1,0 +1,44 @@
+{
+  "name": "@tinyactors/node",
+  "version": "0.1.0",
+  "description": "Tinyactors for Node.js and Bun: SCXML statecharts as actors, on a native runtime",
+  "keywords": [
+    "actor",
+    "actors",
+    "statechart",
+    "scxml",
+    "state-machine",
+    "napi",
+    "bun"
+  ],
+  "homepage": "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-napi#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dhamidi/tinyactors.git",
+    "directory": "tinyactors-napi"
+  },
+  "bugs": {
+    "url": "https://github.com/dhamidi/tinyactors/issues"
+  },
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.14"
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/core": "2.11.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.222.0",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-metrics": "2.11.0",
+    "@opentelemetry/sdk-trace-base": "2.11.0",
+    "xstate": "^5.33.2"
+  }
+}

@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+#MISE description="Fail when tracing's off and sampled-out paths exceed their budgets (napi ADR 0017 section 2)"
+# vim:ft=ruby
+
+# The tracing bench in --check mode, on Node and Bun: a traceparent on an
+# untraced system, and a sampled-out macrostep with a sink installed, each
+# cost at most 40 ns per event more than untraced. It is not part of
+# `mise run test`: a 40 ns budget on a ~440 ns event is within the noise of
+# a shared machine, so a timing gate there would fail at random. Run it on
+# a quiet machine before and after changing the delivery or trace path.
+
+root = File.expand_path('../..', __dir__)
+%w[node bun].each do |runtime|
+  pid = Process.spawn(runtime, 'test/bench/tracing.js', '--check', chdir: root)
+  _pid, status = Process.wait2(pid)
+  exit(status.exitstatus || 1) unless status.success?
+end

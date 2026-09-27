@@ -1,0 +1,13 @@
+{
+  "arch": "arm64",
+  "cores": 16,
+  "cpu": "Apple M4 Max",
+  "efficiencyCores": 4,
+  "lowPowerMode": false,
+  "os": "macOS 26.6.2",
+  "performanceCores": 12,
+  "powerSource": "AC Power",
+  "ramBytes": 51539607552,
+  "runtime": "bun",
+  "runtimeVersion": "1.4.1"
+}

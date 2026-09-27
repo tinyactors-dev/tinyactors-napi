@@ -1,0 +1,130 @@
+#!/usr/bin/env ruby
+#MISE description="Release @tinyactors/node: check, version, build every target, verify, pack and smoke test; with --publish, also publish to npm, tag, and create the GitHub release"
+#USAGE arg "<version>" help="The version to release, MAJOR.MINOR.PATCH"
+#USAGE flag "--publish" help="Commit the version, tag it, publish to npm, push, and create the GitHub release"
+#USAGE flag "--skip-containers" help="Leave out the Docker smoke tests (glibc/musl, arm64 under qemu)"
+# vim:ft=ruby
+
+# docs/adr/0001-packaging-and-releases.md. The stages:
+#
+# 1. Check: a clean main in step with origin, a new version whose tag is free,
+#    not on npm yet, and the napi suite passing (`mise run test` here: the
+#    projects this one builds against are covered by their own releases).
+# 2. Version: package.json's version, in the working tree only.
+# 3. Build every release target, 4. verify their symbols, 5. pack the five
+#    npm packages and smoke test them, on this machine and in containers.
+# 6. Publish (--publish only): commit `release(napi): v<version>`, tag
+#    `tinyactors-napi/v<version>` with the notes, publish the platform
+#    packages and then @tinyactors/node, push, and create the GitHub release
+#    with the tarballs and SHA256SUMS.
+#
+# Without --publish, nothing is committed, tagged or uploaded: package.json
+# is restored at the end, and build/npm/ keeps the tarballs, notes and
+# SHA256SUMS that --publish would upload.
+
+require 'fileutils'
+require 'json'
+require 'pathname'
+require 'release'
+
+ROOT = Pathname.new(__dir__).join('../..').expand_path
+PACKAGE_JSON = ROOT.join('package.json')
+TARBALLS = ROOT.join('build/npm/tarballs')
+RELEASE = ROOT.join('build/npm/release')
+TARGETS = %w[aarch64-macos x86_64-macos x86_64-linux aarch64-linux].freeze
+PLATFORMS = %w[darwin-arm64 darwin-x64 linux-x64 linux-arm64].freeze
+PREFIX = 'tinyactors-napi/'
+
+version = ENV['usage_version'].to_s
+version = ARGV.find { |arg| !arg.start_with?('--') }.to_s if version.empty?
+publish = ENV['usage_publish'] == 'true' || ARGV.include?('--publish')
+containers = !(ENV['usage_skip_containers'] == 'true' || ARGV.include?('--skip-containers'))
+Release.fail!('usage: mise run release -- <version> [--publish] [--skip-containers]') if version.empty?
+
+def napi(*task)
+  Release.run('mise', 'run', *task, chdir: ROOT)
+end
+
+# 1. Check.
+Release.check_tree!
+tag = Release.check_version!(PREFIX, version)
+names = ['@tinyactors/node'] + PLATFORMS.map { |platform| "@tinyactors/node-#{platform}" }
+taken = names.select { |name| Release.npm_published?(name, version) }
+Release.fail!("npm already has #{taken.map { |name| "#{name}@#{version}" }.join(', ')}") unless taken.empty?
+Release.fail!('fnox has no NPM_TOKEN (fnox list)') if publish && !Release.npm_token?
+Release.fail!('the registry does not accept NPM_TOKEN (npm whoami failed)') if publish && !Release.npm_authenticated?
+napi('test')
+
+# 2. Version, in the working tree; restored unless the release commits it.
+original = PACKAGE_JSON.read
+committed = false
+begin
+  Release.fail!('package.json has no version field') unless original.match?(/^\s*"version":\s*"[^"]*"/)
+  updated = original.sub(/^(\s*"version":\s*)"[^"]*"/) { "#{Regexp.last_match(1)}\"#{version}\"" }
+  PACKAGE_JSON.write(updated)
+
+  # 3. Build, 4. verify.
+  TARGETS.each { |target| napi('build', '--target', target) }
+  napi('symbols')
+
+  # 5. Pack and smoke test.
+  napi('package')
+  napi('smoke-install')
+  if containers
+    napi('smoke-packages')
+  else
+    puts 'release: --skip-containers: no glibc/musl or arm64 smoke test ran'
+  end
+
+  FileUtils.mkdir_p(RELEASE)
+  main = TARBALLS.join("tinyactors-node-#{version}.tgz")
+  platforms = PLATFORMS.map { |platform| TARBALLS.join("tinyactors-node-#{platform}-#{version}.tgz") }
+  missing = ([main] + platforms).reject(&:file?)
+  Release.fail!("package did not write #{missing.map { |t| t.basename.to_s }.join(', ')}") unless missing.empty?
+  notes = RELEASE.join('notes.md')
+  notes.write(Release.notes(
+    prefix: PREFIX, path: 'tinyactors-napi/', title: "@tinyactors/node #{version}",
+    summary: 'The first release of @tinyactors/node: SCXML statecharts as actors for Node.js and Bun, ' \
+             'on a native runtime. Prebuilt for macOS (arm64, x64) and Linux (x64, arm64; one addon for ' \
+             'glibc and musl), so installing needs no compiler.'
+  ))
+  sums = Release.write_sha256sums(platforms + [main], RELEASE.join('SHA256SUMS'))
+
+  unless publish
+    puts <<~DRY
+      release: dry run for @tinyactors/node #{version} passed; nothing was committed, tagged or uploaded.
+        would tag:     #{tag}
+        would publish: #{(platforms + [main]).map { |t| t.basename.to_s }.join(', ')}
+        notes:         #{notes.relative_path_from(ROOT)}
+        checksums:     #{Pathname.new(sums).relative_path_from(ROOT)}
+      Publish with: mise run //tinyactors-napi:release -- #{version} --publish
+    DRY
+    exit 0
+  end
+
+  # 6. Publish.
+  subject = "release(napi): v#{version}"
+  Release.commit_and_tag!(paths: [PACKAGE_JSON], subject: subject, tag: tag, notes_file: notes)
+  committed = true
+  published, failed = Release.npm_publish!(platforms + [main])
+  if failed && published.empty?
+    # Nothing reached npm: the release did not happen, so neither do its
+    # commit and tag. A retry starts from a clean tree.
+    Release.undo_commit_and_tag!(subject: subject, tag: tag)
+    Release.fail!("npm publish #{failed.basename} failed; nothing was published, and the commit and tag are undone")
+  elsif failed
+    left = (platforms + [main]) - published
+    Release.fail!(<<~STOPPED)
+      npm publish #{failed.basename} failed; stopping. The commit and tag stay: npm has some packages.
+        published: #{published.map { |t| t.basename.to_s }.join(', ')}
+        left, to publish by hand in this order (fnox exec -- npm publish <tgz> --access public):
+          #{left.map(&:to_s).join("\n      ")}
+      Then push the commit and tag, and create the GitHub release.
+    STOPPED
+  end
+  Release.push_and_release!(tag: tag, title: "@tinyactors/node #{version}", notes_file: notes,
+                            assets: platforms + [main, Pathname.new(sums)])
+  puts "release: published @tinyactors/node #{version}, tagged #{tag}"
+ensure
+  PACKAGE_JSON.write(original) unless committed
+end

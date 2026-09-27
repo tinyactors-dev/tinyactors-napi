@@ -1,0 +1,61 @@
+#!/usr/bin/env ruby
+#MISE description="Install the packed @tinyactors/node tarballs in Docker containers, under glibc and musl, on x64 and arm64 (qemu), with npm and Bun, and run test/smoke/smoke.js in each"
+#USAGE flag "--images <names>" help="Comma-separated subset of the images below, by their label"
+# vim:ft=ruby
+
+# One Linux addon serves glibc and musl (docs/adr/0001, decision 10); this
+# is where that is checked on a packed release. Each container gets the
+# tarballs from `mise run package` and test/smoke/ read-only, installs the
+# main package and its architecture's platform package by path into a
+# fresh directory, and runs the smoke script. arm64 runs under qemu
+# (binfmt), so it is a smoke test only: the full suites' timing assertions
+# fail there. Containers run one at a time. Needs Docker, and a user in
+# the docker group.
+
+require 'pathname'
+
+ROOT = Pathname.new(__dir__).join('../..').expand_path
+TARBALLS = ROOT.join('build/npm/tarballs')
+SMOKE = ROOT.join('test/smoke')
+
+# label => [image, docker platform, npm cpu, engine]
+IMAGES = {
+  'node-alpine-x64' => ['node:22-alpine', 'linux/amd64', 'x64', :npm],
+  'node-bookworm-x64' => ['node:22-bookworm-slim', 'linux/amd64', 'x64', :npm],
+  'node-alpine-arm64' => ['node:22-alpine', 'linux/arm64', 'arm64', :npm],
+  'node-bookworm-arm64' => ['node:22-bookworm-slim', 'linux/arm64', 'arm64', :npm],
+  'bun-debian-x64' => ['oven/bun:1', 'linux/amd64', 'x64', :bun],
+  'bun-alpine-x64' => ['oven/bun:1-alpine', 'linux/amd64', 'x64', :bun]
+}.freeze
+
+requested = ENV['usage_images'].to_s
+requested = ARGV[ARGV.index('--images') + 1].to_s if requested.empty? && ARGV.include?('--images')
+labels = requested.empty? ? IMAGES.keys : requested.split(',').map(&:strip)
+unknown = labels - IMAGES.keys
+abort "smoke-packages: unknown images #{unknown.join(', ')}; known: #{IMAGES.keys.join(', ')}" unless unknown.empty?
+
+main = Dir[TARBALLS.join('tinyactors-node-[0-9]*.tgz').to_s].first
+abort 'smoke-packages: no packed tarballs; run `mise run package` first' unless main
+
+results = labels.map do |label|
+  image, platform, cpu, engine = IMAGES.fetch(label)
+  addon = Dir[TARBALLS.join("tinyactors-node-linux-#{cpu}-*.tgz").to_s].first
+  unless addon
+    puts "#{label}: no linux-#{cpu} tarball; package that target"
+    next [label, false]
+  end
+  install = engine == :npm ? 'npm install --no-audit --no-fund --silent' : 'bun add --silent'
+  run = engine == :npm ? 'node smoke.js' : 'bun smoke.js'
+  script = "set -e; mkdir /work; cp /smoke/* /work/; cd /work; " \
+           "#{install} /tarballs/#{File.basename(main)} /tarballs/#{File.basename(addon)}; #{run}"
+  puts "#{label}: #{image} (#{platform})"
+  $stdout.flush
+  ok = system('docker', 'run', '--rm', '--platform', platform,
+              '-v', "#{TARBALLS}:/tarballs:ro", '-v', "#{SMOKE}:/smoke:ro", image, 'sh', '-c', script)
+  [label, ok]
+end
+
+puts
+results.each { |label, ok| puts format('  %-4s  %s', ok ? 'pass' : 'FAIL', label) }
+failed = results.reject(&:last).map(&:first)
+abort "smoke-packages: failed: #{failed.join(', ')}" unless failed.empty?

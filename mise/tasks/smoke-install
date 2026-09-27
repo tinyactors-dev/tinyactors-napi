@@ -1,0 +1,47 @@
+#!/usr/bin/env ruby
+#MISE description="Install the packed @tinyactors/node tarballs into a fresh project with npm and with Bun, and run test/smoke/smoke.js under each"
+# vim:ft=ruby
+
+# Uses build/npm/tarballs/ from `mise run package`: the main package and
+# this machine's platform package, installed by path. The other platform
+# packages the main package depends on are optional and skipped, as they
+# are in a real install on this machine.
+
+require 'fileutils'
+require 'pathname'
+require 'rbconfig'
+require 'tmpdir'
+
+ROOT = Pathname.new(__dir__).join('../..').expand_path
+TARBALLS = ROOT.join('build/npm/tarballs')
+
+platform = case RbConfig::CONFIG['host_os']
+           when /linux/ then 'linux'
+           when /darwin/ then 'darwin'
+           else abort "smoke-install: no platform package for #{RbConfig::CONFIG['host_os']}"
+           end
+cpu = case RbConfig::CONFIG['host_cpu']
+      when /x86_64|amd64/ then 'x64'
+      when /aarch64|arm64/ then 'arm64'
+      else abort "smoke-install: no platform package for #{RbConfig::CONFIG['host_cpu']}"
+      end
+main = Dir[TARBALLS.join('tinyactors-node-[0-9]*.tgz').to_s].first
+addon = Dir[TARBALLS.join("tinyactors-node-#{platform}-#{cpu}-*.tgz").to_s].first
+abort 'smoke-install: no packed tarballs; run `mise run package` first' unless main && addon
+
+def run(*command, chdir:)
+  pid = Process.spawn(*command, chdir: chdir.to_s)
+  _pid, status = Process.wait2(pid)
+  abort "smoke-install: #{command.join(' ')} failed" unless status.success?
+end
+
+[
+  [%w[npm install --no-audit --no-fund --silent], %w[node smoke.js]],
+  [%w[bun add --silent], %w[bun smoke.js]]
+].each do |install, smoke|
+  Dir.mktmpdir('tinyactors-smoke') do |dir|
+    FileUtils.cp(Dir[ROOT.join('test/smoke/*').to_s], dir)
+    run(*install, main, addon, chdir: dir)
+    run(*smoke, chdir: dir)
+  end
+end

@@ -1,0 +1,41 @@
+#!/usr/bin/env ruby
+#MISE description="Run the tracing bench on Node and Bun, report throughput and memory, and store the records by machine signature"
+#USAGE arg "[population]" var=#true help="Actors per run (default 100000)"
+#USAGE flag "--variants <list>" help="Comma-separated variants (untraced always runs)"
+#USAGE flag "--runtimes <list>" help="Comma-separated runtimes (default node,bun)"
+# vim:ft=ruby
+
+# Usage: mise run bench [population ...] [--variants=a,b] [--runtimes=node,bun]
+#
+# Runs test/bench/tracing.js for each runtime and population, prints one
+# table per run with throughput and memory side by side, and appends the
+# records to bench/results/<machine signature>/<commit>.jsonl (see
+# bench/results/README.md). Not part of `mise run test`: too slow and too
+# noisy. To compare two builds, use `mise run bench-compare <commit>`,
+# which runs them alternately on this machine.
+
+require_relative '../lib/napi/bench'
+
+options = NapiBench.parse(ARGV)
+root = NapiBench::ROOT
+build_pid = Process.spawn('mise', 'run', 'build', chdir: root, out: File::NULL)
+_pid, status = Process.wait2(build_pid)
+abort 'tinyactors-napi: build failed' unless status.success?
+
+commit = NapiBench.commit
+dirty = NapiBench.dirty?
+options[:runtimes].each do |runtime|
+  signature = NapiMachine.signature(runtime, root)
+  options[:populations].each do |population|
+    before = NapiMachine.conditions
+    result = NapiBench.run(dir: root, runtime: runtime, population: population, variants: options[:variants])
+    after = NapiMachine.conditions
+    records = NapiBench.records(result, signature: signature, commit: commit, dirty: dirty, before: before, after: after)
+    dir = NapiBench.store(records, signature)
+    puts "#{result['runtime']}, #{population} actors, #{commit}#{dirty ? ' (dirty)' : ''}, " \
+         "machine #{signature['hash']}, load #{before['loadAverage']&.first}"
+    puts NapiBench.table(records)
+    puts "stored in #{dir.delete_prefix("#{root}/")}"
+    puts
+  end
+end
