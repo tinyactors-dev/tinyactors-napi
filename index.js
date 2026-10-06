@@ -1,34 +1,44 @@
 'use strict';
+/**
+ * tinyactors for Node.js — the xstate-style API (bindings/shared/core.mjs)
+ * over the native addon written against the N-API C API (src/addon.c).
+ */
+const path = require('path');
+const { createRuntime } = require('../shared/core.mjs');
 
-const native = require('./lib/native');
-const { TinyactorsError } = require('./lib/errors');
-const { createSystem } = require('./lib/system');
-const { statechart, literal, content } = require('./lib/statechart');
-const { TRACE_KINDS, parseTraceparent, formatTraceparent, stepSpanID } = require('./lib/tracing');
-const { decodeTraces } = require('./lib/otlp');
-const { metricsToOTLP } = require('./lib/metrics');
-const { createDebugSession, DAPReader, encodeDAPMessage } = require('./lib/debug');
+/* The addon: an override, then this tree's build (mise run node:build),
+ * then the platform package an install of @tinyactors/node brings
+ * (@tinyactors/node-<platform>-<arch>, an optional dependency npm, pnpm and
+ * Bun install only where it matches). The platform package is tried last,
+ * so its error is the one an install without a matching addon reports. */
+function loadNative() {
+  const candidates = [
+    process.env.TINYACTORS_NATIVE,
+    path.join(__dirname, 'build', 'tinyactors.node'),
+    `@tinyactors/node-${process.platform}-${process.arch}`,
+  ].filter(Boolean);
+  let lastError;
+  for (const p of candidates) {
+    try {
+      return require(p);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
 
-module.exports = {
-  version: native.version,
-  createSystem,
-  statechart,
-  literal,
-  content,
-  TinyactorsError,
-  // Tracing (core ADR 0067, napi ADR 0016): OTLP bytes, and a decoder; no
-  // telemetry dependency.
-  TRACE_KINDS,
-  decodeTraces,
-  parseTraceparent,
-  formatTraceparent,
-  stepSpanID,
-  // Metrics (core ADR 0072, napi ADR 0017): system.metrics() and its OTLP bytes.
-  metricsToOTLP,
-  // The debug adapter (napi ADR 0026): a DAP session the application puts
-  // behind its own transport, and the base protocol's framing for byte
-  // streams.
-  createDebugSession,
-  DAPReader,
-  encodeDAPMessage,
+const platform = {
+  now: () => performance.now(),
+  defer: (fn) => setImmediate(fn),
+  cancelDefer: (h) => clearImmediate(h),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (h) => clearTimeout(h),
+  log: (...args) => console.log(...args),
 };
+
+/* links in Node also over WebSocket servers ({ server, path } or { port })
+ * and TCP ({ tcp }): transports.js */
+const api = require('./transports').withNodeTransports(createRuntime({ native: loadNative(), platform }));
+
+module.exports = api;

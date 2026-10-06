@@ -1,5 +1,4 @@
 {
   "name": "tinyactors-smoke",
-  "private": true,
-  "description": "Installs the packed @tinyactors/node tarballs and runs one chart (mise run smoke-install, smoke-packages)"
+  "private": true
 }

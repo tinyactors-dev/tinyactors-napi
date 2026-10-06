@@ -1,21 +1,22 @@
 {
   "name": "@tinyactors/node",
-  "version": "0.1.0",
-  "description": "Tinyactors for Node.js and Bun: SCXML statecharts as actors, on a native runtime",
+  "version": "0.2.0",
+  "description": "xstate-style state machines and actors on the tinyactors SCXML runtime (N-API addon); hibernation, links",
   "keywords": [
     "actor",
     "actors",
     "statechart",
     "scxml",
     "state-machine",
+    "xstate",
     "napi",
     "bun"
   ],
-  "homepage": "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-napi#readme",
+  "homepage": "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-core/bindings/node#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dhamidi/tinyactors.git",
-    "directory": "tinyactors-napi"
+    "directory": "tinyactors-core/bindings/node"
   },
   "bugs": {
     "url": "https://github.com/dhamidi/tinyactors/issues"
@@ -23,22 +24,14 @@
   "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
-  "files": [
-    "index.js",
-    "index.d.ts",
-    "lib",
-    "README.md"
-  ],
   "engines": {
-    "node": ">=22.14"
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "mise run node:build",
+    "test": "node --test \"test/*.test.js\" && tsc -p test"
   },
   "devDependencies": {
-    "@opentelemetry/api": "1.9.1",
-    "@opentelemetry/core": "2.11.0",
-    "@opentelemetry/exporter-trace-otlp-http": "0.222.0",
-    "@opentelemetry/resources": "2.11.0",
-    "@opentelemetry/sdk-metrics": "2.11.0",
-    "@opentelemetry/sdk-trace-base": "2.11.0",
-    "xstate": "^5.33.2"
+    "typescript": "^5.9.0"
   }
 }
