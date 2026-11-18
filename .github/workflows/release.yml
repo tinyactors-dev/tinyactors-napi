@@ -33,22 +33,21 @@ jobs:
         run: |
           version=$(node -p "require('./package.json').version")
           tag="v$version"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "$tag has its release already"
-            exit 0
-          fi
           title=$(head -n 1 RELEASE_NOTES.md | sed 's/^# //')
           case "$title" in
             *" $version") ;;
             *) echo "::error::RELEASE_NOTES.md is not $version's (its title: $title)"; exit 1 ;;
           esac
-          packages=$(node -p "const p = require('./package.json'); [p.name, ...Object.keys(p.optionalDependencies || {}), '@tinyactors/wasm'].join(' ')")
-          mkdir -p dist
+          name=$(node -p "require('./package.json').name")
           # A staged publish is public once the maintainer approves it, so
-          # wait for npm to serve every package, up to two hours.
+          # wait for npm to serve every package, up to two hours. The
+          # platform packages are the published package's optionalDependencies
+          # (the packed package.json lists them; this directory's does not).
           for attempt in $(seq 1 60); do
+            platforms=$(npm view "$name@$version" optionalDependencies --json 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(Object.keys(JSON.parse(s)).join(' '))}catch{}})")
             missing=""
-            for package in $packages; do
+            [ -n "$platforms" ] || missing=" $name"
+            for package in $name $platforms @tinyactors/wasm; do
               npm view "$package@$version" version >/dev/null 2>&1 || missing="$missing $package"
             done
             [ -z "$missing" ] && break
@@ -59,5 +58,18 @@ jobs:
             echo "::error::npm does not serve$missing at $version"
             exit 1
           fi
-          (cd dist && for package in $packages; do npm pack "$package@$version" --silent; done && sha256sum *.tgz > SHA256SUMS)
-          gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file RELEASE_NOTES.md dist/*
+          mkdir -p dist
+          (cd dist && for package in $name $platforms @tinyactors/wasm; do npm pack "$package@$version" --silent; done && sha256sum *.tgz > SHA256SUMS)
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file RELEASE_NOTES.md dist/*
+            exit 0
+          fi
+          # A release made already (by an earlier run) gets the files it lacks;
+          # its notes and its files' bytes stay as they are.
+          have=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          for file in dist/*; do
+            echo "$have" | grep -qx "$(basename "$file")" || gh release upload "$tag" "$file"
+          done
+          if ! echo "$have" | grep -qx SHA256SUMS || [ "$(gh release download "$tag" -p SHA256SUMS -O - | sha256sum)" != "$(sha256sum < dist/SHA256SUMS)" ]; then
+            gh release upload "$tag" dist/SHA256SUMS --clobber
+          fi
