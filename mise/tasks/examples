@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+#MISE description="The example applications (examples/<name>/): each example's test.mjs under node and bun; every one when none is named"
+#MISE depends=["build"]
+#USAGE arg "[name]" var=#true help="examples to run (directories of examples/ with a test.mjs); all of them when none is named"
+# vim:ft=ruby
+
+# Every directory of examples/ with a test.mjs is an example, so a new one
+# runs here and in `mise run test` without a change to this task: its test
+# is written with node:test, runs in a few seconds, and writes only to a
+# temporary directory (docs/example-brief.md). An example that needs more
+# than the package keeps its own task (NodeAPI::EXAMPLES_ELSEWHERE in
+# mise/napi.rb: remote-python). `mise run test` calls the same function
+# after its own build, and lists examples/** among its sources.
+
+require_relative '../napi'
+
+NodeAPI.examples(names: [*(ENV['usage_name'] || '').split, *ARGV].uniq)

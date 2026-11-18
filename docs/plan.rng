@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The schema of docs/plan.xml, the Node session's plan for step 8.5.
+     Check it with `xmllint - -noout - -relaxng docs/plan.rng docs/plan.xml`
+     (without the spaces between the dashes); edit the plan with XML tools
+     (lxml, xmllint), never by hand-editing text, and check it after each edit. -->
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+  <start>
+    <element name="plan">
+      <attribute name="component"/>
+      <attribute name="step"/>
+      <attribute name="status"><choice><value>draft</value><value>sharpened</value><value>approved</value></choice></attribute>
+      <attribute name="updated"><data type="date"/></attribute>
+      <ref name="summary"/>
+      <ref name="frame"/>
+      <ref name="roles"/>
+      <ref name="studied"/>
+      <ref name="api"/>
+      <ref name="lifetimes"/>
+      <ref name="decisions"/>
+      <ref name="phases"/>
+      <ref name="findings"/>
+      <ref name="spikes"/>
+      <ref name="requests"/>
+      <ref name="rulebook"/>
+    </element>
+  </start>
+
+  <define name="text"><text/></define>
+  <define name="prose">
+    <mixed><zeroOrMore><choice><element name="code"><text/></element><element name="ref"><attribute name="to"/><text/></element></choice></zeroOrMore></mixed>
+  </define>
+  <define name="evidence">
+    <element name="evidence">
+      <attribute name="kind"><choice><value>repo</value><value>spike</value><value>primary</value><value>unverified</value></choice></attribute>
+      <ref name="prose"/>
+    </element>
+  </define>
+
+  <define name="summary"><element name="summary"><oneOrMore><element name="p"><ref name="prose"/></element></oneOrMore></element></define>
+
+  <define name="frame">
+    <element name="frame">
+      <oneOrMore>
+        <element name="fact">
+          <attribute name="id"><data type="ID"/></attribute>
+          <element name="claim"><ref name="prose"/></element>
+          <oneOrMore><ref name="evidence"/></oneOrMore>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="roles">
+    <element name="roles">
+      <element name="first"><ref name="prose"/></element>
+      <element name="then"><ref name="prose"/></element>
+      <element name="answers"><ref name="prose"/></element>
+      <element name="pays"><oneOrMore><element name="cost"><attribute name="where"/><ref name="prose"/></element></oneOrMore></element>
+      <element name="out-of-scope"><oneOrMore><element name="item"><ref name="prose"/></element></oneOrMore></element>
+    </element>
+  </define>
+
+  <define name="studied">
+    <element name="studied">
+      <oneOrMore><element name="source"><attribute name="path"/><ref name="prose"/></element></oneOrMore>
+    </element>
+  </define>
+
+  <define name="api">
+    <element name="api">
+      <oneOrMore>
+        <element name="item">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="status"><choice><value>decided</value><value>proposed</value><value>open</value></choice></attribute>
+          <optional><attribute name="decision"><data type="IDREFS"/></attribute></optional>
+          <element name="node"><text/></element>
+          <element name="python"><text/></element>
+          <element name="core"><text/></element>
+          <optional><element name="note"><ref name="prose"/></element></optional>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="lifetimes">
+    <element name="lifetimes">
+      <oneOrMore>
+        <element name="object">
+          <attribute name="name"/>
+          <element name="owner"><text/></element>
+          <element name="created"><text/></element>
+          <element name="read"><text/></element>
+          <element name="ends"><text/></element>
+          <element name="thread"><text/></element>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="decisions">
+    <element name="decisions">
+      <oneOrMore>
+        <element name="decision">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="status"><choice><value>open</value><value>recommended</value><value>decided</value></choice></attribute>
+          <attribute name="owner"><choice><value>maintainer</value><value>api-review</value><value>session</value></choice></attribute>
+          <element name="question"><ref name="prose"/></element>
+          <oneOrMore><element name="option"><attribute name="id"/><ref name="prose"/></element></oneOrMore>
+          <element name="recommendation"><attribute name="option"/><ref name="prose"/></element>
+          <zeroOrMore><ref name="evidence"/></zeroOrMore>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="phases">
+    <element name="phases">
+      <oneOrMore>
+        <element name="phase">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="title"/>
+          <element name="goal"><ref name="prose"/></element>
+          <oneOrMore>
+            <element name="step">
+              <attribute name="id"><data type="ID"/></attribute>
+              <attribute name="status"><choice><value>todo</value><value>doing</value><value>done</value></choice></attribute>
+              <optional><attribute name="after"><data type="IDREFS"/></attribute></optional>
+              <optional><attribute name="decision"><data type="IDREFS"/></attribute></optional>
+              <optional><attribute name="commit"/></optional>
+              <element name="title"><text/></element>
+              <element name="does"><ref name="prose"/></element>
+              <element name="done-when"><ref name="prose"/></element>
+              <zeroOrMore><element name="files"><text/></element></zeroOrMore>
+            </element>
+          </oneOrMore>
+          <element name="gate"><ref name="prose"/></element>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="findings">
+    <element name="findings">
+      <attribute name="refuted-by"/>
+      <oneOrMore>
+        <element name="finding">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="verdict"><choice><value>confirmed</value><value>plausible</value><value>not-applicable</value><value>dropped</value><value>unchecked</value></choice></attribute>
+          <element name="claim"><ref name="prose"/></element>
+          <element name="scenario"><ref name="prose"/></element>
+          <oneOrMore><ref name="evidence"/></oneOrMore>
+          <element name="action"><ref name="prose"/></element>
+          <optional><element name="refutation"><ref name="prose"/></element></optional>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="spikes">
+    <element name="spikes">
+      <oneOrMore>
+        <element name="spike">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="ran"><data type="date"/></attribute>
+          <element name="question"><ref name="prose"/></element>
+          <element name="setup"><ref name="prose"/></element>
+          <element name="result"><ref name="prose"/></element>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="requests">
+    <element name="requests">
+      <zeroOrMore>
+        <element name="request">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="status"><choice><value>candidate</value><value>filed</value><value>answered</value><value>withdrawn</value></choice></attribute>
+          <element name="what"><ref name="prose"/></element>
+          <element name="why"><ref name="prose"/></element>
+          <element name="shown-by"><ref name="prose"/></element>
+        </element>
+      </zeroOrMore>
+    </element>
+  </define>
+
+  <define name="rulebook">
+    <element name="rulebook">
+      <oneOrMore>
+        <element name="change">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="file"/>
+          <attribute name="section"/>
+          <element name="now"><ref name="prose"/></element>
+          <element name="becomes"><ref name="prose"/></element>
+          <oneOrMore><ref name="evidence"/></oneOrMore>
+        </element>
+      </oneOrMore>
+    </element>
+  </define>
+</grammar>

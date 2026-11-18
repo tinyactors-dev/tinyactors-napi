@@ -1,0 +1,52 @@
+id: extension-calls-core-and-node-api
+snapshots:
+  static uint64_t ta_napi_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return 0; }:
+    labels:
+    - source: clock_gettime(CLOCK_MONOTONIC, &t)
+      style: primary
+      start: 55
+      end: 89
+    - source: clock_gettime
+      style: secondary
+      start: 55
+      end: 68
+  static void ta_napi_arm(uv_loop_t *loop, uv_timer_t *timer) { uv_timer_start(timer, NULL, 10, 0); }:
+    labels:
+    - source: uv_timer_start(timer, NULL, 10, 0)
+      style: primary
+      start: 62
+      end: 96
+    - source: uv_timer_start
+      style: secondary
+      start: 62
+      end: 76
+  static void ta_napi_eval(JSContext *context) { JS_Eval(context, "1", 1, "x", 0); }:
+    labels:
+    - source: JS_Eval(context, "1", 1, "x", 0)
+      style: primary
+      start: 47
+      end: 79
+    - source: JS_Eval
+      style: secondary
+      start: 47
+      end: 54
+  static void ta_napi_log(const char *text) { printf("%s", text); }:
+    labels:
+    - source: printf("%s", text)
+      style: primary
+      start: 44
+      end: 62
+    - source: printf
+      style: secondary
+      start: 44
+      end: 50
+  static void ta_napi_wait(void) { usleep(1000); }:
+    labels:
+    - source: usleep(1000)
+      style: primary
+      start: 33
+      end: 45
+    - source: usleep
+      style: secondary
+      start: 33
+      end: 39

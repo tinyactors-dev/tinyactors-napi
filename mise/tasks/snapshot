@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+#MISE description="Snapshots under load: a deploy rehearsed on a copy of a live host (N actors, R resident, the rest in SQLite), on both datamodels under node and bun (tools/snapshot.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="2000000" help="the population"
+#USAGE flag "--resident <n>" default="1000" help="the actors in memory at most (equal to --actors: no store)"
+#USAGE flag "--events <n>" default="200000" help="the events before the snapshot, and again on each host after it"
+# vim:ft=ruby
+
+# The application's side of snapshots as a program writes it: host.snapshot()
+# of a live host to a file and a copy of its store (each runtime's SQLite);
+# Host.restore of a copy, whose own snapshot must be the same bytes; version
+# 2 added and every actor migrated on the copy while the live host goes on.
+# It fails when the copy's snapshot is not the same bytes, when an actor's
+# count, delayed send or version is wrong on either host, when the copy
+# writes into the live store, or when more than R actors are resident.
+# `mise run test --full` runs it at its defaults and with 100,000 actors
+# all resident; the fast pass runs small ones.
+
+require_relative '../napi'
+
+NodeAPI.stress(actors: ENV.fetch('usage_actors', '2000000'), resident: ENV.fetch('usage_resident', '1000'),
+               events: ENV.fetch('usage_events', '200000'), tool: 'snapshot')

@@ -1,0 +1,20 @@
+# Every C function the addon and the wasm layer (wasm/src/) define or declare takes at most three
+# parameters, static helpers included, and so does every callback type it
+# declares (the root AGENTS.md, "At most three parameters"; this
+# project's AGENTS.md, "C rules"): group the rest in a struct. A function
+# whose signature a typedef fixes (napi_threadsafe_function_call_js) is
+# exempt by that signature (tools/lint/utils/fixed-signature.yml).
+id: at-most-three-parameters
+language: c
+severity: error
+message: "a function or callback takes at most three parameters; group the rest in a struct (AGENTS.md), unless a typedef fixes its signature (tools/lint/utils/fixed-signature.yml)"
+files:
+  - src/**/*.c
+  - src/**/*.h
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+rule:
+  kind: function_declarator
+  has:
+    matches: four-or-more-parameters # tinyactors-core/tools/lint/utils/
+    not: {matches: fixed-signature}

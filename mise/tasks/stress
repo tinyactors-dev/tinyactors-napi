@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+#MISE description="Hibernation under load: N actors, R resident, the rest in SQLite, on both datamodels under node and bun (tools/stress.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="2000000" help="the population"
+#USAGE flag "--resident <n>" default="1000" help="the actors in memory at most"
+#USAGE flag "--events <n>" default="200000" help="the events sent to actors drawn at random"
+# vim:ft=ruby
+
+# The application's side of hibernation as a program writes it: a CLOCK
+# sweep, host.hibernate into the runtime's SQLite (node:sqlite under node,
+# bun:sqlite under bun), a wake handler that reads the blob back. It fails
+# when more than R actors are resident after an eviction or when an
+# actor's count differs from the events it was sent. `mise run test
+# --full` runs it at its defaults; the fast pass runs a small one.
+
+require_relative '../napi'
+
+NodeAPI.stress(actors: ENV.fetch('usage_actors', '2000000'), resident: ENV.fetch('usage_resident', '1000'),
+               events: ENV.fetch('usage_events', '200000'))

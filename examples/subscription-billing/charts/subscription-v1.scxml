@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Version 1 of a subscription: one customer's plan, renewed every cycle,
+     with dunning when a renewal's payment fails.
+
+     Every cycleMs the renewal timer (a delayed send) moves the actor to
+     charging, which invokes the payment service for the plan's price. A
+     paid renewal goes back to active and arms the next one. A declined
+     payment counts a failure and, until maxRetries, waits retryMs in
+     pastDue (the dunning timer, another delayed send) and charges again;
+     the customer may update their card meanwhile, which charges at once.
+     After maxRetries failures in a row the subscription is cancelled.
+
+     A coupon halves the price of the next couponCycles renewals. This
+     version stamps when it was applied as a Date (couponAppliedAt), which
+     the native datamodel cannot write out: until its last discounted
+     renewal clears the stamp, such a subscription can be neither
+     hibernated nor migrated. Version 2 keeps a number. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="subscription" initial="subscription">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="customer" expr="null"/>
+    <data id="plan" expr="'basic'"/>
+    <data id="price" expr="900"/>
+    <data id="cycleMs" expr="2592000000"/>
+    <data id="retryMs" expr="86400000"/>
+    <data id="maxRetries" expr="3"/>
+    <!-- the subscription's own -->
+    <data id="failures" expr="0"/>
+    <data id="invoices" expr="0"/>
+    <data id="paid" expr="0"/>
+    <data id="couponCycles" expr="0"/>
+    <data id="couponAppliedAt" expr="null"/>
+    <data id="reason" expr="null"/>
+  </datamodel>
+
+  <state id="subscription" initial="active">
+    <!-- what the customer may do in any state that is not final -->
+    <transition event="cancel" target="cancelled">
+      <assign location="reason" expr="'cancelled by the customer'"/>
+    </transition>
+
+    <state id="active">
+      <onentry>
+        <send id="renewal" event="renew" delayexpr="cycleMs + 'ms'"/>
+      </onentry>
+      <transition event="renew" target="charging"/>
+      <transition event="change">
+        <assign location="plan" expr="_event.data.plan"/>
+        <assign location="price" expr="_event.data.price"/>
+        <send type="urn:billing:notify" event="plan.changed">
+          <param name="customer" expr="customer"/>
+          <param name="plan" expr="plan"/>
+          <param name="price" expr="price"/>
+        </send>
+      </transition>
+      <transition event="coupon">
+        <assign location="couponCycles" expr="_event.data.cycles"/>
+        <assign location="couponAppliedAt" expr="new Date()"/>
+      </transition>
+    </state>
+
+    <state id="charging">
+      <invoke id="charge" type="urn:billing:payments" src="gateway:charge">
+        <param name="customer" expr="customer"/>
+        <param name="amount" expr="couponCycles &gt; 0 ? Math.round(price / 2) : price"/>
+        <param name="invoice" expr="invoices + 1"/>
+        <param name="attempt" expr="failures + 1"/>
+      </invoke>
+      <transition event="done.invoke.charge" target="active">
+        <assign location="failures" expr="0"/>
+        <assign location="invoices" expr="invoices + 1"/>
+        <assign location="paid" expr="paid + _event.data.amount"/>
+        <if cond="couponCycles &gt; 0">
+          <assign location="couponCycles" expr="couponCycles - 1"/>
+          <if cond="couponCycles === 0">
+            <assign location="couponAppliedAt" expr="null"/>
+          </if>
+        </if>
+        <send type="urn:billing:notify" event="invoice.paid">
+          <param name="customer" expr="customer"/>
+          <param name="invoice" expr="invoices"/>
+          <param name="amount" expr="_event.data.amount"/>
+          <param name="version" expr="1"/>
+        </send>
+      </transition>
+      <transition event="payment.declined" cond="failures + 1 &gt;= maxRetries" target="cancelled">
+        <assign location="failures" expr="failures + 1"/>
+        <assign location="reason" expr="'unpaid after ' + failures + ' attempts'"/>
+      </transition>
+      <transition event="payment.declined" target="pastDue">
+        <assign location="failures" expr="failures + 1"/>
+        <send type="urn:billing:notify" event="payment.failed">
+          <param name="customer" expr="customer"/>
+          <param name="attempt" expr="failures"/>
+          <param name="reason" expr="_event.data.reason"/>
+        </send>
+      </transition>
+    </state>
+
+    <state id="pastDue">
+      <onentry>
+        <send id="dunning" event="retry" delayexpr="retryMs + 'ms'"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="dunning"/>
+      </onexit>
+      <transition event="retry" target="charging"/>
+      <transition event="card.updated" target="charging"/>
+    </state>
+  </state>
+
+  <final id="cancelled">
+    <onentry>
+      <cancel sendid="renewal"/>
+      <send type="urn:billing:notify" event="subscription.cancelled">
+        <param name="customer" expr="customer"/>
+        <param name="reason" expr="reason"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

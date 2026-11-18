@@ -1,0 +1,15 @@
+id: datamodel-calls-environment-and-node-api
+valid:
+  - "static int ta_napi_in(const ta_datamodel_call *call, uint32_t state) { return ta_datamodel_environment_in(call->environment, state); }"
+  - "static void ta_napi_charge(ta_datamodel_environment *environment) { ta_datamodel_environment_charge(environment, 1); }"
+  - "static ta_status ta_napi_attach(const ta_image *image, ta_chart_item item, ta_expression_info *info) { return ta_image_expression(image, item, info); }"
+  - "static ta_status ta_napi_to_wire(ta_cbor_writer *writer, ta_bytes *out) { ta_cbor_write_simple(writer, TA_CBOR_NULL); return ta_cbor_writer_bytes(writer, out); }"
+  - "static int32_t ta_napi_from(ta_cbor_reader *reader, ta_cbor_item *item) { return ta_cbor_read(reader, item); }"
+  - "static napi_value ta_napi_eval(napi_env env, napi_value script) { napi_value result; napi_run_script(env, script, &result); return result; }"
+  - "static void *ta_napi_row(ta_table *table, uint64_t handle) { return ta_table_get(table, handle); }"
+  - "static txml_step ta_napi_parse(txml_parser *parser) { return txml_parse_step(parser); }"
+  - "static void *ta_napi_scratch(ta_growable_arena *arena, size_t size) { return ta_growable_arena_alloc(arena, size, 8); }"
+invalid:
+  - "static void ta_napi_sneak(ta_host *host, uint64_t session) { ta_host_send(host, NULL); }"
+  - "static void ta_napi_peek(ta_system *system) { ta_system_run(system, 1); }"
+  - "static void ta_napi_compile(void) { ta_compile_charts(NULL, NULL, NULL); }"

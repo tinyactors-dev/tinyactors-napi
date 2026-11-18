@@ -1,0 +1,81 @@
+id: no-mutable-globals
+snapshots:
+  ? |-
+    #ifndef TA_NAPI_ADDON_H
+    static int ta_napi_ready;
+    #endif
+  : labels:
+    - source: static int ta_napi_ready;
+      style: primary
+      start: 24
+      end: 49
+  extern napi_env ta_napi_env;:
+    labels:
+    - source: extern napi_env ta_napi_env;
+      style: primary
+      start: 0
+      end: 28
+  napi_ref ta_napi_host_class;:
+    labels:
+    - source: napi_ref ta_napi_host_class;
+      style: primary
+      start: 0
+      end: 28
+  static char ta_napi_scratch[256];:
+    labels:
+    - source: static char ta_napi_scratch[256];
+      style: primary
+      start: 0
+      end: 33
+  static const char *ta_napi_message = "setTimeout failed";:
+    labels:
+    - source: static const char *ta_napi_message = "setTimeout failed";
+      style: primary
+      start: 0
+      end: 57
+  static const char *ta_napi_names[] = { "setTimeout" };:
+    labels:
+    - source: static const char *ta_napi_names[] = { "setTimeout" };
+      style: primary
+      start: 0
+      end: 54
+  static int (*ta_napi_hook)(void);:
+    labels:
+    - source: static int (*ta_napi_hook)(void);
+      style: primary
+      start: 0
+      end: 33
+  static int ta_napi_count;:
+    labels:
+    - source: static int ta_napi_count;
+      style: primary
+      start: 0
+      end: 25
+  static napi_property_descriptor ta_napi_one_property;:
+    labels:
+    - source: static napi_property_descriptor ta_napi_one_property;
+      style: primary
+      start: 0
+      end: 53
+  static napi_ref ta_napi_timer = NULL;:
+    labels:
+    - source: static napi_ref ta_napi_timer = NULL;
+      style: primary
+      start: 0
+      end: 37
+  static napi_value ta_napi_cached(napi_env env) { static napi_value cached; return cached; }:
+    labels:
+    - source: static napi_value cached;
+      style: primary
+      start: 49
+      end: 74
+    - source: static
+      style: secondary
+      start: 49
+      end: 55
+  static ta_napi_instance ta_napi_instance_of_the_process;:
+    labels:
+    - source: static ta_napi_instance ta_napi_instance_of_the_process;
+      style: primary
+      start: 0
+      end: 56

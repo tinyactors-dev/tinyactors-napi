@@ -1,0 +1,401 @@
+# @tinyactors/node and @tinyactors/wasm 0.3.0
+
+### Summary
+
+This release replaces the package again. 0.2.0's xstate-style API is removed (70434be), and `@tinyactors/node` is a new Node-API addon over core's host (387366b, 470d320). Its direct layer mirrors core's C API: a `Host` with its inputs, handlers and typed methods, `compileCharts` and `compileSystem`, `encode` and `decode`. A convenience layer adds `host.addCharts`, `host.spawnChart`, `directoryResolver`, and a promise from a typed method given no handler (33fdeab). Charts run on a native "ecmascript" datamodel by default, or in the quickjs sandbox, which stops an evaluation at 1 GiB by default (7b19ec8). Hibernation, migration, snapshots, invoked services, telemetry and other systems are in the API.
+
+`@tinyactors/wasm` is new: the same API as WebAssembly, for browsers, Workers and platforms with no addon (Windows), and for Node.js and Bun. Both packages share one version and this changelog, and each refuses the other's snapshots.
+
+The package is ESM only. A chart that invokes a type with no service gets `error.communication`, and the turn no longer throws (eec9515). A config with no `system.traceSeed` gets a random one (19d8ee2). The addon's functions have the names and lengths `index.d.ts` declares, and its accessors are not enumerable, as a class's are (307db2f).
+
+### Upgrading
+
+- **The package is ESM only.** 0.2.0 was CommonJS; 0.3.0 is an ES module and asks for Node.js 22.3 or later, the first with process.getBuiltinModule, which the native datamodel uses (0.2.0 asked for 22.12). From CommonJS, `await import('@tinyactors/node')` works on every supported version, and `require('@tinyactors/node')` works on 22.12 and later.
+- **The 0.2.0 API is removed, with no compatibility layer** (70434be). The concepts map as follows:
+  - createActor and Actor → `host.spawn(host.chart(name))` or `host.spawnChart(name)`, which return a session; send, stop and getSnapshot → `host.send`, `host.terminate`, and the typed methods `actorState` and `actorContext`. Subscriptions: none.
+  - createSystem, System and SystemOptions → `new Host(config, options)`: the id is the config's `systemID`, logger the `log` handler, clock a `SimulatedClock`, restore `Host.restore`. A System's get → `host.actorByName`, stats → `hostStats`, flush → `host.idle()`, sendMany → `host.sendMany`, snapshot → `host.snapshot()`, reload → `host.addImage` of a new image and `host.migrate`. export and adopt: none.
+  - HibernationStore, HibernationOptions and createMemoryStore → `host.sweep`, `host.hibernate`, the `wake` handler and `host.wake`. The store is the application's: no replacement for createMemoryStore.
+  - Links (createLink, createStoreLink, serveLinks, Envelope, the frames, deliver, ref) → the `transport` handler for sends to other systems and `host.send` with an `Address` for what arrives; parseAddress and formatAddress → `Address`.
+  - createMachine, setup, fromSCXML, StateMachine, SCXMLLogic and the action and guard helpers (assign, raise, sendTo, sendParent, log, cancel, stateIn, and, or, not): none. Charts are SCXML, compiled with `compileCharts`.
+  - `compileSystem` keeps its name and takes a manifest `Source` and a resolver, returning a `Compiled`; loadImage and SystemImage → `host.addImage` and `host.boot`.
+  - encodeValue and decodeValue (0.2.0's tagged JSON) → `encode` and `decode` (CBOR, the value table), which do not read the old encoding; encodeWire, decodeWire and WireValue: none.
+- **Names kept with other meanings.** `SendOptions` were the options of the send actions (delay, id); they are now `host.send`'s (`sendid`, `traceparent`, `origin`). `MigrateOptions`: timeoutMs is now `timeout` (milliseconds of the host's clock), `chart` and `session` choose what moves, `wake` defaults to false, and an unknown option throws. `MigrationResult` reaches the `migrationDone` handler instead of a promise; `pending` is a list of sessions (bigints), `migration` names the migration, and `failed`, a count in 0.2.0, is a list of `{session, reason}`: read `result.failed.length` for the number (43deb01). `StateValue` keeps its shape, read-only, as `actorState`'s `value`.
+- **A stored blob needs a snapshot to survive a restart, as in 0.2.0.** A host wakes only a session it knows as hibernated: its record, mailbox and timers stay in the host, not in the blob. A new host refuses another host's blob, even one of the same session number (934d62d). To keep hibernated actors across a restart, store `host.snapshot()` with the blobs and start with `Host.restore`. Blobs and snapshots of earlier builds are refused, and images compiled by earlier builds run a `<script>` in executable content the old way: hibernate, snapshot and compile again with this release (fa0f761).
+- A migration with no timeout fails an actor that runs invocations at once, where it waited for ever; pass a `timeout` to wait (79bb556).
+- `wake` refuses a blob older than the session's latest hibernation with `TA_ERROR_STALE`: keep the latest blob (dcbe4f0).
+- `send.answer()` and `send.fail()` return false when the sender has ended, as when it ends while the handler's promise is pending, instead of throwing `TA_ERROR_STALE`; a closed host, or a second answer or fail, still throws (eec9515).
+- Unreleased builds only: the `...Async` methods are gone (33fdeab), and 708bdf9, ceb8adb, cac5ba6, 59d54bc, 3fc0b07, 31a56df, 2b810c6, 309fb66, 5bccb45, ff162e3 and 997706b changed the 0.2.0 code before its removal and need nothing beyond the rewrite.
+
+### Breaking changes
+
+- a typed method given no handler returns a promise; the ...Async methods are gone (33fdeab)
+- a migration without a timeout fails an actor running invocations instead of waiting for ever (79bb556)
+- a <script> in executable content runs again: its let and const are its own (fa0f761)
+- a migration names the sessions it could not move, and why (43deb01)
+- wake refuses a blob of an earlier hibernation (dcbe4f0)
+- remove the addon for its rewrite (70434be)
+- delete the bindings, examples, link, JSON reader, framing and the batcher (ADR 0009 step 2) (997706b)
+- the web binding is the addon's wasm twin (ff162e3)
+- the link protocol is a core layer (5bccb45)
+- the host makes the trace policy from options and watches (309fb66)
+- the host packs a whole system into one snapshot (2b810c6)
+- the web binding is JavaScript over the core's C API (31a56df)
+- a thin JavaScript binding over a deep native one (3fc0b07)
+- trace rules decide at a trace's start and when an actor takes an event; watchTraces (59d54bc)
+- systems trace by default: contexts, sampling, lifecycle records, draining (cac5ba6)
+- the kernel stamps causes on events and writes step facts (ceb8adb)
+- the host gets its memory from a ta_allocator (708bdf9)
+
+### API changes
+
+**Added**
+
+- export `ActorContextResult`
+- export `ActorGetResult`
+- export `ActorListParams`
+- export `ActorListResult`
+- export `ActorStateResult`
+- export `AddChartsOptions`
+- export `Address`
+- export `AnswerOptions`
+- export `ChartRef`
+- export `ChartStats`
+- export `CompileError`
+- export `CompileOptions`
+- export `Compiled`
+- export `Diagnostic`
+- export `EffectiveHostConfig`
+- export `EmptyResult`
+- export `Encodable`
+- export `HTTPField`
+- export `HTTPPost`
+- export `HTTPRequest`
+- export `Handled`
+- export `Host`
+- export `HostConfig`
+- export `HostOptions`
+- export `HostStatsResult`
+- export `IOProcessorConfig`
+- export `Invocation`
+- export `LogEntry`
+- export `MigrateOptions`
+- export `Migrated`
+- export `MigrationFailure`
+- export `MigrationResult`
+- export `NoParams`
+- export `OnError`
+- export `OnResult`
+- export `Params`
+- export `PendingSend`
+- export `Pool`
+- export `QuickJSOptions`
+- export `ReceivedValue`
+- export `ResolveError`
+- export `Resolver`
+- export `SegmentPools`
+- export `Send`
+- export `SendMessage`
+- export `SendOptions`
+- export `Service`
+- export `Session`
+- export `SessionParams`
+- export `SimulatedClock`
+- export `Source`
+- export `Span`
+- export `SpanEvent`
+- export `SpawnOptions`
+- export `StateValue`
+- export `Status`
+- export `SystemConfig`
+- export `TelemetryConfig`
+- export `TinyactorsError`
+- export `TraceConfigureParams`
+- export `TraceDetail`
+- export `TraceRule`
+- export `TraceSpansDecodeParams`
+- export `TraceSpansDecodeResult`
+- export `TraceUnwatchParams`
+- export `TraceWatchParams`
+- export `TraceWatchResult`
+- export `Value`
+- export `compileCharts`
+- export `compileSystem`
+- export `decode`
+- export `directoryResolver`
+- export `encode`
+- export `encodeHTTPPost`
+- export `parseHTTPRequest`
+
+### Changes
+
+**Added**
+
+- the binding picks a random trace seed when the config gives none (19d8ee2)
+- quickjs has a default memory limit of 1 GiB (7b19ec8)
+- actor.get lists an actor's pending delayed sends, actor.state where its history states would return (712305d)
+- mise run status, where the work stands after a container is rebuilt (ef0d960)
+- quickjs in @tinyactors/wasm: datamodel "quickjs" works in the browser, node and bun; host.quickjsHeapBytes in both packages (dfebd1e)
+- build the wasm module at -Oz, its stack measured again there (a297af3)
+- a hibernation blob carries its host's identity, and another host's is refused (934d62d)
+- pack @tinyactors/wasm with the addon's packages at one version, smoke-tested in node, bun and Chromium (9c61a92)
+- perevent measures resident memory after the events and after every actor hibernated (ab12ad3)
+- a browser guide tested in Chromium, the documentation in pages, and snapshots refused across the packages (a3c948a)
+- the native "ecmascript" datamodel in @tinyactors/wasm (6ae206f)
+- the direct layer of @tinyactors/wasm, the same API over the module (a07625b)
+- the WebAssembly module of @tinyactors/wasm and its two loaders (cb72c78)
+- compileCharts parses each expression and script of a chart; { warningsAsErrors } refuses a syntax error (e6956f4)
+- what the native datamodel hands the application is of its realm; XML content reaches it as text (22a7eaf)
+- encode writes an Address as tag 32 and decode reads one back (04f997d)
+- idle() waits for the promises handlers return; host.now(); snapshot() holds the time of its call (827b4d2)
+- error.execution says why in its data (6a5df83)
+- examples/elevator-control, a bank of cars with parallel regions, deep history and invoked door controllers, checked by generated scenarios (af30ee6)
+- examples/job-scheduler, recurring and one-shot jobs on the real clock, with retries, deadlines, drift and a graceful shutdown (d9124f6)
+- examples/inventory-sync, a warehouse and a storefront as two systems over a socket (77ac057)
+- examples/document-approval, parallel reviews with history and SLAs, and an admin view on the typed methods (45f1097)
+- examples/iot-rules, customers' alert rules in the quickjs sandbox, one host per rule (cbbe2f8)
+- examples/turn-game, a game server snapshotted to disk and restored after a crash (5c782ac)
+- examples/subscription-billing, a live population migrated to a new chart version while it bills (9e25bb2)
+- examples/chat-rooms, rooms and users as actors hibernated in a file store (ea63963)
+- examples/http-gateway, a rate-limited HTTP API whose sessions are actors (449af23)
+- examples/order-fulfillment, and mise run examples for every example's test (2bd52e4)
+- examples/remote-python, a Python system and a Node system over a socket (e573c99)
+- the package ships its guides, and the README's links resolve after an install (69f9717)
+- types for the host config and every typed method's params and result (998b7a3)
+- host.addCharts, host.spawnChart, directoryResolver, Address.toJSON (6b10bf7)
+- the convenience layer may import node:fs and node:path (50567fb)
+- the typed methods as promises, host.<method>Async(params) (25c647d)
+- txml reads through a 4096 B window (813d653)
+- an arena keeps at most its cap between calls (c91b73c)
+- a primitive payload is an array element, no napi_ref and no box (baec263)
+- sessions' scopes in one array per host, no napi_ref a session (7af18ff)
+- a service handler may return a promise of the service (b37c76f)
+- an input takes a session as a safe-integer number too (e088def)
+- the npm packages, their smoke test and the release task (5e77f9e)
+- the scaling gate: every operation at N and 2N actors (cc50f99)
+- invoked services: the services option, Invocation, receive and stop (a8227f6)
+- snapshots: host.snapshot() and Host.restore, the native datamodel's tables and rows (90fd3a8)
+- migration: migrate, the migrated and migrationDone handlers, the native datamodel's upgrade (97085b5)
+- the hibernation stress gate, tools/stress.mjs with each runtime's SQLite (4b11981)
+- hibernation: sweep, hibernate, wake and the wake handler (9ecad78)
+- telemetry handler, host.metrics() and the last take at close (07adc08)
+- mise run measure, bytes per actor under node and bun on both datamodels (0dfb075)
+- the conformance adapter over the public API, and the M1 gate (0e3d148)
+- encodeHTTPPost and parseHTTPRequest over core's BasicHTTP codec (1bd5453)
+- the native "ecmascript" datamodel, the default of a new Host (cee8368)
+- the typed methods, answered from the pending table at their REPLY (d5e050b)
+- effects as thin views, I/O processors, the transport, the log handler and Address (a7a6c63)
+- compileCharts, compileSystem and the host's inputs (470d320)
+- the loop on the event loop, idle(), nextDeadline and SimulatedClock (fa6bee4)
+- the Host, its memory, close and the dispose symbols (387366b)
+- encode, decode and TinyactorsError over core's CBOR stream (ea1fbe0)
+- the native ecmascript datamodel in the application's engine (e298a2d)
+- the suite's adapter, conform.mjs, over the public API (f3236c5)
+- Host on quickjs, compile, SimulatedClock and the loop (cba8ea3)
+- encode and decode, the value table both ways (8d6b4e2)
+- the exporter's batching is core's (ta_otlp_batch) (3bce3ff)
+- synchronous I/O processors in the JavaScript bindings (57fcbbe)
+- span metrics: the encoder keeps macrostep durations per chart, with exemplars (22b6459)
+- metrics as OTLP: the otlp codec writes ExportMetricsServiceRequest; system.metrics(), metricsToOTLP and /v1/metrics (b1eeb70)
+- ta_xml_writer writes the SCXML of charts a binding builds (77f39f3)
+- JavaScript systems export traces as OTLP, to a sink or over HTTP (4fadf6c)
+
+**Fixed**
+
+- the release takes npm's token from the environment where fnox has none (5df624c)
+- @tinyactors/wasm bundles with esbuild and Vite, smoke-tested in Chromium; the missing-addon message tested (2f8e9ee)
+- index.d.ts declares the disposal symbols, so TypeScript needs no esnext.disposable lib (90dd5e0)
+- iot-rules finds a busy rule by fuel per CPU millisecond, not per wall-clock audit (601dfb0)
+- actor.context tells undefined from null (867b693)
+- quickjs gives an XML node to the application as its XML text (19e8812)
+- the job-scheduler example's drift test holds on a loaded machine (bad3839)
+- a function declared in a transition's script hibernates again, and a 'use strict' that starts one applies (85944c5)
+- an invoke of a type with no service tells the invoker and throws nothing; answer() and fail() give false when the sender ended (eec9515)
+- migrate refuses an unknown chart and an ended session (0a231a5)
+- send.message gives null for a text field the send lacks, as Python's does (1740a06)
+- an XML parse allocates from the datamodel's scratch arena (c5f8e1d)
+- package.json's repository names the monorepo again (3e56ba0)
+- the native datamodel's restore makes one row at a time (adaca1e)
+- a declaring session hibernates with its vars' last values on bun (a381c81)
+- a CompileError's message says error:, as a compiler prints it and as Python's reads (2a0f926)
+- a handler's or a resolver's error is reported whatever value it threw (e98b970)
+- a session 0n is refused as a TypeError, as its message says (44b5e9c)
+- a native session makes _ioprocessors at its first read and shares its _name (fb8114f)
+- addImage copies the image into memory the addon owns (38fc05c)
+- nested calls share nothing: one writer per call, values stream (ADR 0010) (8d600f4)
+- an armed timer holds its Host, so the collector cannot free it under a pending deadline (e9359f3)
+- read the host's tick rate from host.config (b47b22f)
+- drain the exporter without marking posts in flight (d765317)
+
+**Changed**
+
+- the addon's memory: one text buffer, held objects, table rows (bcfa7b4)
+- spans, deliver outcomes and flush come from the addon as they are (85fc653)
+- the addon keeps the table of external invocations (1056654)
+- the addon makes the metrics in the API's shape (014a1ea)
+- store links are links whose transport is SQL (58989d1)
+- migrate() returns a promise the addon settles (26a5a91)
+- the addon keeps hibernated actors in flight (65ad911)
+- the addon runs the loop; the host writes state values (b77c531)
+- the addon is C files per topic (519bffe)
+
+<details>
+<summary>Internal (156)</summary>
+
+- log the changelog tooling's missing Removed part for 0.2.0's moved declarations, and the engines floor (7003c0d)
+- the 0.3.0 changelog summary names 307db2f5's change to the addon (caa89d2)
+- the suite checks core's traceSeed default where core runs it; the adapters pass configs through (3eaf516)
+- the maintainer's decisions of 2026-11-18 move to Decided (cf220df)
+- the maintainer's decisions on the open questions before 0.3.0 (9645ea7)
+- close the build-out's log entries; both packages kept; docs/maintainer.md (10989b2)
+- the 2 MB arena test reads @tinyactors/wasm's linear memory, so it holds on bun and runs in Chromium (5ccfb52)
+- @tinyactors/wasm's size with quickjs, the quickjs per-event and memory numbers for the two packages, p5-quickjs done (5d45261)
+- release-time changelog work must mention 307db2f5's change to the addon (1760b92)
+- the real-clock watch case measures the watch's end instead of assuming it (e66587b)
+- p5-pack done: sizes, the layout, -Oz and extended-const measured (79d9394)
+- p5-parity done (0170fd2)
+- the numbers for retiring a package, in the log for the maintainer (c7e17ca)
+- request to core: a hibernation blob carries no identity of its system (7580397)
+- the parity check of @tinyactors/node and @tinyactors/wasm, each against index.d.ts (307db2f)
+- p5-datamodel done; its protocol gate moves to p5-quickjs (20ef876)
+- the native datamodel's realms, unclosed hosts and policy refusals in Chromium; perevent's fit on both packages (9d84561)
+- p5-api done (7714cd7)
+- p5-build done (ebf2393)
+- p5-design names the commit that finished it (81188a2)
+- the browser design refuted and revised; p5-build to p5-quickjs refined; p5-design done (0fb6d8f)
+- the browser package's design, docs/browser.md, with its spikes; refutation pending (0470d58)
+- p4-surprises names the commit that finished it (73e7f11)
+- docs/surprises.md, the examples' 34 surprises catalogued from the log; p4-surprises done (f761688)
+- the docs batch of the examples' surprises: delays, deadlines, queues, hibernation, livelocks, migration, maxOps, sockets, sessions (7a4b50a)
+- the binding batch's deviations accepted (6e84efe)
+- the examples drop the workarounds of the surprises the binding and core batches fixed (953d6e4)
+- the examples' 35 surprises triaged into core, binding and docs batches (37008f5)
+- p4-examples done (d838f6f)
+- elevator-control in the layout (f4ed3c8)
+- job-scheduler in the layout (d9e2f7c)
+- inventory-sync in the layout (6dc7029)
+- document-approval in the layout (6f01b0a)
+- pools that fill during a run grow; the chat-rooms crash resolved (4534196)
+- p4-remote done; the ten example applications chosen, and their brief (614a7c0)
+- a tinyactors-cpython change reruns napi's tests; p4-remote decisions logged (0086912)
+- p4-remote done (b367e2e)
+- p3-shapes done (0860051)
+- p3-promises done (e6a7030)
+- p3-shapes chosen; the docs review's core defaults left for the maintainer (7692f43)
+- p2-docs done (208e38e)
+- the newcomer review's findings fixed; a symbol is refused as event data (a02770c)
+- the long sentences of the guides split, as Harper flagged them (07ea4c0)
+- guides for every feature, doc comments on every export, the docs' claims checked (cfba48d)
+- a README for newcomers, the first guides, and their examples run by the tests (c124929)
+- the growth fixes logged; the timer pool's jump left open; p2-docs started (86c4c03)
+- a growing segment grows the pool that ran out (ecb80b2)
+- p2-core-memory done; the log truncation and txml directory requests resolved (9340d0b)
+- p2-allocation done; ten consecutive full test passes (1f2566a)
+- the scaling gate counts each attempt's own ratio from the third (7c818f4)
+- the fast scaling gate made robust without loosening its factor (34101ef)
+- the allocation analysis corrected by its refutation (073ef7e)
+- the allocation analysis refuted; two steps for what it found (ea6da26)
+- p2-decisions done; core's log truncation and the refutation wait (1804735)
+- allocation by lifetime, traced and measured (c32271c)
+- api-review's waiting list regenerated; the log truncation asked of core (f0b3506)
+- the README says let/const charts stay resident and charts share builtins (3a067d7)
+- the restore scaling check keeps each size's least cost (b9e7b34)
+- log that spawn params as initial values need documenting (47123d5)
+- p2-pack done: the packages pass the smoke test; the release waits (a01a3b1)
+- the step brief asks for allocation by lifetime and async on the event loop (815e4b5)
+- p2-decisions carries async service starts and allocation by lifetime (fb0c599)
+- async service starts, and allocation by lifetime (ff86fda)
+- every decision waiting for the maintainer, decided (3deb2d3)
+- releases mirrored to tinyactors-dev/tinyactors-napi, user docs, and the browser (d7d71b6)
+- the brief the coordinator gives each step's agent (4a91978)
+- keep p2-pack's unfinished packaging as a patch until it resumes (67b3270)
+- p2-w3c done: the gate is the whole suite; the phase's state (a4f48f5)
+- mise run test runs the whole suite, M5: protocol, scenarios and W3C (91ec217)
+- the scaling gate's snapshot sample is snapshots until --min-ms (17afd0d)
+- p2-scale done (b30606a)
+- the scaling gate passes on all four pairs at two and four million actors (1a5434b)
+- the scaling gate's snapshot cost leaves out the kernel's page faults (fa6b692)
+- the scaling gate times each sweep cold, a resident sweep by the page, an attempt with the next seed (ba65451)
+- the scaling gate holds each snapshot sample and repeats the sweep (776c3e7)
+- core answered the scaling gate's three requests; KNOWN is empty (cf566f3)
+- the scaling gate's numbers at two and four million actors (a473160)
+- a final phase: Python and Node talking, ten example applications, their surprises fixed (0a24fa6)
+- the request about each run scanning every request is answered; the services gate's new numbers (8a40f41)
+- p2-services done: the services gate's numbers, and the step's log (f9edbcf)
+- request to core: each run scans every live request, so a run is O(running invocations) (013d853)
+- p2-snapshot done: the snapshot gate's numbers, and the step's log (b26ce6f)
+- p2-migrate done (f7e41a0)
+- the migration gate's numbers, and the step's log (13cd11f)
+- p2-hibernate done (7afa2bd)
+- p2-telemetry done (4a9c21c)
+- the API review of the direct layer, side by side with Python (baa4b80)
+- the README says a declaring script gives each session a context (0603967)
+- log what the long-string fix left (4403a4e)
+- the long-string request to core is answered (8ef0bc7)
+- p1-rules done (ce4263a)
+- each rule the suite cannot see names its test in AGENTS.md (a572c85)
+- request to core: an event string past a slab page grows a segment without bound (6187f46)
+- a step that times every operation at two and four million actors (a162a8e)
+- p1-measure done (c085600)
+- p1-conform done (6afca42)
+- p1-datamodel done (f675de5)
+- what a chart sees on the "ecmascript" datamodels, and the native one's realm (f2d0803)
+- p1-methods done (58b6acc)
+- p1-effects done (8c776da)
+- p1-compile done (7dec676)
+- p1-loop done (b5f628e)
+- p1-host done (437d51f)
+- p1-values done (d7b7c10)
+- p0-map done (4ba8fc2)
+- every planned API item in the mapping table, and index.d.ts for the direct layer (847c370)
+- p0-inventory done (3d101af)
+- inventory every public function of core in the mapping table (6bcf4a5)
+- ignore the plan tool's Python cache (3978d06)
+- a log for the build-out, and the tool that edits the plan and the log (fc74d1a)
+- the loop step has one driver, the event loop (8eccc13)
+- the rulebook as decided for step 8.5 (8e39c1a)
+- typed methods take params first; promises are the convenience layer's (302637e)
+- time at the API is milliseconds (06d0d87)
+- Address as Python's, errors thrown, and the direct layer checked against core's headers (d269b2e)
+- a resolver is any callable; the native datamodel is the default (4c73595)
+- the native datamodel evaluates in vm contexts and parses XML with txml (6a42a1f)
+- sharpen the step 8.5 plan with its refutation (fd59202)
+- quickjs is the sandbox, the native datamodel uses JavaScript objects (f8cbbfd)
+- the event loop drives every host, with no driver to choose (9e2d5f6)
+- the plan's spikes rerun on the pinned toolchain (a69e717)
+- draft the step 8.5 plan as XML, with its schema (4541001)
+- move the repository to tinyactors-dev/tinyactors (1de22dc)
+- clear the step 8.2 marks (58775b0)
+- how a binding fetches at run time is undecided (1aad3bf)
+- ADR 0012 consolidated: cross-references to its decisions (821276a)
+- only what SCXML.md mandates; no <data srcexpr> (69a57ad)
+- answer TA_EFFECT_REQUEST with TA_ERROR_INVALID until run-time fetching is built (850d323)
+- the resolver lives only at compile time; REQUEST in C; traceparent as W3C text (848ecc3)
+- the shared rules: a direct layer mirroring C, a convenience layer later, a resolver object (9d6b8b1)
+- the shared rules of the decided binding design (e98e47c)
+- ROADMAP step 8 in the maintainer's new order (a423456)
+- AGENTS.md rules for lifetimes and the control plane (ADR 0012) (4033e50)
+- release runs under the run's rules since ADR 0010 (b02039d)
+- ADR 0010, outputs are views and values stream (e571c0b)
+- the protocol suite joins the gate (c7aeb3c)
+- a binding allocates almost nothing (3efac6c)
+- README, the core functions no item uses, and the API's values (b8a758d)
+- a test for each rule the suite cannot see (fdc41a6)
+- request to core: skip for a binding the request and config vectors its API cannot send (4f1416e)
+- request to core: a binding cannot read a host's tick rate (e1aa3c2)
+- the addon builds from core's amalgamation and loads under node and bun (7a0c46d)
+- the M1 plan (75e99ae)
+- decisions cite their commits, not the roadmap (96bf790)
+- AGENTS.md holds the binding's rules; the work's process moves to ROADMAP.md (e8ce536)
+- the session's own ROADMAP.md, M1 done means, the package's CBOR exports (b2d54c4)
+- test runs the suite's M1 set; lint checks the scripts' portability and acronyms (1195ccc)
+- a lint rule refuses mutable globals (b14ff12)
+- changelog components for both bindings; the root runs their tests (82db7e4)
+- the project skeleton of the Node-API addon (a6a61db)
+- the bindings after ADR 0008 (f2302d9)
+- ADR 0007 records metrics and trace policy as built; the proposal is adopted (c06330f)
+- the SCXML-in-core proposal is adopted; docs name ta_xml_writer (701ebef)
+- the roadmap and distribution.md describe what is released and what is left (ac4be28)
+- tracing in the architecture, the layer tables, the bindings' READMEs and the roadmap (dbc0c69)
+- how to publish @tinyactors/node with a token or with npm login (4fa2a41)
+
+</details>

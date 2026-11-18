@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hostile: keeps every reading, a thousand times over, in a variable,
+     and smaller and smaller copies when that fails, until not one more
+     fits: the memory left after it is none. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="hoard" initial="watching">
+  <datamodel><data id="history" expr="[]"/></datamodel>
+  <state id="watching">
+    <transition event="reading">
+      <script>
+        for (let size = 1000; ; ) {
+          try { history.push(new Array(size).fill(_event.data.value)); }
+          catch (error) { if (size === 1) throw error; size = Math.floor(size / 2); }
+        }
+      </script>
+    </transition>
+  </state>
+</scxml>

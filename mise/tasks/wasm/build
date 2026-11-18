@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+#MISE description="Build wasm/tinyactors.wasm, the module of @tinyactors/wasm: core's amalgamation, txml and wasm/src/ for wasm32-wasi (a reactor) with the pinned zig; its imports and exports checked; its size, features and stack reported"
+# vim:ft=ruby
+
+# mise/wasm.rb, WebModule.build: core's amalgamation into build/core (the
+# only core task this project runs), the objects into build/wasm/objects,
+# the stripped module into wasm/tinyactors.wasm (beside the loaders), and
+# the same link with its custom sections into build/wasm/ for the report.
+
+require_relative '../../wasm'
+
+report = WebModule.build
+kb = ->(n) { format('%.1f KB', n / 1000.0) }
+puts "wasm:build: #{WebModule::MODULE.relative_path_from(NodeAPI::ROOT)}: #{report['bytes']} bytes " \
+     "(#{kb.call(report['bytes'])}), gzip -9 #{kb.call(report['gzip'])}, brotli 11 #{kb.call(report['brotli'])}; " \
+     "#{report['exports'].size} exports, imports #{report['imports'].sort.join(' ')}"
+puts "wasm:build: features #{report['features'].join(' ')}; memory #{report['memoryPages']} pages " \
+     "(#{report['memoryPages'] * 64} KiB) at start, stack #{WebModule::STACK_SIZE / 1024} KiB below #{report['stackPointer']}"
+File.write(WebModule::BUILD.join('report.json'), JSON.pretty_generate(report))

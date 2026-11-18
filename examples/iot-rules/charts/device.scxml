@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One device of the fleet: the platform's own chart, trusted, on the
+     native datamodel.
+
+     The device's sensors report samples (the application sends `sample`
+     events with { metric, value }). The chart is the device's edge logic:
+
+     - a sample that is not a finite number is reported as malformed and
+       dropped;
+     - a sample within `deadband` of the last reported value of its metric
+       is dropped, so a flat signal costs nothing downstream;
+     - every other sample becomes a reading, numbered by `seq`, sent to the
+       platform's telemetry I/O processor;
+     - a device that reports nothing for `silenceAfter` goes offline, and the
+       next sample brings it back online. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="device" initial="online">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="deviceID" expr="null"/>
+    <data id="customer" expr="null"/>
+    <data id="deadband" expr="0"/>
+    <data id="silenceAfter" expr="'30s'"/>
+    <!-- the device's own -->
+    <data id="seq" expr="0"/>
+    <data id="last" expr="({})"/>
+    <data id="sample" expr="null"/>
+    <data id="wasOffline" expr="false"/>
+  </datamodel>
+
+  <state id="reporting" initial="online">
+    <transition event="sample" cond="typeof _event.data?.metric !== 'string' || typeof _event.data.value !== 'number' || !Number.isFinite(_event.data.value)">
+      <send type="urn:iot:telemetry" event="device.malformed">
+        <param name="device" expr="deviceID"/>
+        <param name="customer" expr="customer"/>
+        <param name="sample" expr="JSON.stringify(_event.data ?? null)"/>
+      </send>
+    </transition>
+    <!-- a sample (re-)enters online, which restarts the watchdog -->
+    <transition event="sample" type="internal" target="online">
+      <if cond="wasOffline">
+        <assign location="wasOffline" expr="false"/>
+        <send type="urn:iot:telemetry" event="device.online">
+          <param name="device" expr="deviceID"/>
+          <param name="customer" expr="customer"/>
+        </send>
+      </if>
+      <assign location="sample" expr="_event.data"/>
+      <if cond="!(sample.metric in last) || Math.abs(sample.value - last[sample.metric]) &gt;= deadband">
+        <assign location="seq" expr="seq + 1"/>
+        <script>last[sample.metric] = sample.value</script>
+        <send type="urn:iot:telemetry" event="reading">
+          <param name="device" expr="deviceID"/>
+          <param name="customer" expr="customer"/>
+          <param name="metric" expr="sample.metric"/>
+          <param name="value" expr="sample.value"/>
+          <param name="seq" expr="seq"/>
+        </send>
+      </if>
+    </transition>
+
+    <state id="online">
+      <onentry>
+        <send id="watchdog" event="silence" delayexpr="silenceAfter"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="watchdog"/>
+      </onexit>
+      <transition event="silence" target="offline"/>
+    </state>
+
+    <state id="offline">
+      <onentry>
+        <send type="urn:iot:telemetry" event="device.offline">
+          <param name="device" expr="deviceID"/>
+          <param name="customer" expr="customer"/>
+          <param name="seq" expr="seq"/>
+        </send>
+      </onentry>
+      <onexit>
+        <assign location="wasOffline" expr="true"/>
+      </onexit>
+    </state>
+  </state>
+</scxml>

@@ -1,0 +1,204 @@
+#!/usr/bin/env ruby
+#MISE description="Release @tinyactors/node and @tinyactors/wasm at one version: check, version, build one addon per native target with zig and the WebAssembly module, verify, pack and smoke-test (the addon here and in Linux containers, the wasm package under node, bun and in Chromium); with --publish, tag, publish to npm, push, and release through tinyactors-dev/tinyactors-napi; with --dev, HEAD as a development version under the next dist-tag"
+#USAGE arg "[version]" help="The version to release, MAJOR.MINOR.PATCH (none with --dev)"
+#USAGE flag "--publish" help="Commit the version, tag tinyactors-napi/v<version>, publish to npm, push, and create the GitHub release in tinyactors-dev/tinyactors-napi"
+#USAGE flag "--dev" help="HEAD as a development version (<next minor>-dev.<date>.<N>.g<sha>): built and checked like a release; with --publish published to npm under the next dist-tag only, without a commit, tag or GitHub release"
+#USAGE flag "--skip-containers" help="Leave out the Linux container smoke tests (no Docker)"
+#USAGE flag "--skip-tests" help="Leave this project's test task out of the checks, for a commit whose tests passed already; the addons' builds, symbol checks and smoke tests still run"
+#USAGE flag "--build-only" help="Only build, verify, pack and smoke-test (no checks, no version set, nothing committed): a look at the packaging before a release"
+#USAGE flag "--resume" help="Finish a publish that stopped during the npm publish, the push or the GitHub release: publish exactly the tarballs built in build/dist/<version>/ (checked against their SHA256SUMS; the ones npm has are skipped), then push and create the GitHub release; nothing is built again"
+# vim:ft=ruby
+
+# mise run release -- 0.3.0                    check, version, build, verify, smoke-test; publishes nothing
+# mise run release -- 0.3.0 --publish          the same, then tag, npm, push, the release repository's GitHub release
+# mise run release -- --dev --publish          HEAD to npm under `next` (npm install @tinyactors/node@next)
+# mise run release -- 0.3.0 --build-only       only the packages and their checks
+# mise run release -- 0.3.0 --resume           finish a publish that stopped after npm publish began
+#
+# docs/adr/0001, decisions 10, 11, 12, 14 and 15, for what is shipped and
+# why; docs/adr/0016 for where it is released; docs/browser.md,
+# "Packaging and releases", for @tinyactors/wasm, a sibling package at the
+# same version, tag and changelog. The packages are built by
+# mise/pack.rb. The assets (the six tarballs, SHA256SUMS and notes.md)
+# land in build/dist/<version>/. npm's token is fnox's NPM_TOKEN, else the environment's NPM_TOKEN or NPM_API_TOKEN; the push,
+# the snapshot of tinyactors-napi/ in tinyactors-dev/tinyactors-napi
+# (tagged v<version>) and its GitHub release are Release.push_and_release!.
+# A publish that stopped after its tag was pushed can also be finished by
+# `mise run release:mirror -- tinyactors-napi/v<version> --assets
+# tinyactors-napi/build/dist/<version>` at the root.
+
+require 'digest'
+require_relative '../pack'
+
+PREFIX = NodeAPI::Pack::TAG_PREFIX
+TITLE = ->(version) { "@tinyactors/node and @tinyactors/wasm #{version}" }
+PACKAGE_JSON = NodeAPI::Pack::PACKAGE_JSON
+
+def fail!(message) = Release.fail!(message)
+
+argv = [ENV['usage_version'], *ARGV].compact.reject(&:empty?)
+flag = ->(name) { !argv.delete("--#{name}").nil? | (ENV["usage_#{name.tr('-', '_')}"] == 'true') }
+publish = flag.call('publish')
+dev = flag.call('dev')
+containers = !flag.call('skip-containers')
+tests = !flag.call('skip-tests')
+build_only = flag.call('build-only')
+resume = flag.call('resume')
+argv = argv.uniq
+fail!('--build-only publishes nothing; leave out --publish') if build_only && publish
+fail!('usage: mise run release -- <version> [--publish | --build-only | --resume] | --dev [--publish]') unless argv.size == (dev ? 0 : 1)
+version = dev ? Release.dev_version(PREFIX) : argv.first
+if !dev && Release.parse_version(version)[3]
+  fail!("#{version} is a prerelease; a release is MAJOR.MINOR.PATCH (development builds: --dev)")
+end
+dist_tag = dev ? 'next' : 'latest'
+out = NodeAPI::BUILD.join('dist', version)
+tag = dev ? nil : "#{PREFIX}v#{version}"
+
+# The tarballs in publishing order: the platform packages first, so the
+# main package's optional dependencies exist when it does.
+ordered = lambda do |tarballs|
+  main = out.join(NodeAPI::Pack.tarball_name(NodeAPI::Pack::NAME, version))
+  [*tarballs.reject { |tarball| tarball == main }.sort, main]
+end
+
+# The package each tarball holds, by the name npm pack gave its file.
+package_of = lambda do |tarball|
+  NodeAPI::Pack.names.find { |name| NodeAPI::Pack.tarball_name(name, version) == tarball.basename.to_s } or
+    fail!("#{tarball.basename} is no package of release #{version}")
+end
+
+# Publishes what npm does not have yet; answers false when a publish failed.
+publish_npm = lambda do |tarballs|
+  left = tarballs.reject do |tarball|
+    name = package_of.call(tarball)
+    Release.npm_published?(name, version).tap { |has| puts "release: npm has #{name}@#{version}; skipped" if has }
+  end
+  published, failed = Release.npm_publish!(left, dist_tag: dist_tag)
+  return true unless failed
+
+  warn "release: npm publish #{failed.basename} failed; published: " \
+       "#{published.empty? ? 'none' : published.map { |t| t.basename.to_s }.join(', ')}"
+  false
+end
+
+# A publish that stopped after npm publish began: npm may have some of the
+# packages, and it never takes a version back, so the rest must be these
+# same bytes, never a new build.
+if resume
+  sums = out.join('SHA256SUMS')
+  fail!("#{sums.relative_path_from(Release::REPO)} is missing: nothing to resume") unless sums.file?
+  tarballs = sums.readlines.map do |line|
+    digest, name = line.split
+    file = out.join(name)
+    fail!("#{name} does not match SHA256SUMS: build/dist/#{version}/ changed") unless file.file? && Digest::SHA256.file(file).hexdigest == digest
+    file
+  end
+  unless dev
+    tagged = Release.git('rev-parse', '--quiet', '--verify', "#{tag}^{commit}").to_s.strip
+    fail!("the tag #{tag} is not on HEAD; --resume finishes a publish of HEAD") unless tagged == Release.git('rev-parse', 'HEAD').to_s.strip
+  end
+  fail!('no npm token: fnox has no NPM_TOKEN, and the environment has neither NPM_TOKEN nor NPM_API_TOKEN (ADR 0001, decision 12)') unless Release.npm_token?
+  fail!('npm publish failed again; run --resume once more') unless publish_npm.call(ordered.call(tarballs))
+  if dev
+    puts "release: published @tinyactors/node and @tinyactors/wasm #{version} under the #{dist_tag} dist-tag"
+  else
+    Release.push_and_release!(tag: tag, title: TITLE.call(version), notes_file: out.join('notes.md'), assets: [*tarballs, sums])
+    puts "release: published @tinyactors/node and @tinyactors/wasm #{version} to npm and GitHub, tagged #{tag}"
+  end
+  exit
+end
+
+if containers && !system('sh', '-c', 'docker info', out: File::NULL, err: File::NULL)
+  fail!('docker is not running; it runs the Linux smoke tests (or pass --skip-containers)')
+end
+
+# 1. Check.
+unless build_only
+  # The addon holds core's and txml's code, and its build the root's library.
+  Release.check_tree!(scope: ['tinyactors-napi', 'tinyactors-core', 'tinyxml', 'mise'])
+  Release.check_version!(PREFIX, version) unless dev
+  Release.check_changelog!(prefix: PREFIX, version: version) unless dev
+  taken = NodeAPI::Pack.names.select { |name| Release.npm_published?(name, version) }
+  unless taken.empty?
+    fail!("npm has #{taken.map { |name| "#{name}@#{version}" }.join(', ')} already " \
+          "(a publish that stopped half way: --resume)")
+  end
+  if publish
+    fail!('no npm token: fnox has no NPM_TOKEN, and the environment has neither NPM_TOKEN nor NPM_API_TOKEN (ADR 0001, decision 12)') unless Release.npm_token?
+    fail!('the registry does not accept NPM_TOKEN (npm whoami failed)') unless Release.npm_authenticated?
+  end
+  NodeAPI.run('mise', 'run', 'test') if tests
+end
+NodeAPI.run('mise', 'run', '//tinyactors-core:amalgamate', '--', '--out', NodeAPI::CORE_BUILD.to_s)
+
+subject = "release(napi): v#{version}"
+committed = false
+publishing = false # from the first npm publish, nothing is undone
+finished = false
+begin
+  # 2. Version: a release commits package.json's version and tags it
+  # before building, so the packages are built from the tagged commit.
+  notes = out.join('notes.md')
+  if publish && !dev
+    FileUtils.mkdir_p(out)
+    notes.write(Release.notes(prefix: PREFIX, version: version, title: TITLE.call(version)))
+    text = PACKAGE_JSON.read
+    fail!('package.json has no version field') unless text.match?(/^  "version": "[^"]*"/)
+    PACKAGE_JSON.write(text.sub(/^  "version": "[^"]*"/, "  \"version\": \"#{version}\""))
+    Release.commit_and_tag!(paths: [PACKAGE_JSON], subject: subject, tag: tag, notes_file: notes)
+    committed = true
+  end
+
+  # 3. Build, 4. verify, 5. pack and smoke-test. build_all empties `out`,
+  # so the notes are written again after it.
+  kept = notes.file? ? notes.read : nil
+  tarballs = NodeAPI::Pack.build_all(NodeAPI::Pack.target_names, version: version, out: out)
+  notes.write(kept) if kept
+  NodeAPI::Pack.smoke_here!(tarballs)
+  NodeAPI::Pack.print_wasm_sizes(tarballs.fetch(NodeAPI::Pack::WASM))
+  NodeAPI::Pack.smoke_wasm!(tarballs.fetch(NodeAPI::Pack::WASM))
+  if containers
+    NodeAPI::Pack.smoke_in_containers!(tarballs)
+  else
+    puts 'release: --skip-containers: no Linux container smoke test ran'
+  end
+  packages = ordered.call(tarballs.values)
+  sums = Release.write_sha256sums(packages, out.join('SHA256SUMS'))
+  assets = [*packages, sums]
+
+  unless publish
+    puts <<~DRY
+      release: dry run for @tinyactors/node and @tinyactors/wasm #{version} passed; nothing was committed, tagged or published.
+        would tag:     #{tag || 'nothing (a development build)'}
+        would publish: #{packages.map { |file| file.basename.to_s }.join(', ')}, under the #{dist_tag} dist-tag
+        in:            #{out.relative_path_from(Release::REPO)}
+      Publish with: mise run //tinyactors-napi:release -- #{dev ? '--dev' : version} --publish
+    DRY
+    exit
+  end
+
+  # 6. Publish: npm first, since it never takes a version back, then the
+  # push, the snapshot and the GitHub release.
+  publishing = true
+  fail!('npm publish stopped') unless publish_npm.call(packages)
+  if dev
+    finished = true
+    puts "release: published @tinyactors/node and @tinyactors/wasm #{version} under the #{dist_tag} dist-tag: npm install @tinyactors/node@#{dist_tag}"
+    exit
+  end
+  Release.push_and_release!(tag: tag, title: TITLE.call(version), notes_file: notes, assets: assets)
+  finished = true
+  puts "release: published @tinyactors/node and @tinyactors/wasm #{version} to npm and GitHub (#{Release.release_repository('tinyactors-napi')}), tagged #{tag}"
+rescue Toolchain::Error => e
+  fail!(e.message)
+ensure
+  if committed && !publishing
+    Release.undo_commit_and_tag!(subject: subject, tag: tag)
+    warn "release: undid the local commit and tag #{tag}; nothing was published or pushed"
+  elsif publishing && !finished
+    warn "release: stopped after npm publish began; #{committed ? "the commit and tag #{tag} and " : ''}" \
+         "the files in #{out.relative_path_from(Release::REPO)} stay. Finish with: " \
+         "mise run //tinyactors-napi:release -- #{dev ? '--dev' : version} --resume"
+  end
+end

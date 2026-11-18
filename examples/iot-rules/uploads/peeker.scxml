@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hostile: asks the compiler for a file of the platform's. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="peeker" initial="watching">
+  <datamodel><data id="secrets" src="file:///etc/passwd"/></datamodel>
+  <state id="watching"/>
+</scxml>

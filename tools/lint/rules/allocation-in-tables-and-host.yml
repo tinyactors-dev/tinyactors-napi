@@ -1,0 +1,41 @@
+# The addon allocates almost nothing (AGENTS.md, "The binding's memory";
+# tinyactors-core/docs/bindings.md, section 6; ADR 0010): malloc, calloc,
+# realloc and free are called only by the allocator every host and the
+# module's arena grow through (module.c: ta_napi_allocator_alloc and
+# ta_napi_allocator_free, which report each block with
+# napi_adjust_external_memory), by the environment's instance (module.c:
+# ta_napi_instance_new and ta_napi_instance_finalize), and by host.c's
+# create (ta_napi_host_new) and free (ta_napi_host_finalize), which make
+# and free the host's own struct through that allocator, so it is
+# reported too. A writer or a
+# room that outgrows the stack grows through that allocator or the call's
+# arena, not by a call of its own: nothing per call, per event or per
+# evaluation beyond that growth. Rows live in core's ta_table, which grows
+# through the same allocator.
+id: allocation-in-tables-and-host
+language: c
+severity: error
+message: "the C library's allocator is called only by module.c's allocator and instance and by host.c's create and free (AGENTS.md, \"The binding's memory\"): use the call's arena, a writer over it, a ta_table row, or borrow"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    regex: '^(malloc|calloc|realloc|free)$'
+  not:
+    inside:
+      kind: function_definition
+      stopBy: end
+      has:
+        field: declarator
+        any:
+          - kind: function_declarator
+          - kind: pointer_declarator
+        has:
+          stopBy: end
+          field: declarator
+          kind: identifier
+          regex: '^(ta_napi_allocator_alloc|ta_napi_allocator_free|ta_napi_instance_new|ta_napi_instance_finalize|ta_napi_host_new|ta_napi_host_finalize)$'

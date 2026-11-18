@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Version 2 of a subscription. What changed since version 1:
+
+     - A customer may pause the subscription (paused): no renewal while
+       paused; resuming arms the next one.
+     - A failed payment no longer cuts the customer off at once: for
+       graceMs after the first failure the service stays on (grace), and
+       only then is it suspended (suspended, access 'off'); dunning
+       retries go on through both, and a payment restores it.
+     - failures is renamed dunningAttempts, and the coupon's stamp is a
+       number (couponAppliedMs), which every datamodel can write out.
+
+     A running version 1 subscription is moved here by a migration: it
+     keeps its session, its state (by id: version 1's pastDue becomes this
+     pastDue, and its initial child, grace, is entered without running
+     any onentry), its queue and its pending renewal or dunning timer. The
+     variables both versions declare keep their values; the upgrade event
+     carries version 1's, and the transition below takes the renamed ones
+     from it and starts the grace period of a subscription that was past
+     due. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="subscription" initial="subscription">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="customer" expr="null"/>
+    <data id="plan" expr="'basic'"/>
+    <data id="price" expr="900"/>
+    <data id="cycleMs" expr="2592000000"/>
+    <data id="retryMs" expr="86400000"/>
+    <data id="maxRetries" expr="3"/>
+    <data id="graceMs" expr="259200000"/>
+    <!-- the subscription's own -->
+    <data id="dunningAttempts" expr="0"/>
+    <data id="invoices" expr="0"/>
+    <data id="paid" expr="0"/>
+    <data id="couponCycles" expr="0"/>
+    <data id="couponAppliedMs" expr="null"/>
+    <data id="pauses" expr="0"/>
+    <data id="access" expr="'on'"/>
+    <data id="upgradedFrom" expr="null"/>
+    <data id="reason" expr="null"/>
+  </datamodel>
+
+  <state id="subscription" initial="active">
+    <!-- a migration from version 1: take what was renamed -->
+    <transition event="error.platform.upgrade">
+      <assign location="upgradedFrom" expr="1"/>
+      <assign location="dunningAttempts" expr="_event.data.failures ?? 0"/>
+      <!-- the native datamodel never gets here with a Date (it cannot write
+           one out, so the migration fails); quickjs hands it over as text -->
+      <assign location="couponAppliedMs"
+              expr="_event.data.couponAppliedAt == null ? null : new Date(_event.data.couponAppliedAt).getTime()"/>
+      <if cond="In('pastDue')">
+        <send id="graceTimer" event="grace.over" delayexpr="graceMs + 'ms'"/>
+      </if>
+      <send type="urn:billing:notify" event="subscription.upgraded">
+        <param name="customer" expr="customer"/>
+        <param name="version" expr="2"/>
+        <param name="dunningAttempts" expr="dunningAttempts"/>
+      </send>
+    </transition>
+
+    <transition event="cancel" target="cancelled">
+      <assign location="reason" expr="'cancelled by the customer'"/>
+    </transition>
+    <!-- the grace period ended while a retry was being charged -->
+    <transition event="grace.over">
+      <assign location="access" expr="'off'"/>
+      <send type="urn:billing:notify" event="access.suspended">
+        <param name="customer" expr="customer"/>
+      </send>
+    </transition>
+
+    <state id="active">
+      <onentry>
+        <send id="renewal" event="renew" delayexpr="cycleMs + 'ms'"/>
+      </onentry>
+      <transition event="renew" target="charging"/>
+      <transition event="change">
+        <assign location="plan" expr="_event.data.plan"/>
+        <assign location="price" expr="_event.data.price"/>
+        <send type="urn:billing:notify" event="plan.changed">
+          <param name="customer" expr="customer"/>
+          <param name="plan" expr="plan"/>
+          <param name="price" expr="price"/>
+        </send>
+      </transition>
+      <transition event="coupon">
+        <assign location="couponCycles" expr="_event.data.cycles"/>
+        <assign location="couponAppliedMs" expr="Date.now()"/>
+      </transition>
+      <transition event="pause" target="paused">
+        <cancel sendid="renewal"/>
+        <assign location="pauses" expr="pauses + 1"/>
+      </transition>
+    </state>
+
+    <state id="paused">
+      <onentry>
+        <send type="urn:billing:notify" event="subscription.paused">
+          <param name="customer" expr="customer"/>
+        </send>
+      </onentry>
+      <transition event="resume" target="active">
+        <send type="urn:billing:notify" event="subscription.resumed">
+          <param name="customer" expr="customer"/>
+        </send>
+      </transition>
+    </state>
+
+    <state id="charging">
+      <invoke id="charge" type="urn:billing:payments" src="gateway:charge">
+        <param name="customer" expr="customer"/>
+        <param name="amount" expr="couponCycles &gt; 0 ? Math.round(price / 2) : price"/>
+        <param name="invoice" expr="invoices + 1"/>
+        <param name="attempt" expr="dunningAttempts + 1"/>
+      </invoke>
+      <transition event="done.invoke.charge" target="active">
+        <cancel sendid="graceTimer"/>
+        <assign location="access" expr="'on'"/>
+        <assign location="dunningAttempts" expr="0"/>
+        <assign location="invoices" expr="invoices + 1"/>
+        <assign location="paid" expr="paid + _event.data.amount"/>
+        <if cond="couponCycles &gt; 0">
+          <assign location="couponCycles" expr="couponCycles - 1"/>
+          <if cond="couponCycles === 0">
+            <assign location="couponAppliedMs" expr="null"/>
+          </if>
+        </if>
+        <send type="urn:billing:notify" event="invoice.paid">
+          <param name="customer" expr="customer"/>
+          <param name="invoice" expr="invoices"/>
+          <param name="amount" expr="_event.data.amount"/>
+          <param name="version" expr="2"/>
+        </send>
+      </transition>
+      <transition event="payment.declined" cond="dunningAttempts + 1 &gt;= maxRetries" target="cancelled">
+        <assign location="dunningAttempts" expr="dunningAttempts + 1"/>
+        <assign location="reason" expr="'unpaid after ' + dunningAttempts + ' attempts'"/>
+      </transition>
+      <transition event="payment.declined" cond="access === 'off'" target="suspended">
+        <assign location="dunningAttempts" expr="dunningAttempts + 1"/>
+        <send type="urn:billing:notify" event="payment.failed">
+          <param name="customer" expr="customer"/>
+          <param name="attempt" expr="dunningAttempts"/>
+          <param name="reason" expr="_event.data.reason"/>
+        </send>
+      </transition>
+      <transition event="payment.declined" target="grace">
+        <assign location="dunningAttempts" expr="dunningAttempts + 1"/>
+        <if cond="dunningAttempts === 1">
+          <send id="graceTimer" event="grace.over" delayexpr="graceMs + 'ms'"/>
+        </if>
+        <send type="urn:billing:notify" event="payment.failed">
+          <param name="customer" expr="customer"/>
+          <param name="attempt" expr="dunningAttempts"/>
+          <param name="reason" expr="_event.data.reason"/>
+        </send>
+      </transition>
+    </state>
+
+    <state id="pastDue" initial="grace">
+      <onentry>
+        <send id="dunning" event="retry" delayexpr="retryMs + 'ms'"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="dunning"/>
+      </onexit>
+      <transition event="retry" target="charging"/>
+      <transition event="card.updated" target="charging"/>
+
+      <!-- the service stays on -->
+      <state id="grace">
+        <transition event="grace.over" target="suspended">
+          <assign location="access" expr="'off'"/>
+          <send type="urn:billing:notify" event="access.suspended">
+            <param name="customer" expr="customer"/>
+          </send>
+        </transition>
+      </state>
+
+      <!-- the service is off until a payment goes through -->
+      <state id="suspended"/>
+    </state>
+  </state>
+
+  <final id="cancelled">
+    <onentry>
+      <cancel sendid="renewal"/>
+      <cancel sendid="graceTimer"/>
+      <send type="urn:billing:notify" event="subscription.cancelled">
+        <param name="customer" expr="customer"/>
+        <param name="reason" expr="reason"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

@@ -1,0 +1,23 @@
+# The wasm layer (wasm/src/) calls core (ta_*, TA_* macros, its own
+# ta_web_*, the imports among them), txml (txml_*, the native datamodel's
+# XML content) and the C library's memory and string functions, nothing
+# else: JavaScript is reached through the imports only (ta_web.*, declared
+# in web.h), and nothing of wasi-libc's I/O is called, so the module
+# imports nothing but the layer's own (mise/wasm.rb checks the imports
+# too). A C library function the layer needs joins this list with its
+# reason, in the commit that first calls it. Calls through a pointer (a
+# vtable entry, an allocator's) are not checked.
+id: web-calls-core-and-txml
+language: c
+severity: error
+message: "the wasm layer calls core (ta_*), txml (txml_*) and the C library functions this rule lists, nothing else"
+files:
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    not:
+      regex: '^(ta_\w+|TA_\w+|txml_\w+|offsetof|memcpy|memmove|memset|memcmp)$'

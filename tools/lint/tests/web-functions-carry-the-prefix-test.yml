@@ -1,0 +1,10 @@
+id: web-functions-carry-the-prefix
+valid:
+  - "TA_WEB_EXPORT uint32_t ta_web_turn(ta_web_host *host) { return 0; }"
+  - "static void ta_web_put(ta_web_tree *tree, uint32_t value);"
+  - "TA_WEB_IMPORT(\"effect\") int32_t ta_web_import_effect(uint32_t host, uint32_t index, uint32_t extra);"
+  - "typedef struct ta_web_hooks { void (*drop)(void *data); } ta_web_hooks;"
+invalid:
+  - "TA_WEB_EXPORT uint32_t turn(ta_web_host *host) { return 0; }"
+  - "static void ta_napi_put(void);"
+  - "int32_t effect(uint32_t host, uint32_t index, uint32_t extra);"

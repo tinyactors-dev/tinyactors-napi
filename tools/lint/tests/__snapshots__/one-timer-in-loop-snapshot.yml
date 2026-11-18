@@ -1,0 +1,26 @@
+id: one-timer-in-loop
+snapshots:
+  ? static napi_status ta_napi_arm(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, "setTimeout", out); }
+  : labels:
+    - source: '"setTimeout"'
+      style: primary
+      start: 127
+      end: 139
+  ? static napi_status ta_napi_disarm(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, "clearTimeout", out); }
+  : labels:
+    - source: '"clearTimeout"'
+      style: primary
+      start: 130
+      end: 144
+  ? static napi_status ta_napi_every(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, "setInterval", out); }
+  : labels:
+    - source: '"setInterval"'
+      style: primary
+      start: 129
+      end: 142
+  ? static napi_status ta_napi_turn(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, "setImmediate", out); }
+  : labels:
+    - source: '"setImmediate"'
+      style: primary
+      start: 128
+      end: 142

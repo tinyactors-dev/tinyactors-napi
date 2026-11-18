@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hostile: looks for a way out of the sandbox, and reports what it
+     found through its own alert. On quickjs it finds nothing; the same
+     chart on the native datamodel finds the process (README.md). -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="nosy" initial="watching">
+  <state id="watching">
+    <transition event="reading">
+      <send type="urn:iot:alert" event="alert.raised">
+        <param name="globals" expr="[typeof process, typeof require, typeof fetch, typeof setTimeout, typeof globalThis.process].join(' ')"/>
+        <!-- the way out of a node:vm context: the constructor of a
+             function that the outer realm made -->
+        <param name="escape" expr="(() => { try { return 'pid ' + In.constructor('return process')().pid } catch (e) { return 'refused: ' + e.name } })()"/>
+      </send>
+      <!-- and the plain way, which throws -->
+      <script>require('node:child_process').execSync('id')</script>
+    </transition>
+  </state>
+</scxml>

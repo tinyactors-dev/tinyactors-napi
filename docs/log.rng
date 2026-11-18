@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The schema of docs/log.xml: the coordinator's and the step agents' log
+     of issues, uncertainties and decisions taken without the maintainer
+     during the build-out of docs/plan.xml. Validate with xmllint's relaxng
+     option after each edit; edit with XML tools (lxml), not by hand. -->
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+  <start>
+    <element name="log">
+      <zeroOrMore>
+        <element name="entry">
+          <attribute name="id"><data type="ID"/></attribute>
+          <attribute name="date"><data type="date"/></attribute>
+          <attribute name="step"/>
+          <attribute name="kind"><choice><value>issue</value><value>uncertainty</value><value>decision</value><value>request-to-core</value><value>deviation</value><value>note</value><value>surprise</value></choice></attribute>
+          <optional><attribute name="example"/></optional>
+          <!-- a surprise's layers: where it lived (tools/surprises.mjs) -->
+          <optional><attribute name="layer"><list><oneOrMore><choice><value>core</value><value>binding</value><value>docs</value></choice></oneOrMore></list></attribute></optional>
+          <attribute name="status"><choice><value>open</value><value>resolved</value><value>for-maintainer</value></choice></attribute>
+          <element name="what"><text/></element>
+          <optional><element name="why"><text/></element></optional>
+          <optional><element name="evidence"><text/></element></optional>
+          <optional><element name="resolution"><text/></element></optional>
+        </element>
+      </zeroOrMore>
+    </element>
+  </start>
+</grammar>

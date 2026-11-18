@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The bank's dispatcher. It keeps the hall calls (one per floor) and the
+  cars' positions, gives each hall call to the car in service that is
+  cheapest (distance, plus two floors for each call it holds), and gives a
+  car's calls to the others when it leaves service (maintenance, fire). A
+  call no car can take waits until one enters service.
+
+  The fire alarm reaches the cars through the dispatcher: it passes
+  fire.alarm and fire.clear on to every car, cancels every hall call, and
+  refuses new ones until the alarm is cleared.
+
+  It reports every decision on a call to the building through the I/O
+  processor urn:elevator:report.
+-->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="dispatcher" initial="dispatching">
+  <datamodel>
+    <!-- Set by spawn's params: the system's id and the cars' names. -->
+    <data id="system" expr="'building'"/>
+    <data id="cars" expr="[]"/>
+    <!-- car -> { floor, inService } -->
+    <data id="status" expr="({})"/>
+    <!-- floor -> the car that has the call, or null while it waits -->
+    <data id="calls" expr="({})"/>
+    <!-- What the last plan decided: { orders: [{ floor, car, from }], left: [floor] }. -->
+    <data id="result"/>
+    <data id="order"/>
+    <data id="name"/>
+    <data id="plan"/>
+  </datamodel>
+
+  <script>
+    // Gives each floor of `floors` to the cheapest car in service, writing
+    // calls[floor]; returns the orders, and the floors no car could take.
+    plan = (status, calls, floors) => {
+      const orders = [];
+      const left = [];
+      for (const floor of floors) {
+        let best = null;
+        let bestCost = Infinity;
+        for (const car of Object.keys(status).sort()) {
+          const s = status[car];
+          if (!s.inService) continue;
+          const held = Object.values(calls).filter((c) => c === car).length;
+          const cost = Math.abs(s.floor - floor) + 2 * held;
+          if (cost &lt; bestCost) { best = car; bestCost = cost; }
+        }
+        const from = calls[floor] ?? null;
+        calls[floor] = best;
+        if (best === null) left.push(floor);
+        else orders.push({ floor, car: best, from });
+      }
+      return { orders, left };
+    };
+  </script>
+
+  <state id="bank" initial="dispatching">
+    <transition event="car.in">
+      <script>status[_event.data.car] = { floor: _event.data.floor, inService: true };</script>
+      <assign location="result" expr="plan(status, calls, Object.keys(calls).filter((f) => calls[f] === null).map(Number))"/>
+      <raise event="send.orders"/>
+    </transition>
+    <transition event="car.out">
+      <script>if (status[_event.data.car]) status[_event.data.car].inService = false;</script>
+      <assign location="result" expr="plan(status, calls, Object.keys(calls).filter((f) => calls[f] === _event.data.car).map(Number))"/>
+      <raise event="send.orders"/>
+    </transition>
+    <transition event="car.position">
+      <script>if (status[_event.data.car]) status[_event.data.car].floor = _event.data.floor;</script>
+    </transition>
+    <transition event="car.served">
+      <if cond="calls[_event.data.floor] === _event.data.car">
+        <script>delete calls[_event.data.floor];</script>
+        <send type="urn:elevator:report" event="call.served">
+          <param name="floor" expr="_event.data.floor"/><param name="car" expr="_event.data.car"/>
+        </send>
+      </if>
+    </transition>
+    <!-- Sends what the last plan decided: every transition that plans
+         raises it. -->
+    <transition event="send.orders">
+      <foreach array="result.orders" item="order">
+        <send event="assign" targetexpr="'tinyactors://' + system + '/@' + order.car">
+          <param name="floor" expr="order.floor"/>
+        </send>
+        <send type="urn:elevator:report" event="call.assigned">
+          <param name="floor" expr="order.floor"/><param name="car" expr="order.car"/><param name="from" expr="order.from"/>
+        </send>
+      </foreach>
+      <foreach array="result.left" item="order">
+        <send type="urn:elevator:report" event="call.waiting"><param name="floor" expr="order"/></send>
+      </foreach>
+      <assign location="result" expr="null"/>
+    </transition>
+
+    <state id="dispatching">
+      <transition event="hall.call" cond="String(_event.data.floor) in calls">
+        <send type="urn:elevator:report" event="call.duplicate"><param name="floor" expr="_event.data.floor"/></send>
+      </transition>
+      <transition event="hall.call">
+        <assign location="result" expr="plan(status, calls, [_event.data.floor])"/>
+        <raise event="send.orders"/>
+      </transition>
+      <transition event="fire.alarm" target="fireRecall"/>
+    </state>
+
+    <state id="fireRecall">
+      <onentry>
+        <foreach array="cars" item="name">
+          <send event="fire.alarm" targetexpr="'tinyactors://' + system + '/@' + name"/>
+        </foreach>
+        <foreach array="Object.keys(calls).map(Number)" item="order">
+          <send type="urn:elevator:report" event="call.cancelled"><param name="floor" expr="order"/></send>
+        </foreach>
+        <assign location="calls" expr="({})"/>
+      </onentry>
+      <transition event="hall.call">
+        <send type="urn:elevator:report" event="call.refused"><param name="floor" expr="_event.data.floor"/></send>
+      </transition>
+      <transition event="fire.alarm"/>
+      <transition event="fire.clear" target="dispatching">
+        <foreach array="cars" item="name">
+          <send event="fire.clear" targetexpr="'tinyactors://' + system + '/@' + name"/>
+        </foreach>
+      </transition>
+    </state>
+  </state>
+</scxml>

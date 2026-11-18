@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+#MISE description="Pack @tinyactors/node and @tinyactors/wasm: one addon per native release target, with zig, checked by its symbols, in its platform package, the main package listing them, and the WebAssembly package, all at HEAD's development version, into build/packages/; this machine's addon and the wasm package are installed into fresh projects and smoke-tested under node and bun, the wasm package in Chromium too (mise run pack:wasm: that package only)"
+#USAGE arg "[target]" var=#true help="Release targets to build (aarch64-macos, x86_64-macos, x86_64-linux, aarch64-linux); all of them when none is named"
+# vim:ft=ruby
+
+# mise run pack                       every target's package, and this machine's smoke-tested
+# mise run pack -- x86_64-linux       one target's
+#
+# The version is HEAD's development version, <next minor>-dev.<date>.<N>.g<sha>
+# (Release.dev_version, ADR 0001, decision 15): package.json's is the last
+# release's, which the registry has, so a package of HEAD at that version
+# would be taken for it (an install resolves the optional platform
+# packages by version, and Bun fetched the registry's). The release task
+# stamps the version it releases. Nothing is
+# published: `mise run release` checks, builds and publishes (docs/adr/0001,
+# decisions 10, 11, 14 and 15; mise/pack.rb).
+
+require_relative '../../pack'
+
+argv = [*(ENV['usage_target'] || '').split, *ARGV].uniq
+NodeAPI.run('mise', 'run', '//tinyactors-core:amalgamate', '--', '--out', NodeAPI::CORE_BUILD.to_s)
+
+names = argv.empty? ? NodeAPI::Pack.target_names : argv
+unknown = names - NodeAPI::Pack.target_names
+NodeAPI::Pack.fail!("no such target: #{unknown.join(', ')}; one of #{NodeAPI::Pack.target_names.join(', ')}") unless unknown.empty?
+
+version = Release.dev_version(NodeAPI::Pack::TAG_PREFIX)
+tarballs = NodeAPI::Pack.build_all(names, version: version, out: NodeAPI::Pack::PACKAGES)
+NodeAPI::Pack.print_wasm_sizes(tarballs.fetch(NodeAPI::Pack::WASM))
+if tarballs.key?(Toolchain::Host.current.target.name)
+  NodeAPI::Pack.smoke_here!(tarballs)
+else
+  puts "pack: this machine's target (#{Toolchain::Host.current.target}) was not built: no smoke test"
+end
+NodeAPI::Pack.smoke_wasm!(tarballs.fetch(NodeAPI::Pack::WASM))

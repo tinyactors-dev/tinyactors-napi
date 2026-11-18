@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+#MISE description="Measure bytes per actor at 10,000 actors of one chart, resident and idle, on the native datamodel and on quickjs, under node and bun, with the machine's signature (tools/measure.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="10000" help="the population"
+# vim:ft=ruby
+
+# docs/plan.xml, p1-measure: the numbers beside Python's in AGENTS.md. The
+# report gives the machine's signature beside them, and the four
+# configurations (node and bun, native and quickjs) side by side from one
+# run (root AGENTS.md, "Benchmarks"); each is a process of its own, run
+# by the pinned runtime's path. It writes build/measure.json too. It is a
+# measurement, not a test: `mise run test` does not run it.
+
+require_relative '../napi'
+
+actors = ENV.fetch('usage_actors', '10000')
+runtimes = NodeAPI::RUNTIMES.flat_map { |runtime| ['--runtime', "#{runtime}=#{NodeAPI.pinned(runtime)}"] }
+NodeAPI.run(NodeAPI.pinned('node'), 'tools/measure.mjs', '--actors', actors, '--json',
+            NodeAPI::BUILD.join('measure.json').to_s, *runtimes)

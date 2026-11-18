@@ -1,0 +1,29 @@
+# Every function the addon defines or declares is named ta_napi_*
+# (AGENTS.md, "Names"; tinyactors-core/docs/bindings.md,
+# section 11), static helpers included. A platform's name appears only where
+# the platform requires it: the module's entry points, which Node-API's
+# loader finds by name (node_api.h's NAPI_MODULE_INIT() defines
+# napi_register_module_v1 and node_api_module_get_api_version_v1; Node.js
+# 22's include/node/node_api.h:56-74). A callback given to Node-API
+# (a napi_callback, a napi_finalize) is our function; its name is ours.
+id: functions-carry-the-prefix
+language: c
+severity: error
+message: "a function the addon defines or declares is named ta_napi_* (only the module's entry points are Node-API's)"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  kind: identifier
+  not:
+    regex: '^(ta_napi_\w+|napi_register_module_v1|node_api_module_get_api_version_v1)$'
+  inside:
+    kind: function_declarator
+    field: declarator
+    all:
+      - not: {inside: {kind: parameter_list, stopBy: end}}
+      - inside:
+          stopBy: end
+          any:
+            - kind: function_definition
+            - kind: declaration

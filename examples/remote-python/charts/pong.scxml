@@ -1,0 +1,38 @@
+<!-- The Python system's actor, named "pong": it answers each ping to the
+     address it came from (_event.origin) with a computed result, probes an
+     actor the Node system does not have, and tells the pinger what that
+     probe got back. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="python" name="pong" initial="serving">
+  <datamodel>
+    <data id="served" expr="0"/>
+  </datamodel>
+  <state id="serving">
+    <transition event="ping">
+      <assign location="served" expr="served + 1"/>
+      <log label="ping" expr="f'ping {_event.data[&quot;count&quot;]} from {_event.origin}'"/>
+      <send event="pong" targetexpr="_event.origin">
+        <content expr="{'count': _event.data['count'] + 1,
+                        'trail': _event.data['trail'] + ['py'],
+                        'numbers': _event.data['numbers'],
+                        'sum': sum(_event.data['numbers']),
+                        'echo': _event.data['meta'],
+                        'served': served}"/>
+      </send>
+    </transition>
+    <transition event="probe">
+      <send event="hello" target="tinyactors://node/@nobody" id="py-probe"/>
+    </transition>
+    <transition event="error.communication">
+      <log label="failed" expr="f'{_event.name} {_event.sendid}'"/>
+      <send event="probe.failed" target="tinyactors://node/@ping">
+        <content expr="{'sendid': _event.sendid, 'name': _event.name}"/>
+      </send>
+    </transition>
+    <transition event="echo">
+      <send event="echoed" targetexpr="_event.origin">
+        <content expr="_event.data"/>
+      </send>
+    </transition>
+  </state>
+</scxml>

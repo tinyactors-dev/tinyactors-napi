@@ -1,0 +1,18 @@
+#!/usr/bin/env ruby
+#MISE description="Invoked services under load: N actors each invoking a service the application runs, E round trips, a third done and a third cancelled, on both datamodels under node and bun (tools/services.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="200000" help="the population, one invoked service each"
+#USAGE flag "--events <n>" default="1000000" help="the round trips (actor -> service -> actor) to actors drawn at random"
+# vim:ft=ruby
+
+# The application's side of invoked services as a program writes it: a
+# handler per invoke type that makes one service object per invocation,
+# sendBack and done from it, stop when the invoker cancels. It fails when a
+# pong is lost or counted twice, a done datum is wrong, a service is
+# stopped that was not cancelled (or twice), or the host still holds a
+# service that ended. `mise run test --full` runs it at its defaults; the
+# fast pass runs 10,000 actors and 50,000 round trips.
+
+require_relative '../napi'
+
+NodeAPI.services(actors: ENV.fetch('usage_actors', '200000'), events: ENV.fetch('usage_events', '1000000'))

@@ -1,0 +1,24 @@
+#!/usr/bin/env ruby
+#MISE description="Live migration under load: N actors, R resident, the rest in SQLite, all moved to a new chart version while events come, on both datamodels under node and bun (tools/migration.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="2000000" help="the population"
+#USAGE flag "--resident <n>" default="1000" help="the actors in memory at most (plus two batches while the migration moves them)"
+#USAGE flag "--events <n>" default="200000" help="the events before the migration, and again during it"
+# vim:ft=ruby
+
+# The application's side of migration as a program writes it:
+# host.migrate({wake: true}), the migration's WAKEs queued and woken a batch
+# at a time in their order, an event's WAKE woken at once, the migrated
+# actors swept back into the runtime's SQLite (node:sqlite under node,
+# bun:sqlite under bun). It fails when an actor's count or version is
+# wrong, when the migration leaves an actor behind, when version 1's
+# segment is not retired, or when more than R actors (plus two batches
+# while the migration runs) are resident. Every actor's count is checked up
+# to 25,000 actors (the fast pass: all of them), a sample of 25,000 above.
+# `mise run test --full` runs it at its defaults; the fast pass runs a
+# small one.
+
+require_relative '../napi'
+
+NodeAPI.stress(actors: ENV.fetch('usage_actors', '2000000'), resident: ENV.fetch('usage_resident', '1000'),
+               events: ENV.fetch('usage_events', '200000'), tool: 'migration')

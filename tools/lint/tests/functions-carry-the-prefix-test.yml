@@ -1,0 +1,17 @@
+id: functions-carry-the-prefix
+valid:
+  - "static napi_value ta_napi_host_send(napi_env env, napi_callback_info info) { return NULL; }"
+  - "static void ta_napi_host_finalize(napi_env env, void *data, void *hint);"
+  - "NAPI_MODULE_EXPORT napi_value napi_register_module_v1(napi_env env, napi_value exports) { return exports; }"
+  - "NAPI_MODULE_EXPORT int32_t node_api_module_get_api_version_v1(void) { return 9; }"
+  - "static napi_property_descriptor ta_napi_host_methods[] = {{\"send\", NULL, ta_napi_host_send, NULL, NULL, NULL, napi_default, NULL}};"
+  - "typedef napi_value (*ta_napi_method)(napi_env env, napi_callback_info info);"
+  - "typedef struct ta_napi_hooks { void (*drop)(napi_env env, void *data); } ta_napi_hooks;"
+  - "static void ta_napi_run(ta_host *host) { ta_host_run(host, 1000); }"
+  - "static void (*ta_napi_hook)(void) = NULL;"
+invalid:
+  - "static napi_value host_send(napi_env env, napi_callback_info info) { return NULL; }"
+  - "static napi_value convert(napi_env env, napi_value value);"
+  - "napi_value napi_register_module_v2(napi_env env, napi_value exports) { return exports; }"
+  - "static void finalize(napi_env env, void *data, void *hint) {}"
+  - "static ta_status ta_python_spawn(ta_host *host) { return TA_OK; }"

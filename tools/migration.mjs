@@ -1,0 +1,343 @@
+// Live migration under load: every actor moves to a new chart version
+// while events keep coming, most of them asleep in SQLite (docs/plan.xml,
+// p2-migrate; translated from tinyactors-cpython/tools/migration.py).
+//
+//     node tools/migration.mjs [--actors N] [--resident R] [--events E] [--datamodel native|quickjs]
+//                              [--sample S] [--seed K]
+//
+// The application's side of migration (bindings.md section 4; README,
+// "Migration"), as a program would write it:
+//
+// 1. populate: N actors of version 1 of a counter chart, at most R
+//    resident, the rest hibernated into SQLite (tools/store.mjs); then E
+//    events to actors drawn at random;
+// 2. migrate: version 2 of the chart is added, and host.migrate({wake:
+//    true}) moves every actor of version 1 to it. Version 2 takes the count
+//    from error.platform.upgrade (version 1's bindings) and knows its
+//    version. The migration asks for each hibernated actor with a WAKE that
+//    names it: the program queues those and wakes a batch at a time, so at
+//    most R plus two batches are resident; the migration takes each woken
+//    one in its next runs. An event's WAKE (migration undefined) wakes its
+//    actor at once, and the migration takes that one too, so its events do
+//    not wait for the queue. Meanwhile E more events go to random actors, a
+//    batch after every wake: the migration is live. After each batch the
+//    migrated actors at rest are hibernated again (one put back before it
+//    moved would be asked for again: wasted work, not a stall);
+// 3. verify: the migration ended with every actor migrated, none failed,
+//    none left; a sample of actors (all when N is small) reports its count
+//    and version, which must be the events it was sent and 2; the old
+//    version's segment was retired; after every eviction at most R actors
+//    were resident, plus two batches (the migration's WAKEs woken in a
+//    round, and the actors events woke, until the migration moves them).
+//
+// Exits with status 1 when a check fails. Prints the times, the rates, the
+// store's size, the process's peak memory and the host's region per actor.
+
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { compileCharts, Host, TinyactorsError } from '@tinyactors/node';
+import { BATCH, engine, random, Store } from './store.mjs';
+
+// tinyactors-cpython/tools/charts/counter-v1.ecmascript.scxml and -v2.
+const V1 = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="last" expr="null" />
+  </datamodel>
+  <state id="s">
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="last" expr="_event.data" />
+    </transition>
+    <transition event="report">
+      <log label="count" expr="_sessionid + ' ' + n + ' 1'" />
+    </transition>
+  </state>
+</scxml>
+`;
+
+const V2 = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="last" expr="null" />
+    <data id="version" expr="2" />
+  </datamodel>
+  <state id="s">
+    <transition event="error.platform.upgrade">
+      <assign location="n" expr="_event.data.n" />
+      <assign location="last" expr="_event.data.last" />
+    </transition>
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="last" expr="_event.data" />
+    </transition>
+    <transition event="report">
+      <log label="count" expr="_sessionid + ' ' + n + ' ' + version" />
+    </transition>
+  </state>
+</scxml>
+`;
+
+function options(argv) {
+  const given = { actors: 1_000_000, resident: 1000, events: 100_000, sample: 25_000, datamodel: 'native', seed: 1 };
+  for (let i = 0; i < argv.length; i += 2) {
+    const name = argv[i].replace(/^--/, '');
+    if (!(name in given) || i + 1 >= argv.length) throw new Error(`unknown option ${argv[i]}`);
+    given[name] = name === 'datamodel' ? argv[i + 1] : Number(argv[i + 1]);
+  }
+  if (!['native', 'quickjs'].includes(given.datamodel)) throw new Error('--datamodel is native or quickjs');
+  return given;
+}
+
+function add(host, text) {
+  const compiled = compileCharts([{ name: 'counter.scxml', text }]);
+  try {
+    return host.addImage(compiled.image);
+  } finally {
+    compiled.close();
+  }
+}
+
+async function main() {
+  const o = options(process.argv.slice(2));
+  const draw = random(o.seed);
+  const failures = [];
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'tinyactors-migration-'));
+  const file = path.join(directory, 'actors.db');
+  const store = await Store.open(file);
+  const resident = new Map(); // sessions in memory, least recently used first
+  const moved = new Uint8Array(o.actors); // 1: migrated to version 2 (the MIGRATED effect)
+  const queued = new Uint8Array(o.actors); // 1: the migration asked for it, waiting in `asked`
+  const asked = []; // the migration's WAKEs, in the order they came (read from `head`)
+  let head = 0;
+  const counts = new Map();
+  let wakes = 0;
+  let moves = 0;
+  const current = { result: undefined, id: undefined }; // the migration: its id, then migrationDone's result
+
+  const index = (session) => Number(session & 0xffffffffn) - 1; // segment 0 numbers its sessions 1, 2, ...
+
+  const wakeNow = (host, session) => {
+    host.wake(session, store.get(session));
+    resident.set(session, true);
+    wakes++;
+  };
+  const wake = (host, session, migration) => {
+    if (migration !== undefined) { // the migration asks: in its order, a batch at a time
+      if (!queued[index(session)]) {
+        queued[index(session)] = 1;
+        asked.push(session);
+      }
+      return;
+    }
+    wakeNow(host, session); // an event's or a timer's: at once (a migration waiting for it takes it)
+  };
+  const migrated = (host, entry) => {
+    const i = index(entry.session);
+    if (moved[i]) failures.push(`actor ${entry.session} moved twice`);
+    moved[i] = 1;
+    moves++;
+  };
+  const migrationDone = (host, result) => {
+    current.result = result;
+  };
+  const log = (host, entry) => {
+    const [session, count, version] = entry.text.split(' ');
+    counts.set(BigInt(session), [Number(count), Number(version)]);
+  };
+
+  const hibernate = (host, session) => {
+    try {
+      store.put(session, host.hibernate(session));
+    } catch (error) {
+      if (!(error instanceof TinyactorsError) || error.status !== 'TA_ERROR_STATE') throw error; // a bug: the run fails
+      return false; // not at rest now (an upgrade or an event waiting): it stays
+    }
+    resident.delete(session);
+    return true;
+  };
+
+  // Down to R resident: cold actors first, then the least recently used;
+  // while migrating, only the actors that moved already.
+  const evict = (host, migrating) => {
+    const may = (session) => !migrating || moved[index(session)];
+    while (resident.size > o.resident) {
+      const cold = host.sweep(1 << 20, resident.size - o.resident).filter(may);
+      let went = 0;
+      for (const session of cold) went += hibernate(host, session) ? 1 : 0;
+      if (!went) break;
+    }
+    let over = resident.size - o.resident;
+    for (const session of [...resident.keys()]) {
+      if (over <= 0) break;
+      if (!may(session)) continue;
+      over--;
+      hibernate(host, session);
+    }
+  };
+
+  let peak = 0;
+  const checkResident = async (host, slack) => {
+    let got;
+    host.hostStats(undefined, (h, result) => (got = result.host));
+    await host.idle();
+    const live = Number(got.actors) - Number(got.hibernated);
+    peak = Math.max(peak, live);
+    if (live > o.resident + slack) failures.push(`${live} actors resident, more than ${o.resident} + ${slack}`);
+    return got;
+  };
+
+  // sized as tools/stress.mjs's (instance 128 B and strings 16 B per resident actor, tracing off)
+  const room = o.resident + 4 * BATCH;
+  const config = {
+    systemID: 'migration',
+    system: { maxActors: o.actors + 4 * BATCH, maxEvents: 4096, instanceBytes: 128 * room, stringBytes: 16384 + 16 * room, tracing: false },
+  };
+  const host = new Host(config, { ...engine(o.datamodel), wake, log, migrated, migrationDone });
+  add(host, V1);
+  const chart = host.chart('counter');
+
+  // 1. populate, R resident at most, and events
+  let started = performance.now();
+  const sessions = new BigUint64Array(o.actors);
+  const sent = new Uint32Array(o.actors);
+  for (let i = 0; i < o.actors; i++) {
+    const session = host.spawn(chart);
+    sessions[i] = session;
+    resident.set(session, true);
+    if (resident.size >= o.resident + BATCH) {
+      await host.idle();
+      evict(host, false);
+    }
+    if (i && i % 500_000 === 0) console.log(`  populate: ${i} actors, ${((performance.now() - started) / 1000).toFixed(1)} s`);
+  }
+  await host.idle();
+  evict(host, false);
+  if (o.actors && sessions[o.actors - 1] !== sessions[0] + BigInt(o.actors - 1))
+    failures.push('the sessions are not numbered 1..N in segment 0: index() is wrong');
+
+  const traffic = (count) => {
+    const items = [];
+    for (let k = 0; k < count; k++) {
+      const i = Math.floor(draw() * o.actors);
+      sent[i]++;
+      items.push({ target: sessions[i], event: 'inc', data: { k: i } });
+      if (resident.has(sessions[i])) { // most recently used now
+        resident.delete(sessions[i]);
+        resident.set(sessions[i], true);
+      }
+    }
+    if (host.sendMany(items) !== items.length) failures.push('sendMany refused events');
+  };
+
+  for (let first = 0; first < o.events; first += BATCH) {
+    traffic(Math.min(BATCH, o.events - first));
+    await host.idle();
+    evict(host, false);
+  }
+  store.flush();
+  let got = await checkResident(host, 0);
+  const populated = (performance.now() - started) / 1000;
+  console.log(`populate: ${o.actors} actors of version 1 and ${o.events} events in ${populated.toFixed(1)} s, ` +
+    `${Number(got.actors) - Number(got.hibernated)} resident, ${got.hibernated} hibernated`);
+
+  // 2. migrate, live
+  started = performance.now();
+  add(host, V2);
+  let regionBoth;
+  current.id = host.migrate({ wake: true });
+  let liveEvents = 0;
+  let stalled = 0;
+  let before = -1;
+  while (current.result === undefined) {
+    stalled = moves === before && head === asked.length ? stalled + 1 : 0;
+    before = moves;
+    if (stalled > 100) {
+      failures.push(`the migration stalled: nothing moved in 100 rounds, ${before} actors moved`);
+      break;
+    }
+    let woken = 0;
+    while (head < asked.length && woken < BATCH) {
+      const session = asked[head++];
+      queued[index(session)] = 0;
+      if (!resident.has(session) && !moved[index(session)]) { // an event may have woken it
+        wakeNow(host, session);
+        woken++;
+      }
+    }
+    if (head === asked.length) {
+      asked.length = 0;
+      head = 0;
+    }
+    if (liveEvents < o.events) {
+      const count = Math.min(BATCH, o.events - liveEvents);
+      traffic(count);
+      liveEvents += count;
+    }
+    await host.idle();
+    evict(host, true);
+    // a batch of the migration's WAKEs woken this round, and up to a batch the
+    // round's events woke, until the migration moves them (only moved actors go back)
+    got = await checkResident(host, 2 * BATCH);
+    if (regionBoth === undefined) regionBoth = Number(got.regionBytes);
+  }
+  while (liveEvents < o.events) { // the rest after the migration, so every run has its E events
+    const count = Math.min(BATCH, o.events - liveEvents);
+    traffic(count);
+    liveEvents += count;
+    await host.idle();
+    evict(host, false);
+  }
+  evict(host, false);
+  store.flush();
+  const migration = (performance.now() - started) / 1000;
+  const result = current.result ?? { migration: undefined, migrated: 0, failed: [], pending: undefined };
+  if (result.migration !== current.id || result.migrated !== o.actors || result.failed.length || result.pending?.length !== 0)
+    failures.push(`the migration ended ${JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? `${v}` : v))}, not ${o.actors} migrated`);
+  if (moves !== o.actors) failures.push(`${moves} MIGRATED effects for ${o.actors} actors`);
+  await checkResident(host, 0);
+  console.log(`migrate: ${moves} actors to version 2 in ${migration.toFixed(1)} s (${Math.round(moves / migration)} a second), ` +
+    `${o.events} events meanwhile, ${wakes} woken from the store`);
+
+  // 3. verify a sample
+  started = performance.now();
+  let sample;
+  if (o.actors <= o.sample) sample = Array.from({ length: o.actors }, (_, i) => i);
+  else {
+    const chosen = new Set();
+    while (chosen.size < o.sample) chosen.add(Math.floor(draw() * o.actors));
+    sample = [...chosen];
+  }
+  for (let chunk = 0; chunk < sample.length; chunk += BATCH) {
+    host.sendMany(sample.slice(chunk, chunk + BATCH).map((i) => ({ target: sessions[i], event: 'report' })));
+    await host.idle();
+    evict(host, false);
+    await checkResident(host, 0);
+  }
+  const wrong = sample.filter((i) => {
+    const count = counts.get(sessions[i]);
+    return count === undefined || count[0] !== sent[i] || count[1] !== 2;
+  });
+  if (wrong.length)
+    failures.push(`${wrong.length} of ${sample.length} actors wrong, e.g. actor ${wrong[0]}: ` +
+      `${JSON.stringify(counts.get(sessions[wrong[0]]))}, sent ${sent[wrong[0]]}`);
+  got = await checkResident(host, 0);
+  if (Number(got.segments) !== 1) failures.push(`${got.segments} segments live after the migration: version 1's was not retired`);
+  const region = Number(got.regionBytes);
+  const verified = (performance.now() - started) / 1000;
+  host.close();
+  store.flush();
+  const size = statSync(file).size;
+  const peakRSS = process.resourceUsage().maxRSS * 1024; // maxRSS: kilobytes (node, and bun's process.resourceUsage)
+  console.log(`verify: ${sample.length} actors' counts and versions in ${verified.toFixed(1)} s, ${wrong.length} wrong`);
+  console.log(`store: ${store.puts} puts, ${store.gets} gets, ${(size / 1e6).toFixed(1)} MB`);
+  console.log(`memory: peak resident ${Math.round(peakRSS / 1e6)} MB (${Math.round(peakRSS / o.actors)} B an actor); ` +
+    `region ${((regionBoth ?? 0) / 1e6).toFixed(1)} MB with both versions, ${(region / 1e6).toFixed(1)} MB after ` +
+    `(${Math.round(region / o.actors)} B an actor); at most ${peak} actors resident after an eviction`);
+  rmSync(directory, { recursive: true, force: true });
+  for (const failure of failures) console.log(`FAIL ${failure}`);
+  process.exitCode = failures.length ? 1 : 0;
+}
+
+await main();

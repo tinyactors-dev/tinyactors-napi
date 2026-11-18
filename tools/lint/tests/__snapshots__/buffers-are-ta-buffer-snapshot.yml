@@ -1,0 +1,32 @@
+id: buffers-are-ta-buffer
+snapshots:
+  static const char *ta_napi_text(napi_value value, size_t *length) { return NULL; }:
+    labels:
+    - source: size_t *length
+      style: primary
+      start: 50
+      end: 64
+  static napi_value ta_napi_decode(napi_env env, const uint8_t *bytes, size_t length) { return NULL; }:
+    labels:
+    - source: const uint8_t *bytes
+      style: primary
+      start: 47
+      end: 67
+  static ta_status ta_napi_encode(napi_value value, void *buffer, size_t capacity);:
+    labels:
+    - source: void *buffer
+      style: primary
+      start: 50
+      end: 62
+  static ta_status ta_napi_write(napi_value value, char *out, uint32_t capacity) { return TA_OK; }:
+    labels:
+    - source: char *out
+      style: primary
+      start: 49
+      end: 58
+  typedef struct ta_napi_store { int (*put)(void *store, const void *blob, size_t length); } ta_napi_store;:
+    labels:
+    - source: const void *blob
+      style: primary
+      start: 55
+      end: 71

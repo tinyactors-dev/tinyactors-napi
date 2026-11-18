@@ -1,0 +1,58 @@
+# The convenience layer (lib/, but lib/direct.mjs) is JavaScript over the
+# direct layer's exports only (AGENTS.md, "Layers and the resolver";
+# docs/plan.xml, phase p3: "nothing in it calls the addon other than
+# through its exports"). It imports one module, lib/direct.mjs, which
+# loads the addon and exports its items and nothing else, so what the
+# convenience layer can call is what an application can call. Refused:
+# any other specifier (a package, a `node:` built-in, the addon's `.node`
+# file, index.mjs, a path out of lib/), a computed or dynamic import
+# (`import(path)`, `require(name)`), and loading code around the module
+# system (`createRequire`, `process.dlopen`, `process.getBuiltinModule`).
+# A shape that needs a built-in (a resolver reading files) widens this
+# rule in its own commit, with its reason.
+#
+# Widened once (docs/plan.xml, p3-shapes): `node:fs` and `node:path`, for
+# directoryResolver(root), a resolver that reads a chart's `src` from a
+# file under `root` (fs: realpathSync to see through symlinks, readFileSync
+# to read; path: resolve, relative and dirname to place `source` relative to
+# `base` and refuse what leaves `root`). Both names exactly, with their
+# `node:` prefix: not `fs`, not `node:fs/promises`, no other built-in. The
+# addon is still reached only through ./direct.mjs, so the layer still calls
+# nothing an application could not.
+#
+# Widened again (docs/plan.xml, p5-api): one convenience layer for both
+# packages (docs/browser.md, "One API"). It imports `#direct`, the subpath
+# import package.json maps to the addon's lib/direct.mjs and, under the
+# export condition `tinyactors-wasm`, to the wasm package's direct layer,
+# in place of './direct.mjs'; and it reaches node:fs and node:path through
+# `process.getBuiltinModule` when directoryResolver is called, so that a
+# browser, which has neither, loads the layer and refuses only that call.
+# Both names exactly, as before; no static import of a built-in.
+id: convenience-imports-the-direct-layer
+language: javascript
+severity: error
+message: "the convenience layer imports only the direct layer's exports ('#direct') and reaches only the built-ins 'node:fs' and 'node:path' (directoryResolver, through process.getBuiltinModule): no other module, path, package, built-in, .node file or computed import"
+files:
+  - lib/**/*.mjs
+ignores:
+  - lib/direct.mjs
+rule:
+  any:
+    # import ... from '<specifier>'; export ... from '<specifier>'
+    - all:
+        - kind: string
+        - any:
+            - inside: {kind: import_statement}
+            - inside: {kind: export_statement}
+        - not: {regex: '^[''"]#direct[''"]$'}
+    # import('<specifier>') and require('<specifier>'), whatever the specifier
+    - all:
+        - kind: call_expression
+        - has: {field: function, regex: '^(import|require)$'}
+    - pattern: process.dlopen($$$ARGUMENTS)
+    # getBuiltinModule of node:fs or node:path only, by name
+    - all:
+        - kind: call_expression
+        - has: {field: function, regex: 'getBuiltinModule'}
+        - not: {regex: '\(\s*([''"])node:(fs|path)([''"])\s*\)$'}
+    - pattern: createRequire($$$ARGUMENTS)

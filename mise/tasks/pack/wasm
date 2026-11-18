@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+#MISE description="Pack @tinyactors/wasm alone: its module built (wasm:build's checks), staged and packed at HEAD's development version into build/packages/, its sizes printed (packed, unpacked, the module raw, gzip and brotli), then installed into fresh projects and smoke-tested through both entries under node and bun and in Chromium, a page and a module Worker under the guide's policy"
+# vim:ft=ruby
+
+# mise run pack:wasm
+#
+# The same staging and smoke test as `mise run pack`, which packs it with
+# the addon's packages and checks that they share a version (mise/pack.rb).
+# Nothing is published.
+
+require 'tmpdir'
+require_relative '../../pack'
+
+version = Release.dev_version(NodeAPI::Pack::TAG_PREFIX)
+out = NodeAPI::Pack::PACKAGES
+FileUtils.mkdir_p(out)
+tarball = Dir.mktmpdir('tinyactors-pack') do |staging|
+  NodeAPI::Pack.pack_wasm(version, Pathname.new(staging).join('wasm'), out)
+end
+NodeAPI::Pack.same_version!({ NodeAPI::Pack::WASM => tarball }, version)
+NodeAPI::Pack.print_wasm_sizes(tarball)
+NodeAPI::Pack.smoke_wasm!(tarball)

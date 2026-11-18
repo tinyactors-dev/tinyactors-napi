@@ -1,0 +1,9 @@
+id: web-calls-core-and-txml
+valid:
+  - "void ta_web_f(ta_host *h) { ta_host_run(h, 1); TA_UNUSED(h); }"
+  - "void ta_web_f(void *p) { memcpy(p, p, 1); txml_parser_destroy(p); }"
+  - "void ta_web_f(const ta_allocator *a) { a->free(a->context, 0, 0); }"
+invalid:
+  - "void ta_web_f(void) { printf(\"x\"); }"
+  - "void ta_web_f(void) { abort(); }"
+  - "void ta_web_f(void *p) { strlen(p); }"

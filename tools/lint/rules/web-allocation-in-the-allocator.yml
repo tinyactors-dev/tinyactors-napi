@@ -1,0 +1,35 @@
+# Allocation by lifetime (docs/browser.md, "Memory"): the module's blocks
+# come from ta_wasm_alloc and ta_wasm_free (wasi-libc's aligned_alloc and
+# free), called only by the allocator every host, table, arena and
+# compilation grows through (module.c: ta_web_allocator_alloc and
+# ta_web_allocator_free). Everything else allocates through that allocator
+# (a ta_table, a ta_growable_arena with a mark per call, the host's struct
+# and its output room) or from an arena; nothing calls the C library's
+# allocator, nothing per call or per event beyond that growth.
+id: web-allocation-in-the-allocator
+language: c
+severity: error
+message: "ta_wasm_alloc and ta_wasm_free (and the C library's allocator) are called only by module.c's ta_web_allocator_alloc and ta_web_allocator_free: use a table, an arena or the allocator"
+files:
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    regex: '^(ta_wasm_alloc|ta_wasm_free|malloc|calloc|realloc|free|aligned_alloc)$'
+  not:
+    inside:
+      kind: function_definition
+      stopBy: end
+      has:
+        field: declarator
+        any:
+          - kind: function_declarator
+          - kind: pointer_declarator
+        has:
+          stopBy: end
+          field: declarator
+          kind: identifier
+          regex: '^(ta_web_allocator_alloc|ta_web_allocator_free)$'

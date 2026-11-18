@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The template of a customer's alert rule. One actor of it runs per
+     device the rule watches, on the quickjs datamodel. The platform fills
+     in three placeholders before compiling, each escaped as XML text:
+
+     - id (in braces), the chart's name: the rule's id, checked by the platform to
+       be letters, digits and dashes;
+     - when (in braces), the customer's condition: a JavaScript expression over
+       `reading` ({ device, metric, value, seq }), e.g.
+       reading.metric === 'temp' && reading.value > 80;
+     - message (in braces), the customer's message: a JavaScript expression, e.g.
+       'too hot: ' + reading.value.
+
+     An alert is raised when the condition holds for `sustain` readings in
+     a row, and cleared at the first reading for which it does not. The
+     customer's code runs in two places, the condition and the message;
+     either may throw, loop or allocate, which is the sandbox's to stop and
+     the platform's to report. The chart itself does not catch
+     error.execution: the platform reads the rule's error counters. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="{{id}}" initial="clear">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="device" expr="null"/>
+    <data id="sustain" expr="1"/>
+    <!-- the rule's own -->
+    <data id="reading" expr="null"/>
+    <data id="hit" expr="false"/>
+    <data id="streak" expr="0"/>
+  </datamodel>
+
+  <state id="watching" initial="clear">
+    <transition event="reading">
+      <assign location="reading" expr="_event.data"/>
+      <!-- if the customer's condition fails, the block stops here: no
+           `evaluated`, so the rule's state does not change -->
+      <assign location="hit" expr="Boolean({{when}})"/>
+      <raise event="evaluated"/>
+    </transition>
+
+    <state id="clear">
+      <onentry><assign location="streak" expr="0"/></onentry>
+      <transition event="evaluated" cond="hit &amp;&amp; streak + 1 &gt;= sustain" target="firing"/>
+      <transition event="evaluated" cond="hit"><assign location="streak" expr="streak + 1"/></transition>
+      <transition event="evaluated"><assign location="streak" expr="0"/></transition>
+    </state>
+
+    <state id="firing">
+      <onentry>
+        <send type="urn:iot:alert" event="alert.raised">
+          <param name="device" expr="device"/>
+          <param name="value" expr="reading.value"/>
+          <param name="message" expr="String({{message}})"/>
+        </send>
+      </onentry>
+      <transition event="evaluated" cond="!hit" target="clear">
+        <send type="urn:iot:alert" event="alert.cleared">
+          <param name="device" expr="device"/>
+          <param name="value" expr="reading.value"/>
+        </send>
+      </transition>
+    </state>
+  </state>
+</scxml>

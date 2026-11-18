@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Buggy: reads a field the reading does not have, and throws on the
+     metric it does not expect. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="thrower" initial="watching">
+  <state id="watching">
+    <transition event="reading" cond="_event.data.location.floor &gt; 2">
+      <send type="urn:iot:alert" event="alert.raised"/>
+    </transition>
+    <transition event="reading">
+      <script>if (_event.data.metric !== 'temp') throw new Error('unexpected metric ' + _event.data.metric)</script>
+    </transition>
+  </state>
+</scxml>

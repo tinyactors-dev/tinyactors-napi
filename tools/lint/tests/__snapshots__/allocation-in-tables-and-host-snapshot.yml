@@ -1,0 +1,62 @@
+id: allocation-in-tables-and-host
+snapshots:
+  ? int ta_napi_buffer_reserve(ta_napi_buffer *buffer, size_t need) { char *pointer = (char *)realloc(buffer->pointer, need); return pointer != NULL; }
+  : labels:
+    - source: realloc(buffer->pointer, need)
+      style: primary
+      start: 90
+      end: 120
+    - source: realloc
+      style: secondary
+      start: 90
+      end: 97
+  napi_value ta_napi_encode(napi_env env, napi_callback_info info) { void *copy = malloc(16); return NULL; }:
+    labels:
+    - source: malloc(16)
+      style: primary
+      start: 80
+      end: 90
+    - source: malloc
+      style: secondary
+      start: 80
+      end: 86
+  static char *ta_napi_grow(char *text, size_t length) { return (char *)realloc(text, length); }:
+    labels:
+    - source: realloc(text, length)
+      style: primary
+      start: 70
+      end: 91
+    - source: realloc
+      style: secondary
+      start: 70
+      end: 77
+  ? static ta_status ta_napi_create(void *data, const ta_datamodel_start *start, uint64_t *instance) { void *session = calloc(1, 32); return TA_OK; }
+  : labels:
+    - source: calloc(1, 32)
+      style: primary
+      start: 115
+      end: 128
+    - source: calloc
+      style: secondary
+      start: 115
+      end: 121
+  static void ta_napi_send(ta_napi_host *host) { char *name = malloc(64); free(name); }:
+    labels:
+    - source: malloc(64)
+      style: primary
+      start: 60
+      end: 70
+    - source: malloc
+      style: secondary
+      start: 60
+      end: 66
+  void ta_napi_room_free(ta_napi_room *room) { free(room->pointer); }:
+    labels:
+    - source: free(room->pointer)
+      style: primary
+      start: 45
+      end: 64
+    - source: free
+      style: secondary
+      start: 45
+      end: 49

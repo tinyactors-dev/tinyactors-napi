@@ -1,0 +1,5 @@
+/build/
+node_modules/
+__pycache__/
+/wasm/tinyactors.wasm
+/wasm/lib/realm-script.mjs

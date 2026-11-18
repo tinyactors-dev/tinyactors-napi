@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+#MISE description="Two systems in two processes (examples/remote-python/): a Python host (tinyactors-cpython, built by its own build task) and a Node host talking over a socket; prints the conversation, or with --test runs the example's test under node and bun"
+#MISE depends=["build"]
+#USAGE flag "--test" help="run examples/remote-python/test.mjs under node and bun, on both datamodels, instead of the demo"
+#USAGE flag "--rounds <n>" default="3" help="the demo's rounds of ping-pong"
+# vim:ft=ruby
+
+# The Python process gets the interpreter tinyactors-cpython pins and that
+# project's build/abi3 on its PYTHONPATH, never on sys.path (its AGENTS.md,
+# "Tasks"). A cold build of the Python binding takes about a minute (54 s on
+# 4 CPUs, 2026-10-17: core's amalgamation and both of its builds); an up to
+# date one under a second. `mise run test` runs this with --test.
+
+require_relative '../napi'
+
+NodeAPI.remote_python(test: ENV['usage_test'] == 'true' || ARGV.include?('--test'),
+                      rounds: Integer(ENV.fetch('usage_rounds', '3')))

@@ -1,0 +1,18 @@
+#!/usr/bin/env ruby
+#MISE description="Every operation at N and 2N actors, its cost per call or per actor within a factor, on both datamodels under node and bun (tools/scale.mjs)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="2000000" help="the smaller population; the larger is twice it"
+#USAGE flag "--resident-actors <n>" default="1000000" help="the smaller population of the all-resident scenario (0: --actors); 2,000,000 resident actors take 11 GB on node, so twice --actors does not fit in 16 GiB"
+# vim:ft=ruby
+
+# The scaling gate against accidentally quadratic work: each operation of
+# the API timed on a host of N actors and one of 2N, most of them
+# hibernated in the runtime's SQLite, and again with every actor resident.
+# It fails when an operation costs more than tools/scale.mjs's FACTOR times
+# as much at 2N, unless the operation is a known gap in core (KNOWN, with
+# its request to core). `mise run test --full` runs it at its defaults; the
+# fast pass runs test/scale.test.mjs (20,000 and 40,000 actors).
+
+require_relative '../napi'
+
+NodeAPI.scale(actors: ENV.fetch('usage_actors', '2000000'), resident: ENV.fetch('usage_resident_actors', '1000000'))

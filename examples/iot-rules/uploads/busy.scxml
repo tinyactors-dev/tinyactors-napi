@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Buggy: polls itself forever. Each send is cheap and each step ends,
+     so neither limit of the sandbox applies, but the host is never idle. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="busy" initial="watching">
+  <state id="watching">
+    <transition event="reading"><send event="poll"/></transition>
+    <transition event="poll"><send event="poll"/></transition>
+  </state>
+</scxml>

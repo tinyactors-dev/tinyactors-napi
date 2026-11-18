@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Buggy: the XML is not well formed (an attribute without quotes), and
+     a transition targets a state that does not exist. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="broken" initial="watching">
+  <state id="watching">
+    <transition event="reading" target="alarm"/>
+    <transition event="reading" cond=_event.data.value/>
+  </state>
+</scxml>

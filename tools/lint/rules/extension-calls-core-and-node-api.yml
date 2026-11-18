@@ -1,0 +1,30 @@
+# The addon calls core (ta_*, TA_* macros, our own ta_napi_*) and Node-API
+# (napi_*, node_api_*, NAPI_* macros), and nothing else (AGENTS.md, "C rules":
+# layers; tinyactors-core/docs/bindings.md, sections 1 and 2):
+# no other library, no twin of what C or the runtime does, and nothing of
+# a runtime beyond Node-API: Bun runs the same addon and has no libuv
+# timers (uv_*; oven-sh/bun#18546), and V8's API is Node's alone.
+#
+# Of other libraries it calls txml's txml_* (the project's XML library,
+# compiled into the addon for the native datamodel's XML content:
+# docs/plan.xml, decision d-dom), called from src/datamodel/dom.c only.
+#
+# Of the C library it calls the memory and string functions below, which
+# value conversion needs, and malloc, calloc, realloc and free: the host's
+# allocator (AGENTS.md, "The host's allocator"). A C library function the
+# addon needs is added to this list with its reason, in the commit that
+# first calls it. Calls through a pointer (a vtable entry) are not checked.
+id: extension-calls-core-and-node-api
+language: c
+severity: error
+message: "the addon calls core (ta_*), Node-API (napi_*, node_api_*) and the C library functions this rule lists, nothing else"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    not:
+      regex: '^(ta_\w+|TA_\w+|txml_\w+|napi_\w+|node_api_\w+|NAPI_\w+|offsetof|assert|static_assert|_Static_assert|memcpy|memmove|memset|memcmp|memchr|strlen|malloc|calloc|realloc|free)$'

@@ -1,0 +1,20 @@
+# Bytes cross every function of the addon as ta_bytes (input) or
+# ta_buffer * (output), never as a pointer and a length, static helpers
+# included (AGENTS.md, "At most three parameters"; docs/adr/0009 in the
+# repository root, decision 8). The pattern is core's
+# (tinyactors-core/tools/lint/utils/bytes-as-pointer-and-length.yml); a
+# function whose signature a typedef fixes (ta_allocator's alloc and free,
+# which take a pointer and its size) is exempt by that signature.
+id: buffers-are-ta-buffer
+language: c
+severity: error
+message: "bytes cross a function as ta_bytes or ta_buffer *, not a pointer and a length (ADR 0009)"
+files:
+  - src/**/*.c
+  - src/**/*.h
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+rule:
+  matches: bytes-as-pointer-and-length # tinyactors-core/tools/lint/utils/
+  not:
+    inside: {kind: parameter_list, matches: fixed-signature}

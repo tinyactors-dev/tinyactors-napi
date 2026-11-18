@@ -1,0 +1,32 @@
+id: web-calls-core-and-txml
+snapshots:
+  void ta_web_f(void *p) { strlen(p); }:
+    labels:
+    - source: strlen(p)
+      style: primary
+      start: 25
+      end: 34
+    - source: strlen
+      style: secondary
+      start: 25
+      end: 31
+  void ta_web_f(void) { abort(); }:
+    labels:
+    - source: abort()
+      style: primary
+      start: 22
+      end: 29
+    - source: abort
+      style: secondary
+      start: 22
+      end: 27
+  void ta_web_f(void) { printf("x"); }:
+    labels:
+    - source: printf("x")
+      style: primary
+      start: 22
+      end: 33
+    - source: printf
+      style: secondary
+      start: 22
+      end: 28

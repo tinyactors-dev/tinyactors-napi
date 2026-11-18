@@ -1,37 +1,50 @@
 {
   "name": "@tinyactors/node",
-  "version": "0.2.0",
-  "description": "xstate-style state machines and actors on the tinyactors SCXML runtime (N-API addon); hibernation, links",
+  "version": "0.3.0",
+  "description": "SCXML statecharts as actors on the tinyactors host, from Node.js and Bun (a Node-API addon)",
   "keywords": [
     "actor",
     "actors",
     "statechart",
     "scxml",
     "state-machine",
-    "xstate",
     "napi",
     "bun"
   ],
-  "homepage": "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-core/bindings/node#readme",
+  "homepage": "https://github.com/tinyactors-dev/tinyactors-napi#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dhamidi/tinyactors.git",
-    "directory": "tinyactors-core/bindings/node"
+    "url": "git+https://github.com/tinyactors-dev/tinyactors.git",
+    "directory": "tinyactors-napi"
   },
   "bugs": {
-    "url": "https://github.com/dhamidi/tinyactors/issues"
+    "url": "https://github.com/tinyactors-dev/tinyactors/issues"
   },
   "license": "MIT",
-  "main": "index.js",
-  "types": "index.d.ts",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.3.0"
   },
-  "scripts": {
-    "build": "mise run node:build",
-    "test": "node --test \"test/*.test.js\" && tsc -p test"
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "tinyactors-wasm": "./wasm/index.mjs",
+      "default": "./index.mjs"
+    }
   },
-  "devDependencies": {
-    "typescript": "^5.9.0"
+  "files": [
+    "index.mjs",
+    "lib",
+    "index.d.ts",
+    "README.md",
+    "LICENSE",
+    "docs/guide",
+    "docs/values.md"
+  ],
+  "imports": {
+    "#direct": {
+      "tinyactors-wasm": "./wasm/lib/direct.mjs",
+      "default": "./lib/direct.mjs"
+    }
   }
 }

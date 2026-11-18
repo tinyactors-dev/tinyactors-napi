@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hostile: asks for a service the platform does not run. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="invoker" initial="watching">
+  <state id="watching">
+    <transition event="reading" target="shelling"/>
+  </state>
+  <state id="shelling">
+    <invoke type="urn:shell" src="cat /etc/passwd"/>
+  </state>
+</scxml>

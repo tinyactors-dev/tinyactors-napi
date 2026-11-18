@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One order, from placement to delivery, cancellation or failure.
+
+     The payment is an invoked service, one invocation per attempt: each
+     attempt has a timeout of its own (a delayed send), and leaving the
+     attempt, by timeout, error or cancel, cancels the invocation. Retries
+     back off exponentially. Every attempt charges under one idempotency
+     key, the order's id, so an attempt whose answer was lost or came too
+     late is never charged twice.
+
+     The shipment is another invoked service, running from the pick to the
+     delivery. A cancel while the parcel is still in the warehouse is a
+     request to the warehouse, which may lose the race with the hand-over
+     to the carrier; once handed over, a cancel is refused.
+
+     Whenever money may have been taken and the order does not ship, the
+     order refunds through the refunds I/O processor, retrying until the
+     gateway confirms. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="order" initial="validating">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="order" expr="null"/>
+    <data id="items" expr="[]"/>
+    <data id="address" expr="null"/>
+    <data id="paymentTimeoutMs" expr="10000"/>
+    <data id="backoffMs" expr="1000"/>
+    <data id="maxAttempts" expr="3"/>
+    <data id="refundRetryMs" expr="5000"/>
+    <!-- the order's own -->
+    <data id="total" expr="0"/>
+    <data id="attempt" expr="0"/>
+    <data id="chargeID" expr="null"/>
+    <data id="trackingID" expr="null"/>
+    <data id="outcome" expr="null"/>
+    <data id="reason" expr="null"/>
+    <data id="refunded" expr="0"/>
+  </datamodel>
+
+  <state id="validating">
+    <onentry>
+      <script>total = items.reduce((sum, item) => sum + item.price * item.qty, 0)</script>
+    </onentry>
+    <transition cond="items.length === 0" target="failed">
+      <assign location="reason" expr="'the order has no items'"/>
+    </transition>
+    <transition cond="!(total &gt; 0)" target="failed">
+      <assign location="reason" expr="'the order has no positive total'"/>
+    </transition>
+    <transition target="payment"/>
+  </state>
+
+  <state id="payment" initial="charging">
+    <!-- a cancel during payment: a charge may be in flight, so refund -->
+    <transition event="cancel" target="refunding">
+      <assign location="outcome" expr="'cancelled'"/>
+      <assign location="reason" expr="'cancelled by the customer during payment'"/>
+    </transition>
+
+    <state id="charging">
+      <onentry>
+        <assign location="attempt" expr="attempt + 1"/>
+        <!-- a delayexpr must give text with a unit: a bare number is
+             error.execution (docs/log.xml, l-p4-examples-order-delayexpr) -->
+        <send id="paymentTimer" event="payment.timeout" delayexpr="paymentTimeoutMs + 'ms'"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="paymentTimer"/>
+      </onexit>
+      <invoke id="charge" type="urn:shop:payment" src="gateway:charge">
+        <param name="order" expr="order"/>
+        <param name="amount" expr="total"/>
+        <param name="attempt" expr="attempt"/>
+      </invoke>
+      <transition event="done.invoke.charge" target="fulfilment">
+        <assign location="chargeID" expr="_event.data.chargeID"/>
+        <send type="urn:shop:notify" event="order.paid">
+          <param name="order" expr="order"/>
+          <param name="amount" expr="total"/>
+          <param name="attempts" expr="attempt"/>
+        </send>
+      </transition>
+      <transition event="payment.declined" target="failed">
+        <assign location="reason" expr="'payment declined: ' + _event.data.reason"/>
+      </transition>
+      <transition event="payment.timeout payment.error" cond="attempt &lt; maxAttempts" target="backoff">
+        <log label="retry" expr="order + ': attempt ' + attempt + ' ' + _event.name"/>
+      </transition>
+      <!-- the last attempt failed: an earlier one may still have charged -->
+      <transition event="payment.timeout payment.error" target="refunding">
+        <assign location="outcome" expr="'failed'"/>
+        <assign location="reason" expr="'no payment after ' + attempt + ' attempts'"/>
+      </transition>
+    </state>
+
+    <state id="backoff">
+      <onentry>
+        <send id="retryTimer" event="payment.retry" delayexpr="backoffMs * Math.pow(2, attempt - 1) + 'ms'"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="retryTimer"/>
+      </onexit>
+      <transition event="payment.retry" target="charging"/>
+    </state>
+  </state>
+
+  <state id="fulfilment" initial="picking">
+    <invoke id="ship" type="urn:shop:shipping" src="warehouse:main">
+      <param name="order" expr="order"/>
+      <param name="items" expr="items"/>
+      <param name="address" expr="address"/>
+    </invoke>
+    <transition event="shipping.outOfStock" target="refunding">
+      <assign location="outcome" expr="'failed'"/>
+      <assign location="reason" expr="'out of stock: ' + _event.data.sku"/>
+    </transition>
+    <transition event="done.invoke.ship" target="delivered"/>
+
+    <state id="picking">
+      <transition event="shipping.handedOver" target="handedOver"/>
+      <transition event="cancel" target="cancelling"/>
+    </state>
+
+    <!-- the cancel races the hand-over: the warehouse decides -->
+    <state id="cancelling">
+      <onentry>
+        <send target="#_ship" event="cancel"/>
+      </onentry>
+      <transition event="shipping.cancelled" target="refunding">
+        <assign location="outcome" expr="'cancelled'"/>
+        <assign location="reason" expr="'cancelled by the customer before shipping'"/>
+      </transition>
+      <transition event="shipping.handedOver" target="handedOver">
+        <send type="urn:shop:notify" event="order.cancelRefused">
+          <param name="order" expr="order"/>
+          <param name="reason" expr="'the parcel was handed to the carrier first'"/>
+        </send>
+      </transition>
+    </state>
+
+    <state id="handedOver">
+      <onentry>
+        <assign location="trackingID" expr="_event.data.trackingID"/>
+        <send type="urn:shop:notify" event="order.shipped">
+          <param name="order" expr="order"/>
+          <param name="trackingID" expr="trackingID"/>
+        </send>
+      </onentry>
+      <transition event="cancel">
+        <send type="urn:shop:notify" event="order.cancelRefused">
+          <param name="order" expr="order"/>
+          <param name="reason" expr="'the parcel is with the carrier'"/>
+        </send>
+      </transition>
+    </state>
+  </state>
+
+  <!-- compensation: give back whatever the gateway took, until it confirms -->
+  <state id="refunding" initial="requesting">
+    <transition event="cancel"/>
+    <state id="requesting">
+      <onentry>
+        <send type="urn:shop:refunds" event="refund">
+          <param name="order" expr="order"/>
+        </send>
+      </onentry>
+      <transition event="refunded" cond="outcome === 'cancelled'" target="cancelled">
+        <assign location="refunded" expr="_event.data.amount"/>
+      </transition>
+      <transition event="refunded" target="failed">
+        <assign location="refunded" expr="_event.data.amount"/>
+      </transition>
+      <transition event="error.communication" target="waiting">
+        <log label="retry" expr="order + ': refund failed, retrying'"/>
+      </transition>
+    </state>
+    <state id="waiting">
+      <onentry>
+        <send event="refund.retry" delayexpr="refundRetryMs + 'ms'"/>
+      </onentry>
+      <transition event="refund.retry" target="requesting"/>
+    </state>
+  </state>
+
+  <final id="delivered">
+    <onentry>
+      <send type="urn:shop:notify" event="order.delivered">
+        <param name="order" expr="order"/>
+        <param name="trackingID" expr="trackingID"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="cancelled">
+    <onentry>
+      <send type="urn:shop:notify" event="order.cancelled">
+        <param name="order" expr="order"/>
+        <param name="reason" expr="reason"/>
+        <param name="refunded" expr="refunded"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="failed">
+    <onentry>
+      <send type="urn:shop:notify" event="order.failed">
+        <param name="order" expr="order"/>
+        <param name="reason" expr="reason"/>
+        <param name="refunded" expr="refunded"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

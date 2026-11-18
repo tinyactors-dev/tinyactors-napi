@@ -1,11 +1,31 @@
-# tinyactors for Node.js
+# @tinyactors/node
 
-xstate-style machines and actors running on the tinyactors SCXML runtime.
-The addon is written against the **Node-API C API** (`node_api.h`, no C++
-wrapper) and links the tinyactors static libraries. The JavaScript API lives
-in `bindings/shared/core.mjs` and is shared with the
-[web binding](../web) (same `index.d.ts`), so the same code runs in Node.js and
-in browsers. Node.js ≥ 22.12 (`require()` of the ES-module core).
+Run statecharts as actors in Node.js and Bun.
+
+Much of a program's logic is a lifecycle: an order is open, then paying,
+then paid or timed out; a connection is dialing, up, or backing off. Written
+as flags and callbacks, a lifecycle spreads over a codebase, and the states
+it may be in are nowhere written down. A **statechart** writes them down:
+the states, the events that move between them, and what happens on the
+way. This package runs statecharts written in
+[SCXML](https://www.w3.org/TR/scxml/), the W3C's XML language for them,
+with JavaScript for their data and expressions.
+
+Each running statechart is an **actor**: it has its own data and a queue
+of events, and it talks to the world only by sending and receiving events.
+A **host** runs many of them, from a handful to millions, on your
+program's event loop. The host does no I/O of its own. When an actor sends
+something out (a payment request, a log line, an email), your handler gets
+it, does the I/O, and answers with an event. So the logic stays in the
+charts, testable on a simulated clock, and the I/O stays in your code.
+
+Use it when your program keeps many long-lived things that each have a
+lifecycle (orders, sessions, devices, workflows), when you want timeouts
+and retries written as states rather than timers, or when the same logic
+must run in tests without the network.
+
+This README describes the package as it is built from `main`. The last
+version on npm, 0.2.0, is an earlier binding with another API.
 
 ## Install
 
@@ -13,389 +33,631 @@ in browsers. Node.js ≥ 22.12 (`require()` of the ES-module core).
 npm install @tinyactors/node     # or: pnpm add, bun add
 ```
 
-The package carries no compiler step: each supported platform has a
-prebuilt addon in its own package (`@tinyactors/node-darwin-arm64`,
-`-darwin-x64`, `-linux-x64`, `-linux-arm64`), an optional dependency that
-npm, pnpm and Bun install only where it matches. The Linux addon serves
-glibc and musl alike. Development builds are under the `next` dist-tag
-(`npm install @tinyactors/node@next`).
+It runs on Node.js 22.3 or later and on Bun (tested on 1.4), on macOS
+(arm64, x64) and Linux (x64, arm64; glibc or musl). Nothing compiles on
+install: the addon is prebuilt, one per platform, in
+`@tinyactors/node-darwin-arm64`, `-darwin-x64`, `-linux-x64` and
+`-linux-arm64`, which the main package lists as optional dependencies, so
+the package manager installs only the one that matches. A Linux addon
+links no C library, so one file serves glibc and musl. The macOS addons
+are cross-built from Linux and checked by their symbols; no Mac has run
+them yet. An install that left out optional dependencies
+(`--no-optional`, `--omit=optional`) fails at import, naming the package
+it needs.
 
-In this repository, `mise run node:build` (in `tinyactors-core`) builds the
-addon into `bindings/node/build/tinyactors.node`, which `index.js` loads
-before any installed platform package. Packaging and releasing are in
-[distribution](../../docs/distribution.md).
+For a browser, or a platform with no addon (Windows), the same API is
+`@tinyactors/wasm`, core compiled to WebAssembly: see
+[In the browser](docs/guide/browser.md), which says what differs.
+
+Development builds of `main` are published under the `next` dist-tag
+(`npm install @tinyactors/node@next`), versioned
+`<next minor>-dev.<date>.<n>.g<commit>`. Releases, their tarballs and
+`SHA256SUMS` are on
+[tinyactors-dev/tinyactors-napi](https://github.com/tinyactors-dev/tinyactors-napi/releases).
+
+## A first program
+
+An order collects items, then asks a payment service to charge the total,
+and is paid when the service answers. Save this as `order.mjs` and run it
+with `node order.mjs` or `bun order.mjs`:
 
 ```js
-const { createMachine, createActor, assign } = require('@tinyactors/node');
+import { compileCharts, Host } from '@tinyactors/node';
 
-const toggle = createMachine({
-  id: 'toggle',
-  initial: 'inactive',
-  context: { count: 0 },
-  states: {
-    inactive: { on: { TOGGLE: { target: 'active', actions: assign({ count: ({ context }) => context.count + 1 }) } } },
-    active: { on: { TOGGLE: 'inactive' }, after: { 1000: 'inactive' } },
+// 1. The chart: the order's states and what moves between them.
+const chart = `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="order" initial="open">
+  <datamodel>
+    <data id="total" expr="0"/>
+  </datamodel>
+  <state id="open">
+    <transition event="add">
+      <assign location="total" expr="total + _event.data.price"/>
+    </transition>
+    <transition event="checkout" target="paying"/>
+  </state>
+  <state id="paying">
+    <onentry>
+      <send type="urn:payments" event="charge" target="card">
+        <param name="amount" expr="total"/>
+      </send>
+    </onentry>
+    <transition event="charged" target="paid"/>
+  </state>
+  <final id="paid">
+    <onentry><log label="order" expr="'paid ' + total"/></onentry>
+  </final>
+</scxml>`;
+
+// 2. Compile it into an image the host can load.
+const compiled = compileCharts([{ name: 'order.scxml', text: chart }]);
+
+// 3. A host, with a handler for what the chart sends to urn:payments.
+const host = new Host(
+  { systemID: 'shop', ioProcessors: [{ type: 'urn:payments' }] },
+  {
+    ioProcessors: {
+      'urn:payments': (host, send) => {
+        console.log(`charging ${send.data.amount} to ${send.target}`);
+        send.answer('charged');
+      },
+    },
+    log: (host, entry) => console.log(`${entry.label}: ${entry.text}`),
   },
-});
+);
+host.addImage(compiled.image);
+compiled.close();
 
-const actor = createActor(toggle).start();
-actor.subscribe((s) => console.log(s.value, s.context));
-actor.send({ type: 'TOGGLE' });
+// 4. An actor of the chart, and three events for it.
+const order = host.spawn(host.chart('order'));
+host.send(order, 'add', { price: 4 });
+host.send(order, 'add', { price: 7 });
+host.send(order, 'checkout');
+
+// 5. Let it run, then stop.
+await host.idle();
+host.close();
 ```
 
-## How it works
+It prints:
 
-- `createMachine(config)` compiles the config to SCXML that reads like
-  hand-written SCXML (`machine.toSCXML()`): named guards and actions appear by
-  name (`cond="isAdult"`, `<script>track({"tag":"t"})</script>`), inline
-  functions by their source, literals as JSON, `stateIn` as `In('a.b')`,
-  combinators as `and(isAdult, not(above({"min":30})))`, assigns as
-  `<assign location="count" expr="..."/>`, raises as `<raise event="X"/>`.
-- The context is SCXML data: one `<data id="prop">` per property, for object
-  literals and for factories `({ input }) => ({ a: input.a, b: [] })` alike
-  (each `<data>` shows its property's source; the factory still runs once per
-  actor). `assign()` becomes one `<assign location="prop">` per property; the
-  computed properties are evaluated together against the previous context
-  (xstate semantics), constants follow. Sequential steps read best as
-  sequential assigns: `[assign({ pos: ... }), assign({ status: ({ context })
-  => status(context.pos) })]`. Only a function the compiler cannot split (a
-  block body, spreads, computed keys) falls back to a single
-  `<data id="context">` / `<assign location="context">`.
-- Each machine keeps a registry from that text to the JavaScript function
-  implementing it. When a chart is attached to a native system, the datamodel
-  resolves every expression of the chart once and stores the functions in a
-  table indexed by the image's expression ids — evaluation is an indexed
-  call, and the index never appears in the chart. Two different functions
-  with the same source text are told apart by a trailing comment
-  (`... /* 2 */`).
-- **One native system per `System`, not per actor.** Actors started with
-  `createActor()` live in the process-wide default system (or the one given
-  as `createActor(machine, { system: createSystem() })`). The machines known
-  when the system starts are linked into one image; a machine defined later
-  is linked into an additional *segment* (as is each reloaded version). All
-  segments share one base URI, `tinyactors://<system id>/`, and each creates
-  sessions from its own range; a send to a session in another segment goes
-  through the runtime's remote I/O processor (`TA_IO_PROCESSOR_SCXML_SHARED`), so
-  `sendTo(actor, ...)` and
-  `sendTo(({ system }) => system.get('id'), ...)` work across them. The
-  native region grows by relocation (thousands of actors per system).
-- Context, events and payloads are napi references owned by the system's
-  datamodel host; they live as long as the system (payloads are refcounted
-  and recycled).
-- Events are processed synchronously on `send()`; long-running work yields
-  cooperatively (`setImmediate`) so even a runaway eventless loop cannot block
-  the event loop or starve other actors. Delayed events use the host clock via
-  `setTimeout`. Calls made from inside actions (e.g. `actor.send()`) are
-  queued until the current run returns. A system runs on the JavaScript
-  thread; for more cores, run systems in worker threads and link them —
-  [docs/concurrency.md](../../docs/concurrency.md) explains what runs when.
+```output
+charging 11 to card
+order: paid 11
+```
 
-## Hibernation
+What happened, step by step:
 
-Idle actors can be unloaded and brought back on demand. The system never does
-I/O itself: you hand it a store.
+1. **The chart** has three states. In `open`, each `add` event adds its
+   price to the variable `total`; `checkout` moves to `paying`. Entering
+   `paying` sends a `charge` event to `urn:payments`, which is not
+   another actor but something outside the host. The answer `charged`
+   moves to `paid`, a final state, which logs the total.
+2. **`compileCharts`** checks the chart and compiles it. A mistake in the
+   XML, an unknown state id or a malformed attribute throws a
+   `CompileError` here, before anything runs. JavaScript that does not
+   parse is a warning in `compiled.diagnostics` (SCXML makes it an
+   `error.execution` when it runs), and an error with
+   `compileCharts(sources, undefined, { warningsAsErrors: true })`.
+3. **`new Host(config, options)`** makes a host. The config names this
+   system (`systemID`) and the I/O processors its charts may send to; the
+   options hold your handlers. The `urn:payments` handler gets each send
+   to that type: its data, its target, and `answer()`, which sends an
+   event back to the actor that sent it.
+4. **`host.spawn`** starts an actor of the chart and returns its session
+   id, a `bigint`. `host.send` puts an event in its queue.
+5. **`await host.idle()`** waits until the host has nothing left to do.
+   The actor runs on the event loop on its own; `idle()` only watches.
+   `host.close()` frees the host.
+
+## Concepts
+
+Read these in order the first time. Each builds on the one before.
+
+### Charts
+
+A chart is an SCXML document. Its parts, from the outside in:
+
+- **`<scxml>`** names the chart (`name`), its first state (`initial`) and
+  its language for data and expressions. Write `datamodel="ecmascript"`,
+  JavaScript, on every chart. A chart without the attribute gets SCXML's
+  null datamodel, which evaluates no expression and says nothing about it:
+  its `<log>`s and `<data>` do nothing. Another value is refused when the
+  image is added (`host.addImage` throws `TA_ERROR_INVALID`).
+- **`<state id>`** is a state the actor can be in. States nest (a
+  compound state has children, one of them active), and `<parallel>`
+  holds regions that are all active at once. **`<final>`** ends the
+  actor.
+- **`<transition event cond target>`** leaves the state when an event
+  whose name matches `event` arrives and the expression `cond` is true.
+  Without `target` it runs its actions and stays.
+- **Actions** run on a transition and in `<onentry>` and `<onexit>`:
+  `<assign>`, `<script>`, `<log>`, `<send>`, `<raise>`, `<cancel>`,
+  `<if>` and `<foreach>`.
+- **`<datamodel>`** declares the actor's variables, one `<data id expr>`
+  each. Every expression in the chart sees them as plain variables, and
+  sees the event being handled as `_event` (`_event.name`, `_event.data`).
+
+An event's name is matched by prefix, word by word: `event="error"` and
+`event="error.*"` match `error.execution` and `error.communication`;
+`event="a b"` matches either name; `event="*"` matches any event. An
+event no transition matches is dropped.
+
+The prefix rule also matches an answer whose name starts with the
+request's: `event="join"` takes `join.refused` too. A chart that asks a
+peer again on `join`, and a peer that answers with `join.refused`, then
+answer each other for ever, and `await host.idle()` never resolves. Name
+an answer so that it does not extend the request (`refused.join`), and
+see [Inspecting a host](docs/guide/inspection.md#two-actors-that-never-rest)
+for how such a loop shows in the host's counters.
+
+[Writing charts](docs/guide/charts.md) covers the JavaScript a chart may
+hold, `<script>`, XML data, several charts in one image (and
+`host.addCharts`, `host.spawnChart` and `directoryResolver`, which save
+the steps), and `<invoke>`.
+
+### Starting an actor with data
+
+`spawn`'s `params` set the new actor's variables: each key that names a
+top-level `<data>` replaces that variable's initial value, keys that name
+no `<data>` are left out, and the variables you do not name keep the
+chart's `expr`.
 
 ```js
-const system = createSystem({
-  hibernation: {
-    store: { get: (k) => db.get(k), set: (k, blob) => db.put(k, blob), delete: (k) => db.del(k) }, // may be async
-    sweepMs: 30_000, // unload actors idle for a whole sweep period (0 = only system.hibernate())
-  },
-});
-system.hibernate(actor); // or system.hibernate() for every idle actor
-actor.hibernated;        // true; getSnapshot() is answered from cache
-actor.send({ type: 'X' }); // the event waits, the blob is loaded, the actor carries on
+import { compileCharts, Host } from '@tinyactors/node';
+
+const compiled = compileCharts([{ name: 'greeter.scxml', text: `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="greeter" initial="ready">
+  <datamodel>
+    <data id="greeting" expr="'Hello'"/>
+    <data id="who" expr="'world'"/>
+  </datamodel>
+  <state id="ready">
+    <onentry><log expr="greeting + ', ' + who + '!'"/></onentry>
+  </state>
+</scxml>` }]);
+
+const host = new Host({ systemID: 'demo' }, { log: (host, entry) => console.log(entry.text) });
+host.addImage(compiled.image);
+compiled.close();
+
+host.spawn(host.chart('greeter'));
+host.spawn(host.chart('greeter'), { params: { who: 'Ada' } });
+host.spawn(host.chart('greeter'), { params: { greeting: 'Hi', who: 'Bob', mood: 'ignored' } });
+await host.idle();
+host.close();
 ```
 
-Context, events and input travel through a tagged-JSON codec (`encodeValue` /
-`decodeValue`). It keeps `undefined`, `Date`, `Map`, `Set`, `BigInt`, shared
-references and cycles, and encodes actors as their addresses. Actors whose
-context holds functions stay resident (the sweep skips them;
-`system.hibernate(actor)` throws, naming what cannot be stored). Pending
-delayed events wake the actor when they fire. `createMemoryStore()` is a
-store in memory.
+```output
+Hello, world!
+Hello, Ada!
+Hi, Bob!
+```
 
-### Moving an actor to another system
+### The host and its event loop
 
-`system.export(actor)` takes an actor out of its system as bytes — states,
-context or variables, delayed events with their data, the actors it invoked,
-and what it runs. `system.adopt(bytes)` takes it in anywhere: another system
-in this process, another process, Node or web. It keeps its session (its
-address under the new system's id), and its delayed events keep the time
-they had left.
+A host holds actors and runs them on your program's event loop. There is
+no `run()` to call. An input (`spawn`, `send`, `terminate`) is taken at
+once (the event is in the actor's queue when `send` returns, or the call
+throws), but nothing runs yet: it schedules a turn with `setImmediate`,
+and in its turns the host runs
+every actor that has an event, calls your handlers with what the actors
+sent out, and runs again until nothing is left. A turn does a bounded
+amount of work and then yields, so a busy host never starves your I/O.
+
+`await host.idle()` resolves at the next turn that finds nothing to do
+while no promise one of your handlers returned is pending (a promise a
+handler starts and does not return is not waited for). It is for tests, scripts and an orderly shutdown; a server never needs to
+call it. A handler may call the host (send an event, spawn an actor): the
+input applies at once, and the actors run in the same or a later turn.
+
+Each `addImage` makes a **segment**: the host's memory for that image's
+actors, numbered from 0, which `addImage` returns. A host runs many
+segments as one; you need the number for `boot` and see it in the host's
+statistics.
+
+A host also keeps time. A delayed `<send>` or a timeout is a deadline,
+and an idle host arms one `setTimeout` for its next one. That timer keeps
+the process alive while the host is open, as any `setTimeout` does, and
+it is the only thing the host keeps the process alive with: an open host
+with no deadline lets the process exit, even with actors that wait for an
+answer (below, "Before you use it"). `host.close()` clears the timer,
+frees the host, and drops every handler that was still waiting.
+
+### Actors, sessions and addresses
+
+`spawn` returns the actor's **session**, a `bigint` unique in its host.
+Inputs take it back: `host.send(session, event, data)`,
+`host.terminate(session)`. They also take a number that is a safe
+integer, since that is what a database or JSON gives back. The calls and
+views return sessions as `bigint`s (`console.log` prints `1n`, and
+`JSON.stringify` refuses one: convert with `String()` or `Number()`
+yourself), while the results of the typed methods
+([Inspecting a host](docs/guide/inspection.md)) hold them as numbers. So
+compare with `Number(session) === listed`, never `===` across the two;
+either kind may be passed back to an input.
 
 ```js
-const bytes = here.export(actor);   // it stops here (no done event)
-// ... another process ...
-const actor = there.adopt(bytes);   // machines are found as for restore
+import { Host } from '@tinyactors/node';
+
+const host = new Host({ systemID: 'demo' });
+host.addCharts({ 'idle.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+    datamodel="ecmascript" name="idle"><state id="s"/></scxml>` });
+const session = host.spawnChart('idle', { name: 'first' });
+const { sessions } = await host.actorList();
+console.log(typeof session, typeof sessions[0]);
+console.log(sessions.includes(Number(session)), sessions.map(BigInt).includes(session));
+const byKey = new Map([[String(session), 'kept under its text']]);
+console.log(byKey.get(String(sessions[0])), host.actorByName('first') === session);
+host.close();
 ```
 
-## Hot reload and live migration
+```output
+bigint number
+true true
+kept under its text true
+```
+
+`sessions.includes(session)` would be `false` (TypeScript refuses it),
+and a `Map` keyed by the `bigint` misses the number: key it by
+`String(session)`, which is the same for both kinds.
+
+An actor may also have a **name**, given at spawn, and
+`host.actorByName(name)` finds it. An actor that reaches a `<final>`
+state, or is terminated, ends: its session is refused from then on with
+`TA_ERROR_STALE`, and its name finds nothing. The events still in its
+queue when it ends are dropped, as SCXML ends a session at its top-level
+`<final>`: a `host.send` that returned before the end is never handled,
+and nothing tells the application. A chart whose events stand for
+requests your program holds (an HTTP response, a promise) tells your
+program from its `<final>` first:
+[I/O processors](docs/guide/io-processors.md#when-the-sender-ends) has the
+pattern.
+
+Actors find each other by **address**. Every system has its `systemID`,
+and an actor's address is `tinyactors://<systemID>/#_scxml_<session>`, or
+`tinyactors://<systemID>/@<name>` for a named one. A chart sends to
+another actor with `<send target="tinyactors://shop/@pong" event="ping"/>`,
+and the receiver answers to `_event.origin`. The `Address` class reads
+and makes them:
 
 ```js
-system.reload(counterV2); // CGI style: returns 2; new actors run it, running ones keep theirs
-const { done } = system.migrate(); // move running actors (a job in time slices)
-const { migrated, failed, pending } = await done; // pending: left behind (timeout)
-system.migrate(counter, { wake: false, timeoutMs: 5000 }); // options
-// in counterV2: on: { 'error.platform.upgrade': { actions: assign({ total: ({ event }) => event.data.count }) } }
+import { compileCharts, Host, Address } from '@tinyactors/node';
+
+const pong = `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="pong" initial="waiting">
+  <state id="waiting">
+    <transition event="ping">
+      <log expr="'pong got ' + _event.name"/>
+      <send event="pong" targetexpr="_event.origin"/>
+    </transition>
+  </state>
+</scxml>`;
+const ping = `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="ping" initial="asking">
+  <state id="asking">
+    <onentry><send event="ping" target="tinyactors://demo/@pong"/></onentry>
+    <transition event="pong" target="done"><log expr="'ping got ' + _event.name"/></transition>
+  </state>
+  <final id="done"/>
+</scxml>`;
+
+const compiled = compileCharts([{ name: 'ping.scxml', text: ping }, { name: 'pong.scxml', text: pong }]);
+const host = new Host({ systemID: 'demo' }, { log: (host, entry) => console.log(entry.text) });
+host.addImage(compiled.image);
+compiled.close();
+
+const pongSession = host.spawn(host.chart('pong'), { name: 'pong' });
+const pingSession = host.spawn(host.chart('ping'));
+await host.idle();
+
+console.log(Address.fromSession('demo', pongSession).text);
+console.log(new Address('tinyactors://demo/@pong').name);
+console.log(host.actorByName('pong') === pongSession);
+host.terminate(pongSession);
+await host.idle();
+console.log(host.actorByName('pong'), pingSession);
+host.close();
 ```
 
-`reload(machine)` makes `machine` the current version of the machines with its
-id (compiled right away, so errors throw there). A version whose actors are
-all gone is freed. Addresses stay valid: all actors of a system share one base
-URI and sessions are found wherever they live. `migrate(target?)` moves actors
-of older versions (one actor, a machine's actors, or all) at a stable point:
-states are matched by id, the context is kept (properties the new machine does
-not declare are dropped, new ones initialized), timers keep running, and the
-actor receives `{ type: 'error.platform.upgrade', data: previousContext }`.
-Migration is a job advanced in time slices of a few ms, walking the actors
-lazily, so the event loop stays responsive with any number of actors (100,000
-actors: the call takes ~5 ms, each slice ~5 ms). Busy actors move at their next
-stable point. Hibernated actors are loaded from the store first (`wake`, on by
-default when the system has a hibernation store), or move once they wake.
-`timeoutMs` ends the job and reports who was left behind. `done` resolves once
-the moved actors have processed their upgrade event. There is deliberately no
-"force": an actor mid-macrostep or with a pending request cannot move without
-changing SCXML semantics, and an actor with running invocations waits until
-they finish (its invoked sessions run charts of its old version, which are not
-translated). Sends to an address
-nobody has raise `error.communication` in the sender.
+```output
+pong got ping
+ping got pong
+tinyactors://demo/#_scxml_1
+pong
+true
+undefined 2n
+```
 
-## SCXML documents
+### Effects and handlers
 
-`fromSCXML(xml, { documents })` runs a W3C SCXML document as actor logic, in
-the same system as your machines (they message each other directly). The
-`ecmascript` datamodel (SCXML Appendix B.2) runs in JavaScript with the same
-semantics as the C datamodel; `null` works too. The W3C IRP suite passes
-through this binding (158/158 mandatory; `mise run w3c:js`).
+What an actor does toward the outside is an **effect**, and each kind has
+a handler you give the host in its options:
+
+| The chart does | Your handler | Guide |
+|---|---|---|
+| `<send type="urn:x">` to an I/O processor the config lists | `ioProcessors: { 'urn:x': (host, send) => ... }` | [I/O processors](docs/guide/io-processors.md) |
+| `<send>` to an actor of another system | `transport: (host, send) => ...` | [Other systems](docs/guide/other-systems.md) |
+| `<invoke type="urn:y">` of a service you run | `services: { 'urn:y': (host, invocation) => service }` | [Invoked services](docs/guide/services.md) |
+| `<log>` | `log: (host, entry) => ...` | this README |
+| spans, logs and metrics as OpenTelemetry (OTLP) | `telemetry: (host, signal, data) => ...` | [Telemetry](docs/guide/telemetry.md) |
+| an event for an actor you took out of memory | `wake: (host, session, migration) => ...` | [Hibernation](docs/guide/hibernation.md) |
+
+A send to an I/O processor the config lists but no handler serves is
+failed: the sender gets the event `error.communication`, so a chart can
+always react. A send to a type the config does not list at all raises
+`error.execution` in the chart. `<log>` lines without
+a `log` handler are dropped.
+
+**A handler's argument is a view, valid while the handler runs.** The
+`send` an I/O processor gets reads each field from the host's memory when
+you first read it. After the handler returns, the host moves on and the
+view is stale: reading it then throws `TA_ERROR_STALE`. Copy out what you
+keep (`const { data } = send`). A handler that returns a promise (an
+`async` function) is the exception: the host fills its view with every
+field before moving on, so it may `await` and answer later.
+
+### Values
+
+What crosses between your program and a chart (event data, spawn params,
+results) is a value of one table: `undefined`, `null`, booleans, numbers,
+`bigint`s up to 64 bits, strings, `Uint8Array`s, arrays and plain
+objects. A function, a `Map`, a `Date` or a class's instance is refused
+with `TA_ERROR_UNSUPPORTED`, and a value is copied when it crosses, so a
+chart never holds your object, and what a chart hands you (`send.data`,
+`invocation.data`) is made with your realm's constructors: its arrays are
+`instanceof Array`, and `assert.deepStrictEqual` compares it with a
+literal. `undefined` and `null` stay apart; a
+whole number past 2^53 comes back as a `bigint`.
+
+`encode(value)` and `decode(bytes)` give that table as CBOR bytes, the
+form a value takes when you store or send it:
 
 ```js
-const { fromSCXML, createActor } = require('@tinyactors/node');
+import { encode, decode } from '@tinyactors/node';
 
-const counter = fromSCXML(`
-  <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" initial="idle">
-    <datamodel><data id="count" expr="0"/></datamodel>
-    <state id="idle">
-      <transition event="inc"><assign location="count" expr="count + (_event.data.by || 1)"/></transition>
-      <transition event="done" target="end"/>
-    </state>
-    <final id="end"><donedata><param name="total" expr="count"/></donedata></final>
-  </scxml>`);
-
-const a = createActor(counter, { input: { count: 10 } }).start(); // input overrides <data>
-a.send({ type: 'inc', by: 2 });          // _event.name = 'inc', _event.data = { by: 2 }
-a.getSnapshot().context;                 // { count: 12 } — the datamodel's variables
+const bytes = encode({ sku: 'tea', qty: 2, big: 2n ** 60n, gone: undefined });
+const value = decode(bytes);
+console.log(bytes.length, 'bytes');
+console.log(value.sku, value.qty, value.big, 'gone' in value, value.gone);
 ```
 
-- Events: `type` becomes `_event.name`; `data` (or, without it, the event's
-  other properties) becomes `_event.data`.
-- The snapshot's `value` is the active states (by id) as a nested state value;
-  `context` the datamodel variables; `output` the `<donedata>`.
-- `documents` maps names to further documents: `<invoke src="child.scxml">`
-  children and anything a `src="..."` names (`<data src>`).
-- Expressions are compiled with `new Function` (a browser CSP must allow
-  `'unsafe-eval'` for SCXML documents; machines do not need it).
-- `<script>`s that declare top-level names (`var`, `let`, `const`,
-  `function`, `class` — as the JS engine sees them: names in blocks or nested
-  functions do not count) make those names the session's, as in the C
-  datamodel. Such actors hibernate, snapshot, export and migrate: variables
-  and `let`/`const` bindings keep their values (`const` stays constant),
-  top-level function declarations are re-created. Anything else that cannot
-  be stored is refused naming the variable and line, e.g. `variable 'helper'
-  cannot be stored: it holds a function (line 12); only top-level function
-  declarations are stored ...`.
+```output
+33 bytes
+tea 2 1152921504606846976n true undefined
+```
 
-## System images
+`encode` also writes an `Address` (from "Actors, sessions and
+addresses"), as CBOR's tag 32, and `decode` reads one back as an
+`Address`: that is how a transport's message keeps its addresses
+([Other systems](docs/guide/other-systems.md)).
+[docs/values.md](docs/values.md) has every row of the table and every
+refusal.
 
-A `<system>` manifest names charts and the actors to start; compiled, it is
-one immutable image you can ship as bytes (also produced by the C `tac`
-compiler) and boot anywhere — Node, a browser, a C host.
+### Time and the SimulatedClock
+
+Time in this API is milliseconds, with two exceptions that the host's
+config and the trace methods inherit from core: `telemetry.flushInterval`
+counts the host's clock ticks, and `traceWatch` takes `seconds`. In a
+chart, `<send event="timeout" delay="30s"/>` sends an event to the actor
+itself 30 seconds later, and `<cancel sendid>` takes it back. A delay is
+written in seconds or milliseconds (`30s`, `1.5s`, `500ms`), and any
+other form (`10`, `1m`) is a compile error. `delayexpr` computes one, and
+must give such a string: `delayexpr="timeoutMs + 'ms'"`, not
+`delayexpr="timeoutMs"`. A number, or a string without its unit, raises
+`error.execution` with no `_event.data` (the delay is the host's check,
+not code that threw, so there is no reason to give), and nothing is sent.
+By default the host reads the runtime's
+clock. A test gives it a `SimulatedClock` instead, which moves only when
+you move it, so a test of a 30-second timeout takes no time:
 
 ```js
-const { compileSystem, loadImage, createSystem } = require('@tinyactors/node');
+import { compileCharts, Host, SimulatedClock } from '@tinyactors/node';
 
-const image = compileSystem(`
-  <system>
-    <chart name="pinger" src="ping.scxml"/>
-    <actor name="server" chart="pinger"/>
-  </system>`, { files: { 'ping.scxml': pingXML } });
+const compiled = compileCharts([{ name: 'door.scxml', text: `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="door" initial="open">
+  <state id="open">
+    <onentry><send event="close" delay="30s"/></onentry>
+    <transition event="close" target="closed"/>
+  </state>
+  <final id="closed"><onentry><log expr="'closed'"/></onentry></final>
+</scxml>` }]);
 
-fs.writeFileSync('app.tai', image.bytes);
-const { server } = createSystem().boot(loadImage(fs.readFileSync('app.tai')));
-createActor(image.chart('pinger')).start(); // more actors of an image's chart
+const clock = new SimulatedClock();
+const host = new Host({ systemID: 'demo' }, { clock, log: (host, entry) => console.log(entry.text, 'at', clock.now) });
+host.addImage(compiled.image);
+compiled.close();
+
+host.spawn(host.chart('door'));
+await host.idle();
+console.log('next deadline in', host.nextDeadline, 'ms');
+clock.increment(29_999);
+await host.idle();
+clock.increment(1);
+await host.idle();
+host.close();
 ```
 
-## Snapshots and deterministic time
+```output
+next deadline in 30000 ms
+closed at 30000
+```
 
-`system.snapshot()` returns the whole system as bytes: every actor's
-configuration, context or datamodel variables, queued events and pending
-timers, plus what it runs (the SCXML of each machine, documents, images).
-`createSystem({ restore: bytes })` brings it back — same system id, so
-addresses stay valid; find actors with `system.get(systemID)`. Machines are
-matched by id and the SCXML they compile to (ones defined in the process are
-found automatically; pass more in `machines`). Contexts must be encodable (no
-functions); hibernated actors stay in the hibernation store, so restore with
-the same store.
+`host.now()` reads the host's clock in milliseconds (the simulated
+clock's time, or the runtime's), the clock its deadlines and snapshots
+use. `clock.increment(ms)` moves the clock and schedules a turn on every host
+made with it; `await host.idle()` then sees what ran. One increment past
+several deadlines does not replay each of them: what is due runs once, at
+the new time, and a delay it starts counts from there. Step the clock one
+deadline at a time to see each. An input runs at the host's next turn, so
+one given just before an `increment` is handled at the new time: `await
+host.idle()` between them when it should run first. A host on a
+`SimulatedClock` arms no timer.
+
+On the runtime's clock a delay counts from the step that armed it, which
+runs a little after its timer fired (the timer's and the turn's latency).
+So a chart that re-arms `<send event="tick" delay="20ms"/>` at each tick
+falls behind by that latency every tick: 24 ms after 40 ticks alone, 136
+ms beside a CPU-bound job, in the repository's job-scheduler example. A
+chart cannot read the host's clock, so a job that must keep its cadence
+is given its schedule as absolute times by your program, and asks your
+program for the time (an I/O processor) before it arms each delay. [Testing your charts](docs/guide/testing.md)
+has more.
+
+### Errors
+
+Errors surface in four places:
+
+- **At compile time,** `compileCharts` throws a `CompileError` whose
+  message is the first error as `file:line:column: error: message`, and
+  whose `diagnostics` holds them all.
+- **At a call,** the host throws a `TinyactorsError` for what it refuses
+  at once: a chart it does not have, a session that ended or never was, a
+  config it does not take. Branch on `error.status` (`'TA_ERROR_STALE'`,
+  `'TA_ERROR_INVALID'`, ...); the message is for people. A refused config
+  also has `error.path`, the key it is about (`system.maxActors`), and
+  `error.reason`. Arguments of the
+  wrong JavaScript type throw a `TypeError`.
+- **In a chart,** an expression that throws, or an `<assign>` to a
+  variable the chart does not declare, raises the event `error.execution`
+  for that actor, and a send that cannot be delivered raises
+  `error.communication`. These are events, not exceptions. A failed action
+  also stops the rest of its block: the actions after it in the same
+  `<onentry>`, `<onexit>` or transition do not run. The actor goes on,
+  and a transition on `error` handles both; without one the error event
+  is dropped like any event no transition matches. When the chart's code
+  failed, `_event.data` says why: `{ reason, message }`, `reason`
+  `'exception'` (code that threw; `message` is its text, as `String(e)`
+  gives it, such as `'Error: boom'`), `'fuel'` (it ran past QuickJS's
+  `maxOps`) or `'memory'` (past QuickJS's `memoryLimit`); a failure the
+  host decides (an unknown `<send>` type) has no data. To learn which
+  action failed, turn on [telemetry](docs/guide/telemetry.md), whose spans
+  and log records mark the failed action.
+- **In your handlers,** an error a handler throws is reported after its
+  turn: it rejects a waiting `host.idle()`, or, with none waiting, is
+  thrown as an uncaught exception (below).
 
 ```js
-const bytes = system.snapshot();           // e.g. on shutdown
-// ... a new process ...
-const system = createSystem({ restore: bytes, hibernation: { store } });
-system.get('lobby').send({ type: 'PING' });
+import { compileCharts, CompileError, Host, TinyactorsError } from '@tinyactors/node';
+
+try {
+  compileCharts([{ name: 'bad.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" name="bad">
+  <state id="s"><transition event="go" target="nowhere"/></state>
+</scxml>` }]);
+} catch (error) {
+  if (!(error instanceof CompileError)) throw error;
+  console.log(error.message);
+}
+
+const host = new Host({ systemID: 'demo' });
+try {
+  host.chart('missing');
+} catch (error) {
+  if (!(error instanceof TinyactorsError)) throw error;
+  console.log(error.status, '-', error.message);
+}
+host.close();
 ```
 
-`createSystem({ clock })` makes the system run on your clock instead of wall
-time: it arms no timers itself; advance the clock and call
-`system.flush()`, which runs everything that is due until the system is
-idle — for deterministic tests, simulations and replays.
-
-```js
-let now = 0;
-const system = createSystem({ clock: () => now });
-createActor(machineWithAfter1000, { system }).start();
-now += 1000;
-system.flush();  // the `after: 1000` transition has been taken
+```output
+bad.scxml:2:17: error: unknown state id 'nowhere'
+TA_ERROR_INVALID - the host has no chart of that name
 ```
 
-## Links: actors across systems
+## Before you use it
 
-`createLink(system, { url })` connects to another system (`serveLinks` on the
-other side). The link is itself an actor: its snapshot value is the
-connection status (`connecting`, `open`, `reconnecting`, `closed`); its context
-holds `rtt`, `attempts`, `queued` and `peer`. Subscribe to it to show the status.
+- **Chart code is trusted code.** On the native datamodel (the default)
+  a chart's expressions and scripts run in `node:vm` contexts of your own
+  engine, and a `vm` context is not a security boundary. Run charts you do
+  not trust on quickjs, the sandbox: `new Host(config, { datamodel:
+  'quickjs', quickjs: { maxOps, memoryLimit } })`
+  ([the quickjs sandbox](docs/guide/quickjs.md)).
+- **An open host with a pending deadline keeps the process alive, and
+  only then** (a delayed `<send>`, a timeout, the telemetry flush): the host arms one
+  timer at its next deadline, as `setTimeout` does, and `host.close()`
+  clears it. Nothing else holds the event loop: an open host with no
+  deadline lets the process exit, its actors still waiting, and so does an
+  actor that waits for an answer from a handler whose promise has no I/O
+  behind it. Give a chart that waits for an answer a timeout of its own,
+  and keep the process alive with your server, socket or timer.
+- **A handler's error ends the process by default.** An error thrown by
+  a handler (an I/O processor's, the log handler, the result handler of
+  a typed method, one of the host's queries in
+  [Inspecting a host](docs/guide/inspection.md))
+  rejects a waiting `host.idle()`; with none waiting it is thrown from the
+  host's turn as an uncaught exception, and a handler's promise that
+  rejects is an unhandled rejection, as is a typed method's promise
+  (`await host.actorState(...)`) that rejects with no `catch`. Either
+  ends a Node.js or Bun process unless the application handles
+  `uncaughtException` and `unhandledRejection`. Only a turn's first error is reported; the others
+  of that turn are lost.
+- **`using host = new Host(...)` needs a runtime that parses `using`:**
+  Bun 1.4 does, Node.js 22 does not. `Symbol.dispose` and
+  `Symbol.asyncDispose` call `close()`, which works everywhere.
+- **A `<script>` that declares top-level names gives each session a
+  context of its own.** A chart whose scripts declare `var` or `function`,
+  or whose chart-level scripts declare `let`, `const` or `class`, at their
+  top level runs each of its sessions
+  in a `vm` context of its own (about 143 KB a session on Node.js, 60 KB
+  on Bun), so the script's functions close over its own variables. A
+  chart that declares nothing shares one context per host: declare the
+  function as a `<data>` and assign it in the script
+  (`<data id="price"/>`, `price = (sku) => ...`)
+  ([Writing charts](docs/guide/charts.md#scripts)).
+- **A chart whose chart-level scripts declare with `let`, `const` or
+  `class` keeps its sessions resident** (in a transition's script they
+  are the script's own, each run). Hibernation, migration and snapshots refuse its
+  sessions (`TA_ERROR_UNSUPPORTED`): a new context cannot be given those
+  bindings back. Declare with `var` and `function`, or hold the values in
+  `<data>`, for a chart whose sessions should hibernate.
+- **The charts of a host share the builtins of its shared context.** On
+  the native datamodel the charts that declare nothing run in one `vm`
+  context per host, so a chart that changes a builtin (`Math.random = ...`,
+  `Array.prototype.sum = ...`) changes it for the host's other charts
+  there; its sessions' own variables stay apart. On quickjs the same holds,
+  unless `quickjs: { realm: 'isolated' }` gives each session a context of
+  its own ([the quickjs sandbox](docs/guide/quickjs.md#realms)).
 
-```js
-// server
-const system = createSystem({ id: 'chess' });
-createActor(lobby, { system, systemID: 'lobby' }).start();
-// browsers are untrusted peers: they may send only what is exported
-serveLinks(system, { server: httpServer, path: '/link', exports: { lobby: 'JOIN LEAVE' } }); // or { port }, { tcp }, or { accept }
+## Guides
 
-// client (Node or the web binding); name: the server's system id
-const link = createLink(createSystem(), { url: 'ws://localhost:8080/link', name: 'chess' });
-createActor(player, { input: { lobby: link.get('lobby') } }); // an ActorRef to the remote lobby
-// in the player: sendTo(({ context }) => context.lobby, ({ self }) => ({ type: 'JOIN', player: self }))
-// in the lobby:  sendTo(({ event }) => event.player, { type: 'WELCOME' })    — the reply crosses back
-```
+One per feature, each with complete examples that run as written. They
+are in the package too, under `docs/guide/` in
+`node_modules/@tinyactors/node`, so these links work after an install:
 
-Every actor has an `address` (`tinyactors://<system id>/#_scxml_<session>`)
-and `self` in action arguments. An actor reference sent in an event arrives as
-an `ActorRef` (with `send()`) that works as a `sendTo` target. `system.ref(address)`
-creates one. `system.stop()` stops all actors, closes the system's links and
-frees its native memory.
+- [Writing charts](docs/guide/charts.md): JavaScript in charts, scripts,
+  XML data, several charts, `<invoke>` of a chart, systems and `boot`.
+- [I/O processors](docs/guide/io-processors.md): your code as a chart's
+  output: answering, failing, answering later.
+- [Invoked services](docs/guide/services.md): long-running things a chart
+  starts and stops, such as a connection or a subprocess.
+- [Inspecting a host](docs/guide/inspection.md): an actor's state and
+  variables, listing actors, the host's counters.
+- [Telemetry](docs/guide/telemetry.md): traces, logs and metrics as
+  OpenTelemetry, and trace context across your services.
+- [Hibernation](docs/guide/hibernation.md): millions of actors, most of
+  them in your database.
+- [Migration](docs/guide/migration.md): moving running actors to a new
+  version of their chart.
+- [Snapshots](docs/guide/snapshots.md): the whole host as one blob, and a
+  host restored from it.
+- [Other systems](docs/guide/other-systems.md): actors of two hosts
+  talking through your transport, and SCXML's BasicHTTP.
+- [The quickjs sandbox](docs/guide/quickjs.md): charts you do not trust.
+- [Capacity and memory](docs/guide/capacity.md): sizing a host, how it
+  grows, and what an actor costs.
+- [Testing your charts](docs/guide/testing.md): a simulated clock,
+  `idle()`, and asserting on an actor's state.
+- [In the browser](docs/guide/browser.md): `@tinyactors/wasm`, the same
+  API in a page or a Worker: loading, the CSP, IndexedDB as the store,
+  liveness, memory, and what differs.
 
-Routing is done by the native router (`ta_host`, docs/protocol.md), not in
-JS: every link connection is one router *peer*, and the binding only moves
-frames (link protocol v1: `hello`, `ev`, `err`, `ping`/`pong`). What that
-gives you:
-
-- **Policy.** A served peer is untrusted unless `trusted: true` or
-  `trust(hello)` says so: it may send only to the `exports` (`['lobby']`,
-  `{ lobby: 'JOIN LEAVE' }`, `'*'` for every name and session). Everything
-  else, and every forged `origin`, is refused.
-- **No silent drops.** A refused or undeliverable send — unknown name, ended
-  session, no route, denied, queue full, expired — raises
-  `error.communication` (with the `sendid`) in the sending actor, across any
-  number of hops.
-- **Queues and resumption.** While a link is down the router queues for it
-  (`maxQueue`, default 1000; `queueTTLMs` to expire them; `maxQueue: 0` to fail
-  fast). On the server, a peer that reconnects with the same system id within
-  `resumeMs` (default 30 s, on the system's clock: with a `clock` option,
-  simulated time) gets what was queued for it, in order.
-- **Relaying.** With `announce: true` a system tells its peers which other
-  systems it reaches, and forwards their envelopes (for trusted peers): a
-  browser can reach a backend behind its server.
-- **Values.** Between two JS systems values keep their types (`js` profile:
-  `Date`, `Map`, `Set`, `BigInt`, cycles, actor refs). With a peer in another
-  language they travel as neutral values (JSON plus `{"$ref"}` and
-  `{"$bytes"}`; `encodeWire` / `decodeWire`); `profile: 'neutral'` forces that.
-- **Status.** `link.status()` and `server.status(systemID)` report the route:
-  state, queued, lag, rtt, sent/received/errors/duplicates.
-- `system.deliver(envelope)` hands an envelope to the router from host code
-  (any transport you write yourself starts there).
-
-### Byte streams: TCP, stdio, serial
-
-On byte streams the link protocol travels in length-prefixed frames (a 4-byte
-big-endian length, then UTF-8 JSON; docs/protocol.md, "Framing"):
-
-```js
-// TCP
-const served = serveLinks(server, { tcp: { port: 7000 }, exports: ['echo'] });   // served.port
-const link = createLink(client, { tcp: { host: 'db-1', port: 7000 }, name: 'srv' });
-
-// any duplex stream: `transport` and `accept` take byte streams as well as WebSocket-like objects
-const child = spawn('node', ['worker.js'], { stdio: ['pipe', 'pipe', 'inherit'] });
-serveLinks(system, { trusted: true, accept: (on) => on({ readable: child.stdout, writable: child.stdin }) });
-// in worker.js (stdout carries the link: log with createSystem({ logger }) to stderr)
-createLink(system, { name: 'parent', transport: () => ({ readable: process.stdin, writable: process.stdout }) });
-```
-
-A byte stream is a Node-style duplex (a `net.Socket`) or a `{ readable,
-writable }` pair. `maxFrame` (default 1 MiB, both functions) is the largest
-frame this side accepts and is announced in its hello. Frames above it are
-skipped unread. An envelope that does not fit the other side's `maxFrame` is
-not sent: its sender gets `error.communication`. `encodeFrame(text)` and
-`new FrameDecoder({ maxFrame }).push(chunk)` (frames out; a refused one as
-`{ reason: 'malformed', length }`) frame streams of your own. C hosts use
-`ta_frame_header` / `ta_frame_read` (`include/tinyactors/frame.h`).
-
-### Store links: actors in PostgreSQL
-
-`createStoreLink(system, { query, listen })` connects the system to a
-database of actors (the PostgreSQL extension, bindings/postgres) through any
-PostgreSQL client. The database becomes a peer: actors here and there send to
-each other by address, replies included, and the database can reach the
-browsers on your links (the link tells it which ones).
-
-```js
-const pool = new pg.Pool();
-const client = await pool.connect();             // a connection for LISTEN
-const store = createStoreLink(system, {
-  query: (sql, params) => pool.query(sql, params).then((r) => r.rows),
-  listen: async (channel, fn) => { client.on('notification', (n) => n.channel === channel && fn(n.payload));
-                                   await client.query(`LISTEN ${channel}`); return () => client.query(`UNLISTEN ${channel}`); },
-});
-await store.ready;                               // store.id: the database's system id
-sendTo(system.ref(`tinyactors://${store.id}/@ledger`), { type: 'add', amount: 5 });
-```
-
-Envelopes go in with `tinyactors.deliver` (in order, retried until taken;
-the database drops repeats), come out of the outbox with `claim_for` on
-NOTIFY (and every `pollMs`), and errors travel both ways as
-`error.communication`. Values travel as neutral values. `store.flush()`
-waits until everything was handed over; `store.status()` is the route's
-status.
-
-## Supported (xstate v5 subset)
-
-`createMachine`, `setup({ actions, guards, delays, actors })`, `createActor`
-(`start`, `stop`, `send`, `getSnapshot`, `subscribe`, `address`, `hibernated`,
-options `input`, `systemID`, `system`, `logger`),
-`createSystem({ id, hibernation, clock, logger, restore, machines })`,
-`system.get()`, `system.ref()`, `system.sendMany()`, `system.hibernate()`,
-`system.reload()`, `system.migrate()`, `system.snapshot()`, `system.boot()`,
-`system.export()`, `system.adopt()`,
-`system.flush()`, `system.stop()`, `fromSCXML`, `compileSystem`, `loadImage`,
-`machine.provide()`, `createLink`, `serveLinks`, `encodeFrame`, `FrameDecoder`, `createMemoryStore`;
-states (`initial`, nested, `parallel`, `final` with `output`, `history`),
-`on` (including `'*'`), `always`, `after`, `entry`/`exit`, `invoke` of child
-machines (`input`, `onDone`), `tags`; actions: functions, named actions with
-`params`, `assign`, `raise` (optionally delayed), `sendTo`, `sendParent`,
-`log`, `cancel`; guards: functions, named guards with `params`, `and`, `or`,
-`not`, `stateIn`. Snapshots: `value`, `context`, `status`, `output`,
-`error`, `matches()`, `hasTag()`.
-
-Not supported: promise/callback/observable actors, `spawn`, `emit`,
-`enqueueActions`, `onError`, `can()`, inspection API.
-
-Semantics follow SCXML where they differ from xstate: an exception in user
-code raises `error.execution` (the actor keeps running; see
-`snapshot.error`), and external events wait while a macrostep is still
-running.
-
-## Build & test
-
-```sh
-mise run node:test     # npm ci, build the addon, node --test, bun test, tsc
-```
+The reference is the doc comment of each export in
+[index.d.ts](index.d.ts), which an editor shows on hover. In TypeScript
+the types need the `es2022` lib and a `URL` (the `dom` lib or
+@types/node); they declare `Symbol.dispose` and `Disposable` themselves,
+so no `esnext` lib is needed.

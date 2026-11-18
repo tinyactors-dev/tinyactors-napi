@@ -1,0 +1,14 @@
+id: buffers-are-ta-buffer
+valid:
+  - "static ta_status ta_napi_encode(napi_env env, napi_value value, ta_buffer *out) { return TA_OK; }"
+  - "static napi_value ta_napi_decode(napi_env env, ta_bytes bytes) { return NULL; }"
+  - "static void *ta_napi_allocate(void *context, size_t size, size_t alignment) { return malloc(size); }"
+  - "static void ta_napi_release(void *context, void *pointer, size_t size) { free(pointer); }"
+  - "static void ta_napi_finalize(napi_env env, void *data, void *hint) {}"
+  - "static size_t ta_napi_count(napi_value list, size_t limit) { return 0; }"
+invalid:
+  - "static napi_value ta_napi_decode(napi_env env, const uint8_t *bytes, size_t length) { return NULL; }"
+  - "static ta_status ta_napi_encode(napi_value value, void *buffer, size_t capacity);"
+  - "static const char *ta_napi_text(napi_value value, size_t *length) { return NULL; }"
+  - "static ta_status ta_napi_write(napi_value value, char *out, uint32_t capacity) { return TA_OK; }"
+  - "typedef struct ta_napi_store { int (*put)(void *store, const void *blob, size_t length); } ta_napi_store;"

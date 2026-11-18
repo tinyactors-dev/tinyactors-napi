@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  One elevator car. Its normal operation is a parallel state of three
+  regions that move at once and watch each other with In():
+
+  - motion: idle, stopped at a floor, or moving. A trip is the compound
+    state `moving`, floor by floor on a timer, and it completes when it
+    reaches its final state `arrived`: the car gets done.state.moving and
+    stops there.
+  - doors: closed, or cycling, which invokes the door controller
+    (charts/door.scxml) and goes back to closed on its done.invoke.door.
+  - weighing: normal or overloaded.
+
+  The rules that keep the car safe are guards across the regions: the
+  doors open only when the car is not moving (`!In('moving')`), the car
+  leaves only with its doors closed and not overloaded (`In('closed') &&
+  !In('overloaded')`), and a stop at a floor waits for the doors to close
+  (`doors.closed`) before the car may go on.
+
+  Two modes take the car out of service:
+
+  - maintenance: a key switch in the car. Leaving `operating` cancels the
+    timers and the door controller of the states it leaves; the deep
+    history `resume` remembers every active state of all three regions,
+    and `maintenance.end` puts the car back exactly there.
+  - fire recall: the building's alarm, which the dispatcher passes on. The
+    car closes its doors (a door controller in mode close, unless they are
+    shut), travels to the lobby, and opens its doors there and keeps them
+    open (mode hold). `fire.clear` closes them and starts normal operation
+    afresh: the car is at the lobby now, so the history of where it was
+    no longer describes it.
+
+  The car tells the dispatcher when it enters service and leaves it, where
+  it is and which hall calls it served, and reports its motor and modes to
+  the building through the I/O processor urn:elevator:hw.
+-->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="car" initial="service">
+  <datamodel>
+    <!-- Set by spawn's params. -->
+    <data id="car" expr="'car-0'"/>
+    <data id="floors" expr="10"/>
+    <data id="travelMs" expr="1500"/>
+    <data id="doorMs" expr="1000"/>
+    <data id="dwellMs" expr="3000"/>
+    <data id="capacity" expr="630"/>
+    <data id="dispatcher" expr="'tinyactors://building/@dispatcher'"/>
+    <!-- The car's own state. -->
+    <data id="floor" expr="0"/>
+    <data id="dir" expr="1"/>
+    <!-- Floors pressed in the car, and hall calls the dispatcher assigned. -->
+    <data id="carCalls" expr="[]"/>
+    <data id="hallCalls" expr="[]"/>
+    <data id="load" expr="0"/>
+    <!-- The doors are known to be shut: false from the moment a door
+         controller is invoked until one reports them shut. -->
+    <data id="doorShut" expr="true"/>
+    <!-- Calls for the floor the car stands at with its doors open, sent
+         to the door controller as a reopen: 'hall' or 'car', each until
+         the controller answers. -->
+    <data id="reopens" expr="[]"/>
+    <!-- The door controller of `cycling` runs: it said door.started. -->
+    <data id="doorRunning" expr="false"/>
+    <!-- Helpers, assigned by the script below. -->
+    <data id="ahead"/>
+    <data id="added"/>
+    <data id="without"/>
+  </datamodel>
+
+  <!-- The helpers take everything they read as arguments: they are made
+       once per actor and see no variable by name. -->
+  <script>
+    ahead = (calls, floor, dir) => calls.some((f) => (dir > 0 ? f > floor : f &lt; floor));
+    added = (calls, f) => (calls.includes(f) ? calls : [...calls, f]);
+    without = (calls, f) => calls.filter((c) => c !== f);
+  </script>
+
+  <state id="service" initial="operating">
+    <!-- A second alarm while the doors close after one starts the recall again. -->
+    <transition event="fire.alarm" cond="!In('fire') || In('fireReleasing')" target="fire"/>
+    <transition event="error" cond="_event.sendid !== 'reopen' &amp;&amp; _event.sendid !== 'door.signal'">
+      <log label="error" expr="car + ' ' + _event.name + ' ' + _event.sendid"/>
+    </transition>
+
+    <state id="operating" initial="running">
+      <onentry>
+        <send type="urn:elevator:hw" event="mode">
+          <param name="car" expr="car"/><param name="mode" expr="'operating'"/><param name="floor" expr="floor"/>
+        </send>
+        <send event="car.in" targetexpr="dispatcher">
+          <param name="car" expr="car"/><param name="floor" expr="floor"/>
+        </send>
+      </onentry>
+      <onexit>
+        <!-- The dispatcher gives this car's hall calls to another car. -->
+        <assign location="hallCalls" expr="[]"/>
+        <send event="car.out" targetexpr="dispatcher"><param name="car" expr="car"/></send>
+      </onexit>
+
+      <transition event="maintenance.start" target="maintenance"/>
+      <!-- A call for the floor the car stands at is the stopped state's
+           (below). Both regions would take this transition otherwise:
+           targetless transitions of two regions never conflict. -->
+      <transition event="press" cond="!(In('stopped') &amp;&amp; _event.data.floor === floor) &amp;&amp; Number.isInteger(_event.data.floor) &amp;&amp; _event.data.floor &gt;= 0 &amp;&amp; _event.data.floor &lt; floors">
+        <assign location="carCalls" expr="added(carCalls, _event.data.floor)"/>
+      </transition>
+      <transition event="assign" cond="!(In('stopped') &amp;&amp; _event.data.floor === floor)">
+        <assign location="hallCalls" expr="added(hallCalls, _event.data.floor)"/>
+      </transition>
+      <!-- A reopen the door controller did not take: it had ended, the
+           doors are shut. The call becomes a stop again; the failure may
+           come after the car went idle, so it is handled here. -->
+      <transition event="error.communication" cond="_event.sendid === 'reopen'">
+        <log label="reopen.late" expr="car + ' ' + floor"/>
+        <if cond="reopens[0] === 'hall'">
+          <assign location="hallCalls" expr="added(hallCalls, floor)"/>
+        <else/>
+          <assign location="carCalls" expr="added(carCalls, floor)"/>
+        </if>
+        <assign location="reopens" expr="reopens.slice(1)"/>
+      </transition>
+      <transition event="weight"><assign location="load" expr="_event.data.kg"/></transition>
+
+      <history id="resume" type="deep"><transition target="running"/></history>
+
+      <parallel id="running">
+        <state id="motion" initial="idle">
+          <state id="idle">
+            <transition cond="carCalls.includes(floor) || hallCalls.includes(floor)" target="stopped"/>
+            <!-- The trip's direction is chosen here, at departure, not in
+                 moving's onentry: the deep history re-enters `moving`
+                 after maintenance, running its onentry again, and the
+                 car must go on the way it was going. -->
+            <transition cond="carCalls.length + hallCalls.length &gt; 0 &amp;&amp; In('closed') &amp;&amp; !In('overloaded')" target="moving">
+              <assign location="dir" expr="ahead(carCalls.concat(hallCalls), floor, dir) ? dir : -dir"/>
+            </transition>
+          </state>
+
+          <!-- At a floor, serving it: the doors open, and the car stays
+               until they are closed again. -->
+          <state id="stopped">
+            <onentry>
+              <if cond="hallCalls.includes(floor)">
+                <send event="car.served" targetexpr="dispatcher">
+                  <param name="car" expr="car"/><param name="floor" expr="floor"/>
+                </send>
+              </if>
+              <assign location="carCalls" expr="without(carCalls, floor)"/>
+              <assign location="hallCalls" expr="without(hallCalls, floor)"/>
+              <assign location="reopens" expr="[]"/>
+              <raise event="open"/>
+            </onentry>
+            <transition event="doors.closed" target="idle"/>
+            <!-- A call for this floor while the doors are open: the door
+                 controller reopens them, and says so (door.reopened), or
+                 has already shut them and ended (its send fails), and the
+                 call waits for the next stop. -->
+            <transition event="assign press" cond="_event.data.floor === floor &amp;&amp; doorRunning">
+              <assign location="reopens" expr="[...reopens, _event.name === 'assign' ? 'hall' : 'car']"/>
+              <send event="reopen" target="#_door" id="reopen"/>
+            </transition>
+            <!-- The doors are about to open: this stop serves the call. -->
+            <transition event="assign" cond="_event.data.floor === floor">
+              <send event="car.served" targetexpr="dispatcher">
+                <param name="car" expr="car"/><param name="floor" expr="floor"/>
+              </send>
+            </transition>
+            <transition event="press" cond="_event.data.floor === floor"/>
+            <transition event="door.reopened">
+              <log label="reopened" expr="car + ' ' + floor"/>
+              <if cond="reopens.includes('hall')">
+                <send event="car.served" targetexpr="dispatcher">
+                  <param name="car" expr="car"/><param name="floor" expr="floor"/>
+                </send>
+              </if>
+              <assign location="reopens" expr="reopens.slice(1)"/>
+            </transition>
+
+          </state>
+
+          <!-- A trip: one floor per travelMs, in direction dir, until a
+               floor with a call or the last call in this direction. -->
+          <state id="moving" initial="travelling">
+            <onentry>
+              <send type="urn:elevator:hw" event="motor">
+                <param name="car" expr="car"/><param name="state" expr="'start'"/><param name="floor" expr="floor"/><param name="dir" expr="dir"/>
+              </send>
+            </onentry>
+            <onexit>
+              <send type="urn:elevator:hw" event="motor">
+                <param name="car" expr="car"/><param name="state" expr="'stop'"/><param name="floor" expr="floor"/><param name="dir" expr="dir"/>
+              </send>
+            </onexit>
+            <transition event="done.state.moving" target="stopped"/>
+
+            <state id="travelling">
+              <onentry><send event="floor.reached" id="travel" delayexpr="travelMs + 'ms'"/></onentry>
+              <onexit><cancel sendid="travel"/></onexit>
+              <transition event="floor.reached" target="arriving">
+                <assign location="floor" expr="floor + dir"/>
+                <send type="urn:elevator:hw" event="position">
+                  <param name="car" expr="car"/><param name="floor" expr="floor"/>
+                </send>
+                <send event="car.position" targetexpr="dispatcher">
+                  <param name="car" expr="car"/><param name="floor" expr="floor"/>
+                </send>
+              </transition>
+            </state>
+            <state id="arriving">
+              <transition cond="carCalls.includes(floor) || hallCalls.includes(floor) || !ahead(carCalls.concat(hallCalls), floor, dir)" target="arrived"/>
+              <transition target="travelling"/>
+            </state>
+            <final id="arrived"/>
+          </state>
+        </state>
+
+        <state id="doors" initial="closed">
+          <state id="closed">
+            <transition event="open" cond="!In('moving')" target="cycling"/>
+            <!-- Too heavy to leave: open again so someone can step out. An
+                 eventless transition, not one on load.over: the car may
+                 become overloaded while its doors finish closing, and then
+                 it is the closed doors and the idle car that must meet. -->
+            <transition cond="In('idle') &amp;&amp; In('overloaded')" target="cycling"/>
+          </state>
+          <state id="cycling">
+            <onentry>
+              <assign location="doorShut" expr="false"/>
+              <assign location="doorRunning" expr="false"/>
+            </onentry>
+            <invoke id="door" src="door.scxml">
+              <param name="car" expr="car"/>
+              <param name="floor" expr="floor"/>
+              <param name="mode" expr="'cycle'"/>
+              <param name="moveMs" expr="doorMs"/>
+              <param name="dwellMs" expr="dwellMs"/>
+              <param name="held" expr="In('overloaded')"/>
+            </invoke>
+            <transition event="done.invoke.door" target="closed">
+              <assign location="doorShut" expr="true"/>
+              <raise event="doors.closed"/>
+            </transition>
+            <transition event="door.started"><assign location="doorRunning" expr="true"/></transition>
+            <!-- Signals for the running controller, sent only once it said
+                 it runs: an invocation starts at the end of the macrostep
+                 that entered `cycling`, and a send to #_door before then
+                 fails. Nothing is lost: `held` is read when the controller
+                 starts, and a door that shut while the car was overloaded
+                 opens again from `closed`. One sent as the controller ends
+                 fails, as harmlessly. A send that fails at its own step
+                 carries its sendid now (l-p4-examples-elevator-error-sendid),
+                 so such a failure is told from a reopen's; the guard stays
+                 for the sends before the controller starts
+                 (l-p4-examples-elevator-invoke-start). -->
+            <transition event="obstructed" cond="doorRunning"><send event="obstructed" target="#_door" id="door.signal"/></transition>
+            <transition event="load.over" cond="doorRunning"><send event="hold" target="#_door" id="door.signal"/></transition>
+            <transition event="load.ok" cond="doorRunning"><send event="release" target="#_door" id="door.signal"/></transition>
+          </state>
+        </state>
+
+        <state id="weighing" initial="normal">
+          <state id="normal">
+            <transition cond="load &gt; capacity" target="overloaded"/>
+          </state>
+          <state id="overloaded">
+            <onentry>
+              <raise event="load.over"/>
+              <send type="urn:elevator:hw" event="overload">
+                <param name="car" expr="car"/><param name="on" expr="true"/>
+              </send>
+            </onentry>
+            <onexit>
+              <raise event="load.ok"/>
+              <send type="urn:elevator:hw" event="overload">
+                <param name="car" expr="car"/><param name="on" expr="false"/>
+              </send>
+            </onexit>
+            <transition cond="load &lt;= capacity" target="normal"/>
+          </state>
+        </state>
+      </parallel>
+    </state>
+
+    <state id="maintenance">
+      <onentry>
+        <send type="urn:elevator:hw" event="mode">
+          <param name="car" expr="car"/><param name="mode" expr="'maintenance'"/><param name="floor" expr="floor"/>
+        </send>
+      </onentry>
+      <transition event="maintenance.end" target="resume"/>
+    </state>
+
+    <state id="fire" initial="fireClosing">
+      <onentry>
+        <assign location="carCalls" expr="[]"/>
+        <send type="urn:elevator:hw" event="mode">
+          <param name="car" expr="car"/><param name="mode" expr="'fire'"/><param name="floor" expr="floor"/>
+        </send>
+      </onentry>
+      <transition event="fire.clear" cond="!In('fireReleasing')" type="internal" target="fireReleasing"/>
+
+      <state id="fireClosing">
+        <transition cond="doorShut" target="fireTravel"/>
+        <invoke id="closer" src="door.scxml">
+          <param name="car" expr="car"/>
+          <param name="floor" expr="floor"/>
+          <param name="mode" expr="'close'"/>
+          <param name="moveMs" expr="doorMs"/>
+          <param name="dwellMs" expr="dwellMs"/>
+        </invoke>
+        <transition event="done.invoke.closer" target="fireTravel">
+          <assign location="doorShut" expr="true"/>
+        </transition>
+      </state>
+
+      <!-- The recall's trip: down one floor per travelMs to the lobby. -->
+      <state id="fireTravel" initial="recallArriving">
+        <onentry>
+          <send type="urn:elevator:hw" event="motor">
+            <param name="car" expr="car"/><param name="state" expr="'start'"/><param name="floor" expr="floor"/><param name="dir" expr="-1"/>
+          </send>
+        </onentry>
+        <onexit>
+          <send type="urn:elevator:hw" event="motor">
+            <param name="car" expr="car"/><param name="state" expr="'stop'"/><param name="floor" expr="floor"/><param name="dir" expr="-1"/>
+          </send>
+        </onexit>
+        <transition event="done.state.fireTravel" target="fireLobby"/>
+
+        <state id="recallDescending">
+          <onentry><send event="recall.floor" id="recall" delayexpr="travelMs + 'ms'"/></onentry>
+          <onexit><cancel sendid="recall"/></onexit>
+          <transition event="recall.floor" target="recallArriving">
+            <assign location="floor" expr="floor - 1"/>
+            <send type="urn:elevator:hw" event="position">
+              <param name="car" expr="car"/><param name="floor" expr="floor"/>
+            </send>
+          </transition>
+        </state>
+        <state id="recallArriving">
+          <transition cond="floor === 0" target="recallDown"/>
+          <transition target="recallDescending"/>
+        </state>
+        <final id="recallDown"/>
+      </state>
+
+      <state id="fireLobby">
+        <onentry><assign location="doorShut" expr="false"/></onentry>
+        <invoke id="holder" src="door.scxml">
+          <param name="car" expr="car"/>
+          <param name="floor" expr="floor"/>
+          <param name="mode" expr="'hold'"/>
+          <param name="moveMs" expr="doorMs"/>
+          <param name="dwellMs" expr="dwellMs"/>
+        </invoke>
+      </state>
+
+      <!-- After the alarm: shut the doors, then serve again from here. -->
+      <state id="fireReleasing">
+        <transition cond="doorShut" target="operating"/>
+        <invoke id="releaser" src="door.scxml">
+          <param name="car" expr="car"/>
+          <param name="floor" expr="floor"/>
+          <param name="mode" expr="'close'"/>
+          <param name="moveMs" expr="doorMs"/>
+          <param name="dwellMs" expr="dwellMs"/>
+        </invoke>
+        <transition event="done.invoke.releaser" target="operating">
+          <assign location="doorShut" expr="true"/>
+        </transition>
+      </state>
+    </state>
+  </state>
+</scxml>

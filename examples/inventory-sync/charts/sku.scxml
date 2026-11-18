@@ -1,0 +1,157 @@
+<!-- The warehouse's stock of one SKU: one actor per SKU, named "sku-<id>",
+     so the storefront's carts address it as tinyactors://warehouse/@sku-<id>.
+
+     Every request names a reservation, and the answer goes to the request's
+     _event.origin. Each request is idempotent by its reservation id: a
+     duplicate reserve, confirm or release gets the same answer as the first
+     and changes nothing.
+
+       reserve {reservation, qty}  hold qty units for holdFor: reserved, or
+                                   reserve.refused when there are not enough
+       confirm {reservation}       sell what is held: confirmed, or
+                                   confirm.refused when the hold expired
+       release {reservation}       give back what is held or was sold (the
+                                   cart's compensation): released, always
+       restock {qty}               from the application: more units
+
+     A hold that is neither confirmed nor released within holdFor expires: a
+     delayed send to the actor itself gives the units back, and the cart is
+     told with "expired". Each change is reported to the application's
+     urn:warehouse:stock processor. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="sku" initial="open">
+  <datamodel>
+    <data id="sku" expr="''"/>
+    <data id="stock" expr="0"/>          <!-- units free to reserve -->
+    <data id="holdFor" expr="'900s'"/>  <!-- how long a hold lasts: a delay, '30s' or '500ms' -->
+    <data id="holds" expr="({})"/>       <!-- reservation -> {qty, cart, timer} -->
+    <data id="sold" expr="({})"/>        <!-- reservation -> qty -->
+    <data id="closed" expr="({})"/>      <!-- reservation -> 'released' or 'expired' -->
+    <data id="timer" expr="null"/>       <!-- the id of the last expiry sent -->
+  </datamodel>
+
+  <state id="open">
+    <!-- reserve -->
+    <transition event="reserve" cond="holds[_event.data.reservation] !== undefined || sold[_event.data.reservation] !== undefined">
+      <log label="duplicate" expr="'reserve ' + _event.data.reservation"/>
+      <send event="reserved" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku, qty: _event.data.qty })"/>
+      </send>
+    </transition>
+    <!-- A reserve that comes after its reservation ended (a duplicate that
+         was delayed): it must not hold again. -->
+    <transition event="reserve" cond="closed[_event.data.reservation] !== undefined">
+      <log label="duplicate" expr="'reserve ' + _event.data.reservation + ' after it was ' + closed[_event.data.reservation]"/>
+      <send event="reserve.refused" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku, reason: 'reservation ' + closed[_event.data.reservation], available: stock })"/>
+      </send>
+    </transition>
+    <transition event="reserve" cond="_event.data.qty &lt;= stock">
+      <assign location="stock" expr="stock - _event.data.qty"/>
+      <send event="expire" delayexpr="holdFor" idlocation="timer">
+        <param name="reservation" expr="_event.data.reservation"/>
+      </send>
+      <assign location="holds[_event.data.reservation]" expr="({ qty: _event.data.qty, cart: _event.origin, timer: timer })"/>
+      <send event="reserved" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku, qty: _event.data.qty })"/>
+      </send>
+      <send type="urn:warehouse:stock" event="held">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: _event.data.qty, stock: stock })"/>
+      </send>
+    </transition>
+    <transition event="reserve">
+      <send event="reserve.refused" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku, reason: 'out of stock', available: stock })"/>
+      </send>
+      <send type="urn:warehouse:stock" event="refused">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: _event.data.qty, stock: stock })"/>
+      </send>
+    </transition>
+
+    <!-- confirm -->
+    <transition event="confirm" cond="sold[_event.data.reservation] !== undefined">
+      <log label="duplicate" expr="'confirm ' + _event.data.reservation"/>
+      <send event="confirmed" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+    </transition>
+    <transition event="confirm" cond="holds[_event.data.reservation] !== undefined">
+      <cancel sendidexpr="holds[_event.data.reservation].timer"/>
+      <assign location="sold[_event.data.reservation]" expr="holds[_event.data.reservation].qty"/>
+      <script>delete holds[_event.data.reservation];</script>
+      <send event="confirmed" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+      <send type="urn:warehouse:stock" event="sold">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: sold[_event.data.reservation], stock: stock })"/>
+      </send>
+    </transition>
+    <transition event="confirm">
+      <send event="confirm.refused" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku, reason: 'reservation expired' })"/>
+      </send>
+    </transition>
+
+    <!-- release: a hold, or a sale the cart takes back -->
+    <transition event="release" cond="holds[_event.data.reservation] !== undefined">
+      <cancel sendidexpr="holds[_event.data.reservation].timer"/>
+      <assign location="stock" expr="stock + holds[_event.data.reservation].qty"/>
+      <send type="urn:warehouse:stock" event="released">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: holds[_event.data.reservation].qty, stock: stock })"/>
+      </send>
+      <assign location="closed[_event.data.reservation]" expr="'released'"/>
+      <script>delete holds[_event.data.reservation];</script>
+      <send event="released" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+    </transition>
+    <transition event="release" cond="sold[_event.data.reservation] !== undefined">
+      <assign location="stock" expr="stock + sold[_event.data.reservation]"/>
+      <send type="urn:warehouse:stock" event="returned">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: sold[_event.data.reservation], stock: stock })"/>
+      </send>
+      <assign location="closed[_event.data.reservation]" expr="'released'"/>
+      <script>delete sold[_event.data.reservation];</script>
+      <send event="released" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+    </transition>
+    <transition event="release">
+      <assign location="closed[_event.data.reservation]" expr="'released'"/>
+      <send event="released" targetexpr="_event.origin">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+    </transition>
+
+    <!-- a hold's time is up -->
+    <transition event="expire" cond="holds[_event.data.reservation] !== undefined">
+      <assign location="stock" expr="stock + holds[_event.data.reservation].qty"/>
+      <send type="urn:warehouse:stock" event="expired">
+        <content expr="({ sku: sku, reservation: _event.data.reservation, qty: holds[_event.data.reservation].qty, stock: stock })"/>
+      </send>
+      <send event="expired" targetexpr="holds[_event.data.reservation].cart">
+        <content expr="({ reservation: _event.data.reservation, sku: sku })"/>
+      </send>
+      <assign location="closed[_event.data.reservation]" expr="'expired'"/>
+      <script>delete holds[_event.data.reservation];</script>
+    </transition>
+    <transition event="expire"/>
+
+    <transition event="restock">
+      <assign location="stock" expr="stock + _event.data.qty"/>
+      <send type="urn:warehouse:stock" event="restocked">
+        <content expr="({ sku: sku, qty: _event.data.qty, stock: stock })"/>
+      </send>
+    </transition>
+
+    <!-- An answer that could not reach its cart (the cart ended, or the
+         storefront is gone): the cart's own timeouts and the expiry cover
+         it, so there is nothing to undo here. -->
+    <transition event="error.communication">
+      <log label="undelivered" expr="'an answer did not reach its cart'"/>
+    </transition>
+    <transition event="error.execution">
+      <log label="error" expr="_event.name + ' ' + JSON.stringify(_event.data)"/>
+    </transition>
+  </state>
+</scxml>

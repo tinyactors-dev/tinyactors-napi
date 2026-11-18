@@ -1,0 +1,53 @@
+#!/usr/bin/env ruby
+#MISE description="The per-event benchmark of both packages side by side: @tinyactors/node and @tinyactors/wasm under node and bun, alternating, each run a process of its own (tools/perevent.mjs), with the memory per actor and the machine's signature"
+#MISE depends=["build", "wasm:build"]
+#USAGE flag "--actors <n>" default="10000" help="the population"
+#USAGE flag "--runs <n>" default="3" help="runs of each configuration, alternating"
+#USAGE flag "--chart <name>" default="null" help="null (no evaluation) or fit (the native datamodel's work)"
+#USAGE flag "--rounds <n>" default="30" help="rounds of one event to each actor"
+#USAGE flag "--datamodel <name>" default="native" help="native or quickjs: the hosts' datamodel (fit's work runs on it)"
+# vim:ft=ruby
+
+# Root AGENTS.md, "Benchmarks": throughput and memory together, the
+# machine's signature, builds compared side by side in one session. Each
+# configuration runs `runs` times, the packages alternating, and the
+# least per event of its runs is reported. A measurement, not a test.
+
+require 'json'
+require_relative '../napi'
+
+actors = ENV.fetch('usage_actors', '10000')
+runs = Integer(ENV.fetch('usage_runs', '3'))
+chart = ENV.fetch('usage_chart', 'null')
+rounds = ENV.fetch('usage_rounds', '30')
+datamodel = ENV.fetch('usage_datamodel', 'native')
+packages = %w[node wasm]
+results = Hash.new { |hash, key| hash[key] = [] }
+runs.times do
+  NodeAPI::RUNTIMES.each do |runtime|
+    packages.each do |package|
+      env = package == 'wasm' ? { 'TA_NAPI_PACKAGE' => 'wasm' } : {}
+      flags = package == 'wasm' ? ['--conditions=tinyactors-wasm'] : []
+      out = IO.popen(env, [NodeAPI.pinned(runtime), *flags, 'tools/perevent.mjs', '--chart', chart, '--actors', actors, '--rounds', rounds,
+                      '--datamodel', datamodel],
+                     chdir: NodeAPI::ROOT.to_s, &:read)
+      abort "perevent: #{runtime} #{package} failed" unless $?.success?
+      results[[runtime, package]] << JSON.parse(out.lines.last)
+    end
+  end
+end
+puts "perevent: #{results.values.first.first['machine']}; #{actors} actors of #{chart} on #{datamodel}, the least of #{runs} runs"
+puts format('%-6s %-18s %10s %14s %9s %9s %9s %9s %11s %11s %9s', 'runtime', 'package', 'event us', 'spawn+term us', 'rss B/a',
+            'heap B/a', 'qjs B/a', 'linear', 'rss events', 'rss asleep', 'blob B')
+results.each do |(runtime, _package), list|
+  best = list.min_by { |r| r['eventMicroseconds'] }
+  median = ->(key) { list.map { |r| r[key] }.sort[list.size / 2] }
+  puts format('%-6s %-18s %10.3f %14.3f %9d %9d %9s %9s %11d %11d %9d', runtime, best['package'], best['eventMicroseconds'],
+              list.map { |r| r['spawnTerminateMicroseconds'] }.min, median.call('residentBytesPerActor'),
+              median.call('heapBytesPerActor'), best['quickjsHeapBytesPerActor'] || '-', best['linearBytesPerActor'] || '-',
+              median.call('residentAfterEventsBytesPerActor'), median.call('residentHibernatedBytesPerActor'),
+              best['blobBytesPerActor'])
+end
+puts 'perevent: the times are the least of the runs, the memory the median: rss B/a and heap B/a after the spawns, ' \
+     'qjs B/a quickjs\'s heap per actor then (quickjsHeapBytes), linear the wasm memory per actor then, rss events after the rounds, rss asleep after every actor was hibernated'
+File.write(NodeAPI::BUILD.join("perevent-#{chart}-#{datamodel}-#{actors}.json"), JSON.pretty_generate(results.transform_keys { |k| k.join('-') }))

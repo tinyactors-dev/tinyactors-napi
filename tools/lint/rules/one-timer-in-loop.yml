@@ -1,0 +1,21 @@
+# One timer, in src/loop.c (AGENTS.md, "C rules": layers;
+# tinyactors-core/docs/bindings.md, section 3: "One timer, re-armed after
+# every loop; never one per actor or per deadline"). The timer is the
+# global setTimeout, ref'd while a deadline is pending (AGENTS.md, "Rules
+# the suite cannot see": Bun has no uv_timer_*), which the addon reaches
+# by name from C, as it does the other timers of the global object (setInterval, setImmediate
+# for a turn after TA_RUN_YIELDED, and their clear functions). Their names
+# appear in src/loop.c only. That there is one timer at a time is the
+# loop's own test.
+id: one-timer-in-loop
+language: c
+severity: error
+message: "the loop's timer and wakes (setTimeout, setInterval, setImmediate and their clear functions) live in src/loop.c only"
+files:
+  - src/**/*.c
+  - src/**/*.h
+ignores:
+  - src/loop.c
+rule:
+  kind: string_literal
+  regex: '^"(setTimeout|clearTimeout|setInterval|clearInterval|setImmediate|clearImmediate)"$'

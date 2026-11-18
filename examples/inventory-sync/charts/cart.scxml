@@ -1,0 +1,326 @@
+<!-- A storefront's cart: one actor per cart, named by the cart's id. Each
+     line of the cart is a reservation at the warehouse's SKU actor
+     (tinyactors://warehouse/@sku-<id>), made when the customer adds it.
+
+     From the application:  add {sku, qty}, remove {sku}, checkout, cancel
+     From the warehouse:    reserved, reserve.refused, confirmed,
+                            confirm.refused, released, expired
+
+     A line is pending until its reservation is answered, then held. The
+     checkout confirms the held lines one at a time. When the warehouse
+     cannot be reached (error.communication, from the transport) or does
+     not answer in time, the cart compensates: it releases every line,
+     confirmed ones too, retrying the releases until the warehouse takes
+     them, and then tries the whole order again (new reservations, a new
+     checkout) up to maxAttempts times. An order that cannot succeed (out
+     of stock, a hold that expired) is failed after the same compensation.
+
+     Answers name their reservation, and a line's reservation id is new for
+     each attempt, so a duplicated or late answer finds no line waiting for
+     it and changes nothing. A reserved that finds no line is released: the
+     warehouse holds stock nobody wants.
+
+     Every step the customer sees goes to the urn:shop:customer processor. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="cart" initial="cart">
+  <datamodel>
+    <data id="warehouse" expr="'warehouse'"/>  <!-- the warehouse's system id -->
+    <data id="replyTimeout" expr="'5s'"/>      <!-- how long to wait for the warehouse -->
+    <data id="backoff" expr="'2s'"/>           <!-- the pause before a retry -->
+    <data id="maxAttempts" expr="3"/>          <!-- tries of a checkout -->
+    <data id="lines" expr="({})"/>             <!-- sku -> {qty, reservation, status} -->
+    <data id="sends" expr="({})"/>             <!-- send id of a reserve -> sku -->
+    <data id="seq" expr="0"/>                  <!-- makes reservation ids unique -->
+    <data id="attempt" expr="0"/>
+    <data id="retry" expr="false"/>            <!-- does compensation end in a retry? -->
+    <data id="cancelled" expr="false"/>
+    <data id="reason" expr="''"/>
+    <data id="lastSend" expr="null"/>
+    <data id="timer" expr="null"/>
+    <data id="each" expr="null"/>
+  </datamodel>
+
+  <state id="cart" initial="shopping">
+    <!-- A reservation nobody waits for (a duplicate, or one that came after
+         its line was dropped): give it back. Child states take the answers
+         they wait for first. -->
+    <transition event="reserved"
+                cond="!Object.values(lines).some(function (line) { return line.reservation === _event.data.reservation; })">
+      <send event="release" targetexpr="_event.origin">
+        <param name="reservation" expr="_event.data.reservation"/>
+      </send>
+    </transition>
+    <!-- Other answers nobody waits for: a duplicate, or late. -->
+    <transition event="reserved reserve.refused confirmed confirm.refused released expired reserve.timeout"/>
+    <transition event="error.communication"/>
+    <transition event="error.execution">
+      <log label="error" expr="_event.name + ' ' + JSON.stringify(_event.data)"/>
+    </transition>
+
+    <!-- The customer fills the cart. -->
+    <state id="shopping">
+      <transition event="add" cond="lines[_event.data.sku] === undefined">
+        <assign location="seq" expr="seq + 1"/>
+        <assign location="lines[_event.data.sku]"
+                expr="({ qty: _event.data.qty, status: 'pending',
+                         reservation: _name + '/' + _event.data.sku + '/' + seq })"/>
+        <send event="reserve" targetexpr="'tinyactors://' + warehouse + '/@sku-' + _event.data.sku" idlocation="lastSend">
+          <param name="reservation" expr="lines[_event.data.sku].reservation"/>
+          <param name="qty" expr="_event.data.qty"/>
+        </send>
+        <assign location="sends[lastSend]" expr="_event.data.sku"/>
+        <send event="reserve.timeout" delayexpr="replyTimeout">
+          <param name="reservation" expr="lines[_event.data.sku].reservation"/>
+          <param name="sku" expr="_event.data.sku"/>
+        </send>
+      </transition>
+      <transition event="add">
+        <send type="urn:shop:customer" event="line.refused">
+          <content expr="({ cart: _name, sku: _event.data.sku, reason: 'already in the cart' })"/>
+        </send>
+      </transition>
+
+      <transition event="reserved"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation &amp;&amp; lines[_event.data.sku].status === 'pending'">
+        <assign location="lines[_event.data.sku].status" expr="'held'"/>
+        <send type="urn:shop:customer" event="line.reserved">
+          <content expr="({ cart: _name, sku: _event.data.sku, qty: _event.data.qty })"/>
+        </send>
+      </transition>
+      <transition event="reserve.refused"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation">
+        <script>delete lines[_event.data.sku];</script>
+        <send type="urn:shop:customer" event="line.refused">
+          <content expr="({ cart: _name, sku: _event.data.sku, reason: _event.data.reason, available: _event.data.available })"/>
+        </send>
+      </transition>
+      <!-- No answer in time: the reserve or its answer was lost. Release in
+           case the warehouse holds it, and drop the line. -->
+      <transition event="reserve.timeout"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation &amp;&amp; lines[_event.data.sku].status === 'pending'">
+        <send event="release" targetexpr="'tinyactors://' + warehouse + '/@sku-' + _event.data.sku">
+          <param name="reservation" expr="_event.data.reservation"/>
+        </send>
+        <script>delete lines[_event.data.sku];</script>
+        <send type="urn:shop:customer" event="line.failed">
+          <content expr="({ cart: _name, sku: _event.data.sku, reason: 'the warehouse did not answer' })"/>
+        </send>
+      </transition>
+      <!-- The reserve could not be sent: no connection to the warehouse, or
+           no such SKU there. -->
+      <transition event="error.communication"
+                  cond="sends[_event.sendid] !== undefined &amp;&amp; lines[sends[_event.sendid]] !== undefined &amp;&amp; lines[sends[_event.sendid]].status === 'pending'">
+        <send type="urn:shop:customer" event="line.failed">
+          <content expr="({ cart: _name, sku: sends[_event.sendid], reason: 'not delivered to the warehouse' })"/>
+        </send>
+        <script>delete lines[sends[_event.sendid]]; delete sends[_event.sendid];</script>
+      </transition>
+      <transition event="expired"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation">
+        <script>delete lines[_event.data.sku];</script>
+        <send type="urn:shop:customer" event="line.expired">
+          <content expr="({ cart: _name, sku: _event.data.sku })"/>
+        </send>
+      </transition>
+      <transition event="remove" cond="lines[_event.data.sku] !== undefined">
+        <send event="release" targetexpr="'tinyactors://' + warehouse + '/@sku-' + _event.data.sku">
+          <param name="reservation" expr="lines[_event.data.sku].reservation"/>
+        </send>
+        <script>delete lines[_event.data.sku];</script>
+        <send type="urn:shop:customer" event="line.removed">
+          <content expr="({ cart: _name, sku: _event.data.sku })"/>
+        </send>
+      </transition>
+
+      <transition event="checkout"
+                  cond="Object.keys(lines).length > 0 &amp;&amp; Object.values(lines).every(function (line) { return line.status === 'held'; })"
+                  target="checkingOut">
+        <assign location="attempt" expr="1"/>
+      </transition>
+      <transition event="checkout">
+        <send type="urn:shop:customer" event="checkout.refused">
+          <content expr="({ cart: _name, reason: Object.keys(lines).length === 0 ? 'the cart is empty' : 'a line is not reserved yet' })"/>
+        </send>
+      </transition>
+      <transition event="cancel" target="compensating">
+        <assign location="cancelled" expr="true"/>
+      </transition>
+    </state>
+
+    <!-- The checkout: confirm the held lines, one at a time. -->
+    <state id="checkingOut">
+      <onentry>
+        <assign location="each" expr="Object.keys(lines).find(function (sku) { return lines[sku].status === 'held'; })"/>
+        <if cond="each !== undefined">
+          <assign location="lines[each].status" expr="'confirming'"/>
+          <send event="confirm" targetexpr="'tinyactors://' + warehouse + '/@sku-' + each">
+            <param name="reservation" expr="lines[each].reservation"/>
+          </send>
+          <send event="checkout.timeout" delayexpr="replyTimeout" idlocation="timer"/>
+        </if>
+      </onentry>
+      <onexit><cancel sendidexpr="timer"/></onexit>
+
+      <transition event="confirmed"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation &amp;&amp; lines[_event.data.sku].status === 'confirming'"
+                  target="checkingOut">
+        <assign location="lines[_event.data.sku].status" expr="'confirmed'"/>
+        <send type="urn:shop:customer" event="line.confirmed">
+          <content expr="({ cart: _name, sku: _event.data.sku })"/>
+        </send>
+      </transition>
+      <transition event="confirm.refused"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation"
+                  target="compensating">
+        <assign location="lines[_event.data.sku].status" expr="'released'"/>
+        <assign location="reason" expr="_event.data.reason + ': ' + _event.data.sku"/>
+        <assign location="retry" expr="false"/>
+      </transition>
+      <transition event="error.communication" target="compensating">
+        <assign location="reason" expr="'the warehouse cannot be reached'"/>
+        <assign location="retry" expr="true"/>
+      </transition>
+      <transition event="checkout.timeout" target="compensating">
+        <assign location="reason" expr="'the warehouse did not answer'"/>
+        <assign location="retry" expr="true"/>
+      </transition>
+      <transition event="cancel" target="compensating">
+        <assign location="cancelled" expr="true"/>
+      </transition>
+      <transition event="add remove checkout">
+        <send type="urn:shop:customer" event="busy">
+          <content expr="({ cart: _name, event: _event.name, state: 'checking out' })"/>
+        </send>
+      </transition>
+      <!-- Every line is confirmed: eventless, so it is taken as soon as the
+           last confirmed re-entered the state. -->
+      <transition cond="Object.values(lines).every(function (line) { return line.status === 'confirmed'; })" target="placed"/>
+    </state>
+
+    <!-- Give back every line, and retry the releases until the warehouse
+         has taken them all. -->
+    <state id="compensating">
+      <onentry>
+        <send type="urn:shop:customer" event="compensating">
+          <content expr="({ cart: _name, reason: cancelled ? 'cancelled by the customer' : reason, attempt: attempt })"/>
+        </send>
+        <foreach array="Object.keys(lines)" item="each">
+          <if cond="lines[each].status !== 'released'">
+            <send event="release" targetexpr="'tinyactors://' + warehouse + '/@sku-' + each">
+              <param name="reservation" expr="lines[each].reservation"/>
+            </send>
+          </if>
+        </foreach>
+        <send event="release.timeout" delayexpr="replyTimeout" idlocation="timer"/>
+      </onentry>
+      <onexit><cancel sendidexpr="timer"/></onexit>
+
+      <transition event="released expired"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation">
+        <assign location="lines[_event.data.sku].status" expr="'released'"/>
+      </transition>
+      <transition event="error.communication release.timeout" target="releaseBackoff"/>
+      <transition event="cancel">
+        <assign location="cancelled" expr="true"/>
+      </transition>
+      <transition event="add remove checkout">
+        <send type="urn:shop:customer" event="busy">
+          <content expr="({ cart: _name, event: _event.name, state: 'compensating' })"/>
+        </send>
+      </transition>
+
+      <transition cond="Object.values(lines).every(function (line) { return line.status === 'released'; }) &amp;&amp; cancelled" target="cancelled"/>
+      <transition cond="Object.values(lines).every(function (line) { return line.status === 'released'; }) &amp;&amp; retry &amp;&amp; attempt &lt; maxAttempts" target="retrying"/>
+      <transition cond="Object.values(lines).every(function (line) { return line.status === 'released'; })" target="failed"/>
+    </state>
+
+    <!-- The warehouse cannot be reached: wait, then release again. -->
+    <state id="releaseBackoff">
+      <onentry><send event="release.again" delayexpr="backoff"/></onentry>
+      <transition event="release.again" target="compensating"/>
+      <transition event="released expired"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation">
+        <assign location="lines[_event.data.sku].status" expr="'released'"/>
+      </transition>
+      <transition event="cancel">
+        <assign location="cancelled" expr="true"/>
+      </transition>
+    </state>
+
+    <!-- Everything is given back: wait, then reserve every line again. -->
+    <state id="retrying">
+      <onentry><send event="retry" delayexpr="backoff"/></onentry>
+      <transition event="retry" target="reserving"/>
+      <transition event="cancel" target="cancelled"/>
+    </state>
+
+    <state id="reserving">
+      <onentry>
+        <assign location="attempt" expr="attempt + 1"/>
+        <foreach array="Object.keys(lines)" item="each">
+          <assign location="seq" expr="seq + 1"/>
+          <assign location="lines[each].status" expr="'pending'"/>
+          <assign location="lines[each].reservation" expr="_name + '/' + each + '/' + seq"/>
+          <send event="reserve" targetexpr="'tinyactors://' + warehouse + '/@sku-' + each">
+            <param name="reservation" expr="lines[each].reservation"/>
+            <param name="qty" expr="lines[each].qty"/>
+          </send>
+        </foreach>
+        <send event="reserving.timeout" delayexpr="replyTimeout" idlocation="timer"/>
+      </onentry>
+      <onexit><cancel sendidexpr="timer"/></onexit>
+
+      <transition event="reserved"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation &amp;&amp; lines[_event.data.sku].status === 'pending'">
+        <assign location="lines[_event.data.sku].status" expr="'held'"/>
+      </transition>
+      <transition event="reserve.refused"
+                  cond="lines[_event.data.sku] !== undefined &amp;&amp; lines[_event.data.sku].reservation === _event.data.reservation"
+                  target="compensating">
+        <assign location="lines[_event.data.sku].status" expr="'released'"/>
+        <assign location="reason" expr="_event.data.reason + ': ' + _event.data.sku"/>
+        <assign location="retry" expr="false"/>
+      </transition>
+      <transition event="error.communication" target="compensating">
+        <assign location="reason" expr="'the warehouse cannot be reached'"/>
+        <assign location="retry" expr="true"/>
+      </transition>
+      <transition event="reserving.timeout" target="compensating">
+        <assign location="reason" expr="'the warehouse did not answer'"/>
+        <assign location="retry" expr="true"/>
+      </transition>
+      <transition event="cancel" target="compensating">
+        <assign location="cancelled" expr="true"/>
+      </transition>
+      <transition event="add remove checkout">
+        <send type="urn:shop:customer" event="busy">
+          <content expr="({ cart: _name, event: _event.name, state: 'retrying' })"/>
+        </send>
+      </transition>
+      <transition cond="Object.values(lines).every(function (line) { return line.status === 'held'; })" target="checkingOut"/>
+    </state>
+  </state>
+
+  <final id="placed">
+    <onentry>
+      <send type="urn:shop:customer" event="order.placed">
+        <content expr="({ cart: _name, attempt: attempt,
+                          lines: Object.keys(lines).map(function (sku) { return { sku: sku, qty: lines[sku].qty }; }) })"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="failed">
+    <onentry>
+      <send type="urn:shop:customer" event="order.failed">
+        <content expr="({ cart: _name, reason: reason, attempt: attempt })"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="cancelled">
+    <onentry>
+      <send type="urn:shop:customer" event="order.cancelled">
+        <content expr="({ cart: _name })"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

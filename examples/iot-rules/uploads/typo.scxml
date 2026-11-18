@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Buggy: well-formed XML and a valid chart, but its JavaScript does not
+     parse: the compiler does not read it, the platform does. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="typo" initial="watching">
+  <datamodel><data id="limit" expr="80"/></datamodel>
+  <state id="watching">
+    <transition event="reading" cond="_event.data.value &gt; limit)">
+      <send type="urn:iot:alert" event="alert.raised"/>
+    </transition>
+    <transition event="reading">
+      <script>if (_event.data.value &lt; 0 { limit = 0 }</script>
+    </transition>
+  </state>
+</scxml>

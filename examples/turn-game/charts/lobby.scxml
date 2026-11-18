@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The lobby: one named actor, `lobby`, that every player joins.
+
+     It invokes the matchmaking service for as long as it is open, and is
+     the record of who waits: the service pairs players, but what it holds
+     is a cache of the lobby's `waiting`. A service started again (after a
+     restore, `invocation.restored`) says `matchmaker.restarted`, and the
+     lobby gives it the waiting players again, in the order they joined.
+
+     For each pair it names a match (`match-<n>`), asks the application to
+     start it (the urn:game:control I/O processor), and tells both players.
+     It keeps the names of the running matches, so `sync` can reach each. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="lobby" initial="open">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="turnMs" expr="30000"/>
+    <data id="maxTimeouts" expr="2"/>
+    <data id="window" expr="200"/>
+    <!-- the lobby's own -->
+    <data id="waiting" expr="[]"/>
+    <data id="active" expr="[]"/>
+    <data id="nextMatch" expr="1"/>
+    <data id="finished" expr="0"/>
+    <data id="restarts" expr="0"/>
+  </datamodel>
+
+  <state id="open">
+    <invoke id="matchmaker" type="urn:game:matchmaking" src="matchmaking://ranked">
+      <param name="window" expr="window"/>
+    </invoke>
+
+    <transition event="join" cond="!waiting.some(function (w) { return w.player === _event.data.player; })">
+      <script>waiting.push({ player: _event.data.player, rating: _event.data.rating })</script>
+      <send target="#_matchmaker" event="enqueue">
+        <param name="player" expr="_event.data.player"/>
+        <param name="rating" expr="_event.data.rating"/>
+      </send>
+    </transition>
+    <transition event="leave">
+      <assign location="waiting" expr="waiting.filter(function (w) { return w.player !== _event.data.player; })"/>
+      <send target="#_matchmaker" event="dequeue">
+        <param name="player" expr="_event.data.player"/>
+      </send>
+    </transition>
+
+    <transition event="paired">
+      <assign location="waiting" expr="waiting.filter(function (w) { return _event.data.players.indexOf(w.player) &lt; 0; })"/>
+      <send type="urn:game:control" event="match.create">
+        <param name="match" expr="'match-' + nextMatch"/>
+        <param name="players" expr="_event.data.players"/>
+        <param name="turnMs" expr="turnMs"/>
+        <param name="maxTimeouts" expr="maxTimeouts"/>
+      </send>
+      <foreach array="_event.data.players" item="p">
+        <send event="matched" targetexpr="'tinyactors://game/@player-' + p">
+          <param name="match" expr="'match-' + nextMatch"/>
+        </send>
+      </foreach>
+      <script>active.push('match-' + nextMatch)</script>
+      <assign location="nextMatch" expr="nextMatch + 1"/>
+    </transition>
+
+    <transition event="matchmaker.restarted">
+      <assign location="restarts" expr="restarts + 1"/>
+      <send target="#_matchmaker" event="resync">
+        <param name="waiting" expr="waiting"/>
+      </send>
+    </transition>
+
+    <transition event="match.over">
+      <assign location="active" expr="active.filter(function (m) { return m !== _event.data.match; })"/>
+      <assign location="finished" expr="finished + 1"/>
+    </transition>
+
+    <transition event="sync">
+      <foreach array="active" item="m">
+        <send event="sync" targetexpr="'tinyactors://game/@' + m"/>
+      </foreach>
+    </transition>
+
+    <transition event="error.communication">
+      <log label="lobby" expr="'the matchmaking service failed: ' + _event.name"/>
+    </transition>
+  </state>
+</scxml>

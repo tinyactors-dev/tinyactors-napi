@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A well-behaved customer chart: keeps a device's last 1000 temperature
+     readings and raises an alert while their average is over 85. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="rolling-average" initial="normal">
+  <datamodel>
+    <data id="device" expr="null"/>
+    <data id="recent" expr="[]"/>
+    <data id="average" expr="0"/>
+  </datamodel>
+  <state id="watching" initial="normal">
+    <transition event="reading" cond="_event.data.metric === 'temp'">
+      <script>
+        recent = recent.concat([_event.data.value]).slice(-1000);
+        average = recent.reduce((sum, value) => sum + value, 0) / recent.length;
+      </script>
+      <raise event="averaged"/>
+    </transition>
+    <state id="normal">
+      <transition event="averaged" cond="average &gt; 85" target="high"/>
+    </state>
+    <state id="high">
+      <onentry>
+        <send type="urn:iot:alert" event="alert.raised">
+          <param name="message" expr="'average ' + average.toFixed(1) + ' over ' + recent.length + ' readings'"/>
+        </send>
+      </onentry>
+      <transition event="averaged" cond="average &lt;= 85" target="normal">
+        <send type="urn:iot:alert" event="alert.cleared"/>
+      </transition>
+    </state>
+  </state>
+</scxml>

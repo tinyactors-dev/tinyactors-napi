@@ -1,0 +1,75 @@
+#!/usr/bin/env ruby
+#MISE description="Test @tinyactors/wasm: build its module (wasm:build, its imports and exports checked), then wasm/test/module.test.mjs under node and bun and wasm/test/browser.test.mjs in Chromium (a page and a module Worker, through both entries), then the shared test files (test/*.test.mjs) against the wasm package under node and bun (--conditions=tinyactors-wasm) and in Chromium (an import map), each with the exclusions wasm/test/exclusions.mjs lists, then the documentation's examples and the example applications' tests in Chromium (wasm/test/documentation.mjs), then the conformance suite against conform.mjs on the wasm package (wasm/test/conform.mjs in Chromium): its scenarios and W3C suite on the native datamodel under node and bun and in Chromium, and the whole suite (protocol, scenarios, W3C) on quickjs under node and bun and in Chromium"
+# vim:ft=ruby
+
+# Chromium is the pre-installed Playwright's (/opt/pw-browsers/chromium,
+# PLAYWRIGHT_CHROMIUM, as staticjs-js's test finds it); without Playwright
+# the browser tests say they skipped. `mise run test` runs this task.
+#
+# The shared test files import `@tinyactors/node`, which package.json's
+# export condition `tinyactors-wasm` maps to wasm/index.mjs (and `#direct`
+# to its direct layer): the condition goes in NODE_OPTIONS and BUN_OPTIONS,
+# so a test's child process (a liveness case, a documentation example)
+# runs the same package, and TA_NAPI_PACKAGE tells the harness which
+# exclusions apply. Each file runs on both datamodels, native and quickjs
+# (TA_NAPI_DATAMODEL), as against the addon.
+
+require_relative '../../wasm'
+
+NodeAPI.run('mise', 'run', 'wasm:build')
+condition = '--conditions=tinyactors-wasm'
+NodeAPI::RUNTIMES.each do |runtime|
+  puts "wasm:test: #{runtime} wasm/test/module.test.mjs"
+  NodeAPI.run(NodeAPI.pinned(runtime), condition, WebModule::ROOT.join('test/module.test.mjs').to_s)
+end
+env = {}
+chromium = Pathname.new('/opt/pw-browsers/chromium')
+env['PLAYWRIGHT_CHROMIUM'] = chromium.to_s if chromium.executable?
+puts 'wasm:test: chromium wasm/test/browser.test.mjs'
+NodeAPI.run(NodeAPI.pinned('node'), WebModule::ROOT.join('test/browser.test.mjs').to_s, env: env)
+
+shared = { 'TA_NAPI_PACKAGE' => 'wasm', 'NODE_OPTIONS' => condition, 'BUN_OPTIONS' => condition }
+NodeAPI::RUNTIMES.each do |runtime|
+  program = NodeAPI.pinned(runtime)
+  NodeAPI::DATAMODELS.each do |datamodel|
+    NodeAPI.tests.each do |file|
+      puts "wasm:test: #{runtime} #{datamodel} #{file.relative_path_from(NodeAPI::ROOT)} against @tinyactors/wasm"
+      NodeAPI.run(program, file.to_s, env: shared.merge('TA_NAPI_DATAMODEL' => datamodel))
+    end
+  end
+end
+puts 'wasm:test: chromium test/*.test.mjs against @tinyactors/wasm (wasm/test/chromium.mjs)'
+NodeAPI.run(NodeAPI.pinned('node'), WebModule::ROOT.join('test/chromium.mjs').to_s, env: env)
+# the user documentation in Chromium: the README's and the guides' blocks
+# that need no Node.js built-in, and the example applications' tests that
+# run in a page (wasm/test/documentation.mjs; what stays in node and bun is
+# listed with its reason in wasm/test/documented.mjs)
+puts 'wasm:test: chromium the documentation\'s examples against @tinyactors/wasm (wasm/test/documentation.mjs)'
+NodeAPI.run(NodeAPI.pinned('node'), WebModule::ROOT.join('test/documentation.mjs').to_s, env: env)
+
+# The conformance suite against the same adapter, conform.mjs, on the wasm
+# package: under node and bun by the export condition, in Chromium through
+# wasm/test/conform.mjs, which runs it in a page. The set is the addon's
+# gate (NodeAPI::MILESTONE): on quickjs all of it, and on the native
+# datamodel its scenarios and W3C suite, since the protocol suite's setups
+# make every host with datamodel "quickjs" whatever the run's datamodel
+# (tinyactors-test/lib/runner.rb, `setup`; docs/log.xml,
+# l-p5-datamodel-protocol-quickjs), so a native pass would run the same
+# protocol cases again.
+runs = { 'native' => %w[scenarios w3c], 'quickjs' => %w[protocol scenarios w3c] }
+adapters = [
+  ['node', [NodeAPI.pinned('node'), condition, 'conform.mjs']],
+  ['bun', [NodeAPI.pinned('bun'), condition, 'conform.mjs']],
+  ['chromium', [NodeAPI.pinned('node'), 'wasm/test/conform.mjs']],
+]
+adapters.each do |name, command|
+  if name == 'chromium' && !system(*command, '--available', chdir: NodeAPI::ROOT.to_s)
+    puts 'wasm:test: conform, chromium: skip: no Playwright installed'
+    next
+  end
+  runs.each do |datamodel, suites|
+    puts "wasm:test: conform, #{name}, #{datamodel}, against @tinyactors/wasm"
+    NodeAPI.run('mise', 'run', '//tinyactors-test:run', '--', '--kind', 'binding', '--datamodel', datamodel,
+                '--milestone', NodeAPI::MILESTONE, *suites.flat_map { |suite| ['--suite', suite] }, *command, env: env)
+  end
+end

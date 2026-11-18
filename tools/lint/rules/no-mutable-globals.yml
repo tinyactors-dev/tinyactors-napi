@@ -1,0 +1,67 @@
+# No mutable state in static storage: no global and no static local the
+# addon can write (the model is mise/ast-grep/rules/tinyparse-no-static-mutable.yml
+# at the repository root). The addon is loaded once per process and its
+# module initialized once per environment: the main thread and each worker
+# thread has its own (Node-API's per-environment instance data,
+# `napi_set_instance_data`; under Bun, unverified until a test runs it). A
+# global would be shared by all of them, and a `napi_value` or `napi_ref`
+# of one environment is meaningless in another. State
+# lives in the instance data or on the `Host` object.
+#
+# Allowed:
+#   - a constant: the object itself is `const` (`static const int`,
+#     `static const char *const names[]`, `static const napi_type_tag`;
+#     `static const char *p` is a mutable pointer and is refused);
+#   - a function's declaration (static linkage is not data);
+#   - an array of Node-API's `napi_property_descriptor`, the table of a
+#     class's methods and accessors (`napi_define_class`, Node.js 22's
+#     include/node/js_native_api.h:295), exempt by type.
+id: no-mutable-globals
+language: c
+severity: error
+message: "no mutable global or static local: keep state in the environment's instance data or on the Host; constants are const objects, napi_property_descriptor tables are exempt"
+files:
+  - src/**/*.c
+  - src/**/*.h
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+utils:
+  # The declared object itself is const: `const` on the declaration and no
+  # pointer in its declarator, or `* const` next to its name.
+  const-object:
+    any:
+      - all:
+          - has: {kind: type_qualifier, regex: '^const$'}
+          - not: {has: {kind: pointer_declarator, stopBy: end}}
+      - has:
+          kind: pointer_declarator
+          stopBy: end
+          all:
+            - has: {kind: type_qualifier, regex: '^const$'}
+            - has:
+                field: declarator
+                any: [{kind: identifier}, {kind: array_declarator}]
+  # A function's declaration: its name is a function_declarator's (a
+  # pointer to a function is a variable).
+  function-declaration:
+    has:
+      kind: function_declarator
+      stopBy: end
+      has: {field: declarator, kind: identifier}
+  # an array of napi_property_descriptor
+  platform-table:
+    all:
+      - has: {field: type, kind: type_identifier, regex: '^napi_property_descriptor$'}
+      - has: {kind: array_declarator, stopBy: end}
+rule:
+  kind: declaration
+  any:
+    # file scope: outside every function body
+    - not: {inside: {kind: compound_statement, stopBy: end}}
+    # a static local
+    - has: {kind: storage_class_specifier, regex: '^static$'}
+  not:
+    any:
+      - matches: const-object
+      - matches: function-declaration
+      - matches: platform-table

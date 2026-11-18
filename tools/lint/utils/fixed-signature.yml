@@ -1,0 +1,29 @@
+# The parameter list of a function whose signature a typedef fixes, so its
+# parameters are not ours to group (AGENTS.md, "C rules":
+# exempt by that typedef, not by name). It is matched by the
+# parameter types, whatever the function and its parameters are called
+# (Node.js 22's include/node/js_native_api_types.h and node_api_types.h):
+#
+#   - napi_callback: (napi_env, napi_callback_info)
+#     (js_native_api_types.h:159);
+#   - napi_finalize: (napi_env, void *, void *) (js_native_api_types.h:161),
+#     and node_api_basic_finalize, the same with node_api_basic_env
+#     (node_api_nogc_env before; js_native_api_types.h:171-175);
+#   - napi_threadsafe_function_call_js: (napi_env, napi_value, void *,
+#     void *) (node_api_types.h:39), the one with four parameters;
+#   - ta_allocator's alloc and free, which the host's allocator fills
+#     (tinyactors-core/tools/lint/utils/allocator-signature.yml).
+#
+# Only the last two have more than three parameters or a pointer and a
+# size; the first two are here so that a callback stays exempt if a rule
+# grows. Add a typedef here, with its header line, before a function that
+# it fixes fails a rule.
+id: fixed-signature
+language: c
+rule:
+  kind: parameter_list
+  any:
+    - regex: '^\(\s*napi_env\s+\w*\s*,\s*napi_callback_info\s+\w*\s*\)$'
+    - regex: '^\(\s*(napi_env|node_api_basic_env|node_api_nogc_env)\s+\w*\s*,\s*void\s*\*\s*\w*\s*,\s*void\s*\*\s*\w*\s*\)$'
+    - regex: '^\(\s*napi_env\s+\w*\s*,\s*napi_value\s+\w*\s*,\s*void\s*\*\s*\w*\s*,\s*void\s*\*\s*\w*\s*\)$'
+    - matches: allocator-signature

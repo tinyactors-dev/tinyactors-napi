@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": [
+      "esnext",
+      "dom"
+    ],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "types": [],
+    "paths": {
+      "@tinyactors/wasm": [
+        "../../../index.d.ts"
+      ],
+      "@tinyactors/wasm/init": [
+        "../../../wasm/init.d.ts"
+      ]
+    }
+  },
+  "include": [
+    "*.ts"
+  ]
+}

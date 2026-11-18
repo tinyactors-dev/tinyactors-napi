@@ -1,0 +1,41 @@
+# The datamodel (src/datamodel/) is the vtable's entries only: of core it
+# calls only what a datamodel may (AGENTS.md, "C rules": layers;
+# include/tinyactors/datamodel.h: "implementations may call the read-only
+# ta_datamodel_environment_* queries below; they must never call ta_system_*
+# functions"):
+#
+#   - ta_datamodel_environment_*: In(), fuel, the chart and its image;
+#   - ta_image_*: the chart's expressions and data, read from that image at
+#     chart_attach, as the ECMAScript datamodel does
+#     (tinyactors-core/src/datamodel_ecmascript/datamodel_ecmascript.c:979,
+#     1272);
+#   - ta_cbor_*: the token lists of to_wire and from_wire (the same file,
+#     2883 and 2995);
+#   - ta_table_*: its rows, which live in the host's tables (AGENTS.md,
+#     "The binding's memory");
+#   - ta_growable_arena_*: its scratch arena, the memory of a call that
+#     needs it for the call only (an XML parse's tree), a mark per call
+#     (AGENTS.md, "The binding's memory");
+#   - txml's txml_*: XML content parsed into a DOM (docs/plan.xml,
+#     decision d-dom; tinyxml/include/txml.h);
+#   - the addon's own ta_napi_* (values.c's conversion, rows.c).
+#
+# Never the host, the system or the compiler (ta_host_*, ta_system_*,
+# ta_compile_*, ...). Everything else it calls is Node-API and the C
+# library functions of `extension-calls-core-and-node-api`, which covers
+# src/datamodel/ too.
+id: datamodel-calls-environment-and-node-api
+language: c
+severity: error
+message: "src/datamodel/ calls of core only ta_datamodel_environment_*, ta_image_*, ta_cbor_*, ta_table_* and ta_growable_arena_* (and txml_* and the addon's own ta_napi_*)"
+files:
+  - src/datamodel/**/*.c
+  - src/datamodel/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    regex: '^ta_'
+    not:
+      regex: '^ta_(datamodel_environment|image|cbor|table|growable_arena|napi)_\w+$'

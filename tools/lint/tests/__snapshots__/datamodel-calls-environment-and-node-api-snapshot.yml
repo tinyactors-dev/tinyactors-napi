@@ -1,0 +1,32 @@
+id: datamodel-calls-environment-and-node-api
+snapshots:
+  static void ta_napi_compile(void) { ta_compile_charts(NULL, NULL, NULL); }:
+    labels:
+    - source: ta_compile_charts(NULL, NULL, NULL)
+      style: primary
+      start: 36
+      end: 71
+    - source: ta_compile_charts
+      style: secondary
+      start: 36
+      end: 53
+  static void ta_napi_peek(ta_system *system) { ta_system_run(system, 1); }:
+    labels:
+    - source: ta_system_run(system, 1)
+      style: primary
+      start: 46
+      end: 70
+    - source: ta_system_run
+      style: secondary
+      start: 46
+      end: 59
+  static void ta_napi_sneak(ta_host *host, uint64_t session) { ta_host_send(host, NULL); }:
+    labels:
+    - source: ta_host_send(host, NULL)
+      style: primary
+      start: 61
+      end: 85
+    - source: ta_host_send
+      style: secondary
+      start: 61
+      end: 73

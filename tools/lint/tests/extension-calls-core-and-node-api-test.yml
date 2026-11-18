@@ -1,0 +1,18 @@
+id: extension-calls-core-and-node-api
+valid:
+  - "static void ta_napi_turn(ta_host *host) { ta_host_run(host, 1000); ta_host_effects_ack(host); }"
+  - "static napi_value ta_napi_error(napi_env env) { napi_throw_error(env, NULL, \"x\"); return NULL; }"
+  - "static void ta_napi_tag(napi_env env, napi_value object) { napi_type_tag_object(env, object, &ta_napi_host_tag); }"
+  - "static void ta_napi_finalize(node_api_basic_env env, void *data, void *hint) { node_api_post_finalizer(env, NULL, data, hint); }"
+  - "static void *ta_napi_allocate(void *context, size_t size, size_t alignment) { void *block = malloc(size); free(block); return realloc(NULL, size); }"
+  - "static void ta_napi_copy(char *a, const char *b, size_t n) { memcpy(a, b, n); memset(a, 0, strlen(b)); }"
+  - "static void ta_napi_check(void) { assert(sizeof(int) == 4); size_t at = offsetof(ta_spawn, size); }"
+  - "static void ta_napi_vtable(const ta_datamodel_call *call) { call->datamodel->release(call); }"
+  - "NAPI_MODULE_INIT() { return ta_napi_module_init(env, exports); }"
+  - "static txml_cursor ta_napi_root(const txml_doc *doc) { return txml_doc_root(doc); }"
+invalid:
+  - "static void ta_napi_arm(uv_loop_t *loop, uv_timer_t *timer) { uv_timer_start(timer, NULL, 10, 0); }"
+  - "static void ta_napi_log(const char *text) { printf(\"%s\", text); }"
+  - "static void ta_napi_eval(JSContext *context) { JS_Eval(context, \"1\", 1, \"x\", 0); }"
+  - "static void ta_napi_wait(void) { usleep(1000); }"
+  - "static uint64_t ta_napi_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return 0; }"

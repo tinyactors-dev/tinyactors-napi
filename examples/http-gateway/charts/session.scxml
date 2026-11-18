@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One API session of one client, from its login to its logout or expiry.
+
+     Every request the client makes on the session is an event. The chart
+     decides what becomes of it:
+
+     - Rate limit: a token bucket of `burst` tokens, refilled one token
+       every `refillMs`. A request with no token left is answered 429 with
+       a Retry-After.
+     - Concurrency: at most `maxInFlight` requests at the upstream at once;
+       one more is answered 429 too.
+     - Upstream timeout: a request the upstream does not answer within
+       `upstreamTimeoutMs` is answered 504, and its late answer goes
+       nowhere.
+     - Upstream failure: a request whose connection to the upstream failed
+       (error.communication) is answered 502, except a GET, which is
+       idempotent and retried once, within the same timeout.
+     - Expiry: `idleMs` without a request closes the session. A logout
+       closes it at once. Requests still in flight then are answered by the
+       gateway (401), as is every request that reaches a closed session.
+
+     The answer to every request is a send to urn:gateway:http, which
+     writes the HTTP response. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="session" initial="open">
+  <datamodel>
+    <!-- given at spawn: the client and its plan's limits -->
+    <data id="client" expr="null"/>
+    <data id="burst" expr="5"/>
+    <data id="refillMs" expr="1000"/>
+    <data id="maxInFlight" expr="2"/>
+    <data id="upstreamTimeoutMs" expr="2000"/>
+    <data id="idleMs" expr="60000"/>
+    <!-- the session's own -->
+    <data id="tokens" expr="0"/>
+    <data id="refilling" expr="false"/>
+    <!-- requestID -> { sendID, timerID, attempt, request } -->
+    <data id="inflight" expr="({})"/>
+    <data id="requests" expr="0"/>
+    <data id="limited" expr="0"/>
+    <data id="sendID" expr="null"/>
+    <data id="timerID" expr="null"/>
+    <data id="failed" expr="null"/>
+    <data id="closeReason" expr="null"/>
+  </datamodel>
+
+  <state id="open">
+    <onentry>
+      <assign location="tokens" expr="burst"/>
+      <!-- a delayexpr gives text with a unit (docs/log.xml,
+           l-p4-examples-order-delayexpr) -->
+      <send id="idle" event="idle" delayexpr="idleMs + 'ms'"/>
+    </onentry>
+
+    <!-- a request with a token and room at the upstream: forward it -->
+    <transition event="request" cond="tokens &gt; 0 &amp;&amp; Object.keys(inflight).length &lt; maxInFlight">
+      <assign location="tokens" expr="tokens - 1"/>
+      <assign location="requests" expr="requests + 1"/>
+      <if cond="!refilling">
+        <assign location="refilling" expr="true"/>
+        <send id="refill" event="refill" delayexpr="refillMs + 'ms'"/>
+      </if>
+      <cancel sendid="idle"/>
+      <send id="idle" event="idle" delayexpr="idleMs + 'ms'"/>
+      <send type="urn:gateway:upstream" event="forward" idlocation="sendID">
+        <content expr="Object.assign({ client: client }, _event.data)"/>
+      </send>
+      <send event="upstream.timeout" delayexpr="upstreamTimeoutMs + 'ms'" idlocation="timerID">
+        <param name="requestID" expr="_event.data.requestID"/>
+      </send>
+      <script>inflight[_event.data.requestID] = { sendID: sendID, timerID: timerID, attempt: 1, request: Object.assign({ client: client }, _event.data) }</script>
+    </transition>
+    <transition event="request" cond="tokens === 0">
+      <assign location="limited" expr="limited + 1"/>
+      <cancel sendid="idle"/>
+      <send id="idle" event="idle" delayexpr="idleMs + 'ms'"/>
+      <send type="urn:gateway:http" event="respond">
+        <content expr="({ requestID: _event.data.requestID, status: 429, error: 'rate limited', retryAfterMs: refillMs })"/>
+      </send>
+    </transition>
+    <transition event="request">
+      <assign location="limited" expr="limited + 1"/>
+      <cancel sendid="idle"/>
+      <send id="idle" event="idle" delayexpr="idleMs + 'ms'"/>
+      <send type="urn:gateway:http" event="respond">
+        <content expr="({ requestID: _event.data.requestID, status: 429, error: 'too many requests in flight', retryAfterMs: 0 })"/>
+      </send>
+    </transition>
+
+    <transition event="refill">
+      <assign location="tokens" expr="Math.min(burst, tokens + 1)"/>
+      <if cond="tokens &lt; burst">
+        <send id="refill" event="refill" delayexpr="refillMs + 'ms'"/>
+      <else/>
+        <assign location="refilling" expr="false"/>
+      </if>
+    </transition>
+
+    <!-- the upstream answered, in time -->
+    <transition event="upstream.response" cond="_event.data.requestID in inflight">
+      <cancel sendidexpr="inflight[_event.data.requestID].timerID"/>
+      <script>delete inflight[_event.data.requestID]</script>
+      <send type="urn:gateway:http" event="respond">
+        <content expr="({ requestID: _event.data.requestID, status: _event.data.status, body: _event.data.body })"/>
+      </send>
+    </transition>
+    <!-- too late: the client got its 504 already -->
+    <transition event="upstream.response">
+      <log label="late" expr="'upstream answered ' + _event.data.requestID + ' after its timeout'"/>
+    </transition>
+
+    <transition event="upstream.timeout" cond="_event.data.requestID in inflight">
+      <script>delete inflight[_event.data.requestID]</script>
+      <log label="timeout" expr="'upstream did not answer ' + _event.data.requestID + ' in ' + upstreamTimeoutMs + ' ms'"/>
+      <send type="urn:gateway:http" event="respond">
+        <content expr="({ requestID: _event.data.requestID, status: 504, error: 'upstream timeout' })"/>
+      </send>
+    </transition>
+
+    <!-- the connection to the upstream failed: which request was it? -->
+    <transition event="error.communication" cond="Object.keys(inflight).some((id) =&gt; inflight[id].sendID === _event.sendid)">
+      <assign location="failed" expr="Object.keys(inflight).find((id) =&gt; inflight[id].sendID === _event.sendid)"/>
+      <if cond="inflight[failed].request.method === 'GET' &amp;&amp; inflight[failed].attempt === 1">
+        <log label="retry" expr="'upstream connection failed for ' + failed + ', retrying the GET'"/>
+        <send type="urn:gateway:upstream" event="forward" idlocation="sendID">
+          <content expr="inflight[failed].request"/>
+        </send>
+        <script>inflight[failed].sendID = sendID; inflight[failed].attempt = 2</script>
+      <else/>
+        <cancel sendidexpr="inflight[failed].timerID"/>
+        <script>delete inflight[failed]</script>
+        <send type="urn:gateway:http" event="respond">
+          <content expr="({ requestID: failed, status: 502, error: 'upstream unavailable' })"/>
+        </send>
+      </if>
+    </transition>
+
+    <transition event="logout" target="closed">
+      <assign location="closeReason" expr="'logout'"/>
+      <send type="urn:gateway:http" event="respond">
+        <content expr="({ requestID: _event.data.requestID, status: 204 })"/>
+      </send>
+    </transition>
+    <transition event="idle" target="closed">
+      <assign location="closeReason" expr="'idle'"/>
+    </transition>
+  </state>
+
+  <final id="closed">
+    <onentry>
+      <log label="session" expr="client + ' closed (' + closeReason + ') after ' + requests + ' requests, ' + limited + ' limited'"/>
+      <send type="urn:gateway:http" event="closed">
+        <content expr="({ reason: closeReason, requests: requests, limited: limited })"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

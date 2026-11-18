@@ -1,0 +1,34 @@
+#!/usr/bin/env ruby
+#MISE description="Run the conformance suite against the adapter (conform.mjs) as a binding (--kind binding), under node and bun, on the native datamodel and on quickjs; arguments go to the runner (--suite protocol, ...)"
+#USAGE arg "[argument]..." var=#true help="options for the runner: --milestone, --suite, --timeout, --skip (tinyactors-test/README.md)"
+# vim:ft=ruby
+
+# The differential run (AGENTS.md, "Tasks"): the same suite on the
+# native "ecmascript" datamodel and on quickjs, and both must pass, under
+# each runtime the package serves. Both datamodels are named "ecmascript",
+# so the adapter's host.create puts only the one asked for in the host
+# (tinyactors-test/docs/driver.md, "The chart language"). The kind is
+# stated here, by the project that runs the suite, not by the adapter
+# ("Kinds"). The runtimes run by path: the runner is tinyactors-test's
+# task, whose PATH is its own. The adapter reads and writes the driver's
+# frames with the package's own `encode` and `decode`, and imports nothing
+# but `@tinyactors/node` and `node:` built-ins (tinyactors-test/lint).
+# Without --milestone the whole suite runs; `mise run test` passes
+# `--milestone NodeAPI::MILESTONE`.
+
+require_relative '../napi'
+
+unless NodeAPI::ADAPTER.exist?
+  abort "conform: no adapter yet: #{NodeAPI::ADAPTER.relative_path_from(NodeAPI::ROOT)}"
+end
+
+options = ARGV.reject { |argument| argument == '--' }
+NodeAPI::RUNTIMES.each do |runtime|
+  program = NodeAPI.pinned(runtime)
+  datamodels = ENV.fetch('TA_NAPI_DATAMODELS', '').split(',')
+  (datamodels.empty? ? NodeAPI::DATAMODELS : datamodels).each do |datamodel|
+    puts "conform: #{runtime}, #{datamodel}"
+    NodeAPI.run('mise', 'run', '//tinyactors-test:run', '--', '--kind', 'binding', '--datamodel', datamodel, *options,
+                program, NodeAPI::ADAPTER.basename.to_s)
+  end
+end

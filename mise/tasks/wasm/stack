@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+#MISE description="Measure the wasm module's shadow stack: a build with the stack probe (TA_WEB_STACK_PROBE), then the deepest the compiler (a chart nested to its limits) and a run go, against WebModule::STACK_SIZE"
+# vim:ft=ruby
+
+# A measurement, not a test: `mise run test` does not run it. Its numbers
+# justify mise/wasm.rb's STACK_SIZE (docs/log.xml, l-p5-build-stack).
+
+require_relative '../../wasm'
+
+probe = WebModule.build_probe
+NodeAPI.run(NodeAPI.pinned('node'), WebModule::ROOT.join('tools/stack.mjs').to_s, probe.to_s)

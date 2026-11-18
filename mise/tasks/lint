@@ -1,0 +1,64 @@
+#!/usr/bin/env ruby
+#MISE description="Lint: the ast-grep rules' tests, then the addon's C (parameters, buffers, layers, one timer, the ta_napi_ prefix, no mutable globals; the convenience layer's imports), the adapter's imports, the mapping table, the types against the examples (tsc), the surprise catalogue, the build scripts' portability and acronyms"
+# vim:ft=ruby
+
+# 1. tools/lint/rules (sgconfig.yml), after their tests in tools/lint/tests:
+#    at most three parameters and ta_bytes/ta_buffer for every function of
+#    src/ (with the utility rules of tinyactors-core/tools/lint/utils), the
+#    layer rules, one timer in src/loop.c, the ta_napi_ prefix, no
+#    mutable globals, and the convenience layer's imports (lib/: only
+#    lib/direct.mjs, the addon's exports).
+# 2. The adapters' lint (tinyactors-test/lint): the adapter imports only
+#    the public module, `@tinyactors/node`, and `node:` built-ins.
+# 3. docs/api-map.md: every API item names a core function, constant or
+#    request method (mise/lib/api_map.rb); then index.d.ts checked by the
+#    pinned tsc against every example of README.md and docs/guide/ and the
+#    cases of test/types (tools/typecheck.mjs); and docs/surprises.md
+#    against docs/log.xml's surprises, each resolved or for the maintainer
+#    (tools/surprises.mjs --check).
+# 4. The root's checks, on this project's files only: its build scripts
+#    leave what differs between hosts to the toolchain (check-portability's
+#    rules, mise/lib/build_scripts.rb), and acronyms are all capitals or
+#    all lowercase (check-acronyms, mise/lib/acronym_case.rb). They are
+#    called as libraries, not as the root's tasks, so this run does not
+#    stamp the root's check-portability as passed for the whole tree.
+#
+# Invoke `ast-grep`, never `sg` (shadow-utils' group tool in orbs).
+
+require_relative '../napi'
+require 'api_map'
+require 'acronym_case'
+require 'build_scripts'
+require 'open3'
+
+NodeAPI.run('ast-grep', 'test')
+NodeAPI.run('ast-grep', 'scan')
+
+if NodeAPI::ADAPTER.exist?
+  NodeAPI.run('mise', 'run', '//tinyactors-test:lint', '--', 'conform.mjs')
+else
+  NodeAPI.run('mise', 'run', '//tinyactors-test:lint')
+  puts 'lint: no adapter yet (conform.mjs): the adapters\' lint ran its own tests only'
+end
+
+problems = APIMap.check(NodeAPI::MAPPING)
+problems.each { |problem| warn "lint: docs/api-map.md: #{problem}" }
+abort "lint: docs/api-map.md: #{problems.size} problem(s)" unless problems.empty?
+puts 'lint: docs/api-map.md names core behind every API item'
+
+NodeAPI.run(NodeAPI.pinned('node'), 'tools/typecheck.mjs', NodeAPI.pinned('tsc'))
+NodeAPI.run(NodeAPI.pinned('node'), 'tools/surprises.mjs', '--check')
+
+project = NodeAPI::ROOT.basename.to_s
+findings = BuildScripts.scan(project)
+findings.each { |finding| warn "lint: check-portability: #{finding}" }
+abort "lint: #{findings.size} build script finding(s); see the rule's note in mise/ast-grep/rules/" unless findings.empty?
+puts "lint: #{BuildScripts.paths(project).size} build scripts leave what differs between hosts to the toolchain"
+
+files, status = Open3.capture2('git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', project,
+                               chdir: AcronymCase::ROOT)
+abort 'lint: git ls-files failed' unless status.success?
+acronyms = AcronymCase.check(files.split("\0"))
+acronyms.each { |finding| warn "lint: check-acronyms: #{finding}" }
+abort "lint: #{acronyms.size} mixed-case acronym(s); see AGENTS.md at the root (Acronyms)" unless acronyms.empty?
+puts 'lint: acronyms are all capitals or all lowercase'

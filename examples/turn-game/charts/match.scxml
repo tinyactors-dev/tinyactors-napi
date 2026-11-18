@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One match of noughts and crosses between two players.
+
+     Each turn has a timer, a delayed send of turnMs: a move from the
+     player to move, for this turn, on an empty cell, ends the turn; the
+     timer firing first skips it. A player who lets maxTimeouts turns in a
+     row run out forfeits.
+
+     A move names the turn it is for. That makes a move idempotent: one
+     for a turn already played (a client's retry, or a move replayed after
+     a restore that the snapshot already held) is a duplicate and changes
+     nothing, and only one for the current turn can be played.
+
+     The spectator feed (the urn:game:spectators I/O processor) gets a
+     numbered frame at the start of every turn, and the result at the end.
+     `sync` publishes the current frame again, with the same number, for a
+     feed that may have missed it. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="match" initial="playing">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="match" expr="''"/>
+    <data id="players" expr="[]"/>
+    <data id="turnMs" expr="30000"/>
+    <data id="maxTimeouts" expr="2"/>
+    <!-- the match's own -->
+    <data id="board" expr="['', '', '', '', '', '', '', '', '']"/>
+    <data id="lines" expr="[[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]]"/>
+    <data id="turn" expr="1"/>
+    <data id="frame" expr="0"/>
+    <data id="timeouts" expr="[0, 0]"/>
+    <data id="lastMove" expr="null"/>
+    <data id="winner" expr="null"/>
+    <data id="outcome" expr="null"/>
+  </datamodel>
+
+  <state id="playing" initial="turn">
+    <transition event="publish">
+      <send type="urn:game:spectators" event="frame" targetexpr="match">
+        <param name="match" expr="match"/>
+        <param name="frame" expr="frame"/>
+        <param name="players" expr="players"/>
+        <param name="turn" expr="turn"/>
+        <param name="toMove" expr="players[(turn - 1) % 2]"/>
+        <param name="board" expr="board"/>
+        <param name="lastMove" expr="lastMove"/>
+        <param name="resync" expr="_event.data === 'sync'"/>
+      </send>
+    </transition>
+    <transition event="sync">
+      <!-- the same frame again, marked as a resync -->
+      <send event="publish"><content expr="'sync'"/></send>
+    </transition>
+
+    <state id="turn">
+      <onentry>
+        <assign location="frame" expr="frame + 1"/>
+        <send id="turnTimer" event="turn.timeout" delayexpr="turnMs + 'ms'"/>
+        <raise event="publish"/>
+      </onentry>
+      <onexit>
+        <cancel sendid="turnTimer"/>
+      </onexit>
+
+      <transition event="move" target="judging"
+                  cond="_event.data.turn === turn &amp;&amp; _event.data.player === players[(turn - 1) % 2] &amp;&amp; board[_event.data.cell] === ''">
+        <assign location="board[_event.data.cell]" expr="(turn - 1) % 2 === 0 ? 'X' : 'O'"/>
+        <assign location="timeouts[(turn - 1) % 2]" expr="0"/>
+        <assign location="lastMove" expr="({ player: _event.data.player, cell: _event.data.cell, turn: turn })"/>
+      </transition>
+      <transition event="move" cond="_event.data.turn &lt; turn">
+        <log label="duplicate" expr="match + ' turn ' + _event.data.turn + ' from ' + _event.data.player"/>
+      </transition>
+      <transition event="move">
+        <send type="urn:game:spectators" event="rejected" targetexpr="match">
+          <param name="match" expr="match"/>
+          <param name="player" expr="_event.data.player"/>
+          <param name="turn" expr="_event.data.turn"/>
+          <param name="cell" expr="_event.data.cell"/>
+          <param name="reason" expr="_event.data.turn !== turn ? 'not this turn' : _event.data.player !== players[(turn - 1) % 2] ? 'not your turn' : 'cell taken'"/>
+        </send>
+      </transition>
+
+      <transition event="turn.timeout" cond="timeouts[(turn - 1) % 2] + 1 &gt;= maxTimeouts" target="over">
+        <assign location="winner" expr="players[turn % 2]"/>
+        <assign location="outcome" expr="'forfeit'"/>
+      </transition>
+      <transition event="turn.timeout" target="judging">
+        <assign location="timeouts[(turn - 1) % 2]" expr="timeouts[(turn - 1) % 2] + 1"/>
+        <assign location="lastMove" expr="({ player: players[(turn - 1) % 2], cell: null, turn: turn })"/>
+      </transition>
+    </state>
+
+    <state id="judging">
+      <transition target="over" cond="lastMove.cell !== null &amp;&amp; lines.some(function (l) { return board[l[0]] !== '' &amp;&amp; board[l[0]] === board[l[1]] &amp;&amp; board[l[1]] === board[l[2]]; })">
+        <assign location="winner" expr="lastMove.player"/>
+        <assign location="outcome" expr="'win'"/>
+      </transition>
+      <transition target="over" cond="board.every(function (c) { return c !== ''; })">
+        <assign location="outcome" expr="'draw'"/>
+      </transition>
+      <transition target="turn">
+        <assign location="turn" expr="turn + 1"/>
+      </transition>
+    </state>
+  </state>
+
+  <final id="over">
+    <onentry>
+      <send type="urn:game:spectators" event="result" targetexpr="match">
+        <param name="match" expr="match"/>
+        <param name="players" expr="players"/>
+        <param name="winner" expr="winner"/>
+        <param name="outcome" expr="outcome"/>
+        <param name="turns" expr="turn"/>
+        <param name="board" expr="board"/>
+      </send>
+      <send event="match.over" target="tinyactors://game/@lobby">
+        <param name="match" expr="match"/>
+      </send>
+      <foreach array="players" item="p">
+        <send event="match.over" targetexpr="'tinyactors://game/@player-' + p">
+          <param name="match" expr="match"/>
+          <param name="winner" expr="winner"/>
+          <param name="outcome" expr="outcome"/>
+        </send>
+      </foreach>
+    </onentry>
+  </final>
+</scxml>

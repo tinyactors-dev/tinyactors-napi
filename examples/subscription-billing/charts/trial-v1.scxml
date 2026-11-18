@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Version 1 of a free trial: trialMs after it starts, the trial converts
+     into a paid subscription (the application spawns one when it hears
+     trial.converted), unless the customer cancels it first. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="trial" initial="trialing">
+  <datamodel>
+    <data id="customer" expr="null"/>
+    <data id="plan" expr="'basic'"/>
+    <data id="price" expr="900"/>
+    <data id="trialMs" expr="1209600000"/>
+  </datamodel>
+
+  <state id="trialing">
+    <onentry>
+      <send id="trialEnd" event="trial.end" delayexpr="trialMs + 'ms'"/>
+    </onentry>
+    <transition event="trial.end" target="converted"/>
+    <transition event="cancel" target="ended"/>
+  </state>
+
+  <final id="converted">
+    <onentry>
+      <send type="urn:billing:notify" event="trial.converted">
+        <param name="customer" expr="customer"/>
+        <param name="plan" expr="plan"/>
+        <param name="price" expr="price"/>
+      </send>
+    </onentry>
+  </final>
+
+  <final id="ended">
+    <onentry>
+      <cancel sendid="trialEnd"/>
+      <send type="urn:billing:notify" event="trial.cancelled">
+        <param name="customer" expr="customer"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

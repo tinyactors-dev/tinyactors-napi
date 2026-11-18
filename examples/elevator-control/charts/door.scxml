@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A car's door controller, invoked by the car (charts/car.scxml) each time
+  its doors must move, and cancelled when the car leaves the state that
+  invoked it. It drives the door's hardware through the I/O processor
+  urn:elevator:hw, one report per movement, and reaches its final state
+  when the door is shut, which the car gets as done.invoke.<id>.
+
+  Its mode is the car's reason for invoking it:
+  - cycle: open, dwell, close; an obstruction, a hold or a reopen while
+    closing opens again, and a held door stays open past its dwell (the
+    car is overloaded). A reopen (a call for this floor) is answered with
+    door.reopened while the controller runs; once it reached its final
+    state the car's send fails instead, so the car knows the door shut;
+  - close: close only (a fire recall, a release after one); an
+    obstruction still reopens it, as a door must;
+  - hold: open and stay open, until the car cancels the invocation (the
+    fire recall's lobby).
+-->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="door" initial="working">
+  <datamodel>
+    <data id="car" expr="''"/>
+    <data id="floor" expr="0"/>
+    <data id="mode" expr="'cycle'"/>
+    <!-- How long the door takes to open or to close, and to dwell open. -->
+    <data id="moveMs" expr="1000"/>
+    <data id="dwellMs" expr="3000"/>
+    <!-- The car is overloaded: the door does not close. -->
+    <data id="held" expr="false"/>
+  </datamodel>
+
+  <state id="working" initial="start">
+    <!-- The car sends its signals (hold, release, obstructed, reopen) only
+         once it knows the controller runs. -->
+    <onentry><send event="door.started" target="#_parent"/></onentry>
+    <transition event="hold"><assign location="held" expr="true"/></transition>
+    <transition event="release"><assign location="held" expr="false"/></transition>
+    <!-- A call for this floor while the door is open or opening: it is
+         served by this cycle, which the car is told. -->
+    <transition event="reopen"><send event="door.reopened" target="#_parent"/></transition>
+
+    <state id="start">
+      <transition cond="mode === 'close'" target="closing"/>
+      <transition target="opening"/>
+    </state>
+
+    <state id="opening">
+      <onentry>
+        <send type="urn:elevator:hw" event="door">
+          <param name="car" expr="car"/><param name="floor" expr="floor"/><param name="state" expr="'opening'"/>
+        </send>
+        <send event="door.moved" id="move" delayexpr="moveMs + 'ms'"/>
+      </onentry>
+      <onexit><cancel sendid="move"/></onexit>
+      <transition event="door.moved" target="open"/>
+    </state>
+
+    <state id="open">
+      <onentry>
+        <send type="urn:elevator:hw" event="door">
+          <param name="car" expr="car"/><param name="floor" expr="floor"/><param name="state" expr="'open'"/>
+        </send>
+        <if cond="mode !== 'hold'">
+          <send event="door.dwelt" id="dwell" delayexpr="dwellMs + 'ms'"/>
+        </if>
+      </onentry>
+      <onexit><cancel sendid="dwell"/></onexit>
+      <!-- A held door dwells again; the release lets the next dwell close it. -->
+      <transition event="door.dwelt" cond="held" target="open"/>
+      <transition event="door.dwelt" target="closing"/>
+    </state>
+
+    <state id="closing">
+      <onentry>
+        <send type="urn:elevator:hw" event="door">
+          <param name="car" expr="car"/><param name="floor" expr="floor"/><param name="state" expr="'closing'"/>
+        </send>
+        <send event="door.moved" id="move" delayexpr="moveMs + 'ms'"/>
+      </onentry>
+      <onexit><cancel sendid="move"/></onexit>
+      <transition event="obstructed" target="opening"/>
+      <transition event="reopen" target="opening"><send event="door.reopened" target="#_parent"/></transition>
+      <transition event="hold" target="opening"><assign location="held" expr="true"/></transition>
+      <transition event="door.moved" target="shut"/>
+    </state>
+  </state>
+
+  <final id="shut">
+    <onentry>
+      <send type="urn:elevator:hw" event="door">
+        <param name="car" expr="car"/><param name="floor" expr="floor"/><param name="state" expr="'closed'"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

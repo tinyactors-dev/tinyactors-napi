@@ -1,0 +1,32 @@
+id: web-allocation-in-the-allocator
+snapshots:
+  void ta_web_f(void *p) { free(p); }:
+    labels:
+    - source: free(p)
+      style: primary
+      start: 25
+      end: 32
+    - source: free
+      style: secondary
+      start: 25
+      end: 29
+  void ta_web_f(void) { malloc(8); }:
+    labels:
+    - source: malloc(8)
+      style: primary
+      start: 22
+      end: 31
+    - source: malloc
+      style: secondary
+      start: 22
+      end: 28
+  void ta_web_f(void) { ta_wasm_alloc(8, 8); }:
+    labels:
+    - source: ta_wasm_alloc(8, 8)
+      style: primary
+      start: 22
+      end: 41
+    - source: ta_wasm_alloc
+      style: secondary
+      start: 22
+      end: 35

@@ -1,0 +1,17 @@
+id: allocation-in-tables-and-host
+valid:
+  - "static void *ta_napi_allocator_alloc(void *context, size_t size, size_t align) { return malloc(size); }"
+  - "static void ta_napi_allocator_free(void *context, void *ptr, size_t size) { free(ptr); }"
+  - "static ta_napi_instance *ta_napi_instance_new(napi_env env) { ta_napi_instance *instance = (ta_napi_instance *)calloc(1, sizeof *instance); return instance; }"
+  - "static void ta_napi_instance_finalize(napi_env env, void *data, void *hint) { free(data); }"
+  - "static napi_value ta_napi_host_new(napi_env env, napi_callback_info info) { ta_napi_host *host = (ta_napi_host *)calloc(1, sizeof *host); return NULL; }"
+  - "static void ta_napi_host_finalize(node_api_basic_env env, void *data, void *hint) { free(data); }"
+  - "int ta_napi_room_reserve(ta_napi_room *room, size_t more) { char *pointer = (char *)room->allocator.alloc(room->allocator.context, more, 1); return pointer != NULL; }"
+  - "static void ta_napi_send(napi_env env, napi_value value) { char *text = ta_growable_arena_alloc(&instance->arena, 64, 1); }"
+invalid:
+  - "int ta_napi_buffer_reserve(ta_napi_buffer *buffer, size_t need) { char *pointer = (char *)realloc(buffer->pointer, need); return pointer != NULL; }"
+  - "void ta_napi_room_free(ta_napi_room *room) { free(room->pointer); }"
+  - "static void ta_napi_send(ta_napi_host *host) { char *name = malloc(64); free(name); }"
+  - "static ta_status ta_napi_create(void *data, const ta_datamodel_start *start, uint64_t *instance) { void *session = calloc(1, 32); return TA_OK; }"
+  - "static char *ta_napi_grow(char *text, size_t length) { return (char *)realloc(text, length); }"
+  - "napi_value ta_napi_encode(napi_env env, napi_callback_info info) { void *copy = malloc(16); return NULL; }"

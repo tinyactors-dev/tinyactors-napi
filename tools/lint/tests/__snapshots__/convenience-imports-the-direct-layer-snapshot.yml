@@ -1,0 +1,240 @@
+id: convenience-imports-the-direct-layer
+snapshots:
+  const addon = await import(path);:
+    labels:
+    - source: import(path)
+      style: primary
+      start: 20
+      end: 32
+    - source: import
+      style: secondary
+      start: 20
+      end: 26
+  const addon = require('../build/tinyactors.node');:
+    labels:
+    - source: require('../build/tinyactors.node')
+      style: primary
+      start: 14
+      end: 49
+    - source: require
+      style: secondary
+      start: 14
+      end: 21
+  const direct = await import('#direct');:
+    labels:
+    - source: import('#direct')
+      style: primary
+      start: 21
+      end: 38
+    - source: import
+      style: secondary
+      start: 21
+      end: 27
+  const direct = await import('./direct.mjs');:
+    labels:
+    - source: import('./direct.mjs')
+      style: primary
+      start: 21
+      end: 43
+    - source: import
+      style: secondary
+      start: 21
+      end: 27
+  const fs = process.getBuiltinModule('node:fs');:
+    labels:
+    - source: process.getBuiltinModule('node:fs')
+      style: primary
+      start: 11
+      end: 46
+  const os = process.getBuiltinModule('node:os');:
+    labels:
+    - source: process.getBuiltinModule('node:os')
+      style: primary
+      start: 11
+      end: 46
+    - source: process.getBuiltinModule
+      style: secondary
+      start: 11
+      end: 35
+  const require = createRequire(import.meta.url);:
+    labels:
+    - source: createRequire(import.meta.url)
+      style: primary
+      start: 16
+      end: 46
+  const vm = process.getBuiltinModule(name);:
+    labels:
+    - source: process.getBuiltinModule(name)
+      style: primary
+      start: 11
+      end: 41
+    - source: process.getBuiltinModule
+      style: secondary
+      start: 11
+      end: 35
+  export * from './other.mjs';:
+    labels:
+    - source: '''./other.mjs'''
+      style: primary
+      start: 14
+      end: 27
+    - source: export * from './other.mjs';
+      style: secondary
+      start: 0
+      end: 28
+  import addon from '../build/tinyactors.node';:
+    labels:
+    - source: '''../build/tinyactors.node'''
+      style: primary
+      start: 18
+      end: 44
+    - source: import addon from '../build/tinyactors.node';
+      style: secondary
+      start: 0
+      end: 45
+  import cbor from 'cbor-x';:
+    labels:
+    - source: '''cbor-x'''
+      style: primary
+      start: 17
+      end: 25
+    - source: import cbor from 'cbor-x';
+      style: secondary
+      start: 0
+      end: 26
+  import { Host } from '#direct?raw';:
+    labels:
+    - source: '''#direct?raw'''
+      style: primary
+      start: 21
+      end: 34
+    - source: import { Host } from '#direct?raw';
+      style: secondary
+      start: 0
+      end: 35
+  import { Host } from '../index.mjs';:
+    labels:
+    - source: '''../index.mjs'''
+      style: primary
+      start: 21
+      end: 35
+    - source: import { Host } from '../index.mjs';
+      style: secondary
+      start: 0
+      end: 36
+  import { Host } from './direct.mjs';:
+    labels:
+    - source: '''./direct.mjs'''
+      style: primary
+      start: 21
+      end: 35
+    - source: import { Host } from './direct.mjs';
+      style: secondary
+      start: 0
+      end: 36
+  import { Host } from './direct.mjs?raw';:
+    labels:
+    - source: '''./direct.mjs?raw'''
+      style: primary
+      start: 21
+      end: 39
+    - source: import { Host } from './direct.mjs?raw';
+      style: secondary
+      start: 0
+      end: 40
+  import { Host } from '@tinyactors/node';:
+    labels:
+    - source: '''@tinyactors/node'''
+      style: primary
+      start: 21
+      end: 39
+    - source: import { Host } from '@tinyactors/node';
+      style: secondary
+      start: 0
+      end: 40
+  import { join } from 'node:path/posix';:
+    labels:
+    - source: '''node:path/posix'''
+      style: primary
+      start: 21
+      end: 38
+    - source: import { join } from 'node:path/posix';
+      style: secondary
+      start: 0
+      end: 39
+  import { join } from 'path';:
+    labels:
+    - source: '''path'''
+      style: primary
+      start: 21
+      end: 27
+    - source: import { join } from 'path';
+      style: secondary
+      start: 0
+      end: 28
+  import { other } from './other.mjs';:
+    labels:
+    - source: '''./other.mjs'''
+      style: primary
+      start: 22
+      end: 35
+    - source: import { other } from './other.mjs';
+      style: secondary
+      start: 0
+      end: 36
+  import { readFile } from 'node:fs/promises';:
+    labels:
+    - source: '''node:fs/promises'''
+      style: primary
+      start: 25
+      end: 43
+    - source: import { readFile } from 'node:fs/promises';
+      style: secondary
+      start: 0
+      end: 44
+  import { readFileSync } from 'fs';:
+    labels:
+    - source: '''fs'''
+      style: primary
+      start: 29
+      end: 33
+    - source: import { readFileSync } from 'fs';
+      style: secondary
+      start: 0
+      end: 34
+  import { readFileSync } from 'node:fs';:
+    labels:
+    - source: '''node:fs'''
+      style: primary
+      start: 29
+      end: 38
+    - source: import { readFileSync } from 'node:fs';
+      style: secondary
+      start: 0
+      end: 39
+  import { spawn } from 'node:child_process';:
+    labels:
+    - source: '''node:child_process'''
+      style: primary
+      start: 22
+      end: 42
+    - source: import { spawn } from 'node:child_process';
+      style: secondary
+      start: 0
+      end: 43
+  import { tmpdir } from 'node:os';:
+    labels:
+    - source: '''node:os'''
+      style: primary
+      start: 23
+      end: 32
+    - source: import { tmpdir } from 'node:os';
+      style: secondary
+      start: 0
+      end: 33
+  process.dlopen(module, '../build/tinyactors.node');:
+    labels:
+    - source: process.dlopen(module, '../build/tinyactors.node')
+      style: primary
+      start: 0
+      end: 50

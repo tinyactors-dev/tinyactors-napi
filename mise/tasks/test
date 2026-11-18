@@ -1,0 +1,104 @@
+#!/usr/bin/env ruby
+#MISE description="Test tinyactors-napi: lint (rules, the addon's C, the adapter, the mapping table, the build scripts, acronyms), the build, the runtimes, the WebAssembly module (node, bun, Chromium), the parity of @tinyactors/node and @tinyactors/wasm (tools/parity.mjs), and the conformance set named by MILESTONE against the adapter under node and bun on both datamodels, the example applications, the remote-python example against the Python binding, and the gates"
+#MISE sources=["src/**/*", "conform.mjs", "index.mjs", "lib/**/*", "index.d.ts", "README.md", "docs/guide/**/*", "test/**/*", "tools/**/*", "docs/api-map.md", "docs/log.xml", "docs/log.rng", "docs/surprises.md", "examples/**/*", "wasm/src/**/*", "wasm/lib/**/*", "wasm/test/**/*", "wasm/tools/**/*", "wasm/*.mjs", "sgconfig.yml", "package.json", "mise/**/*", "mise.toml", "../tinyactors-core/include/**/*", "../tinyactors-core/src/**/*", "../tinyactors-core/third_party/**/*", "../tinyactors-core/mise/**/*", "../tinyactors-core/tools/lint/utils/**/*", "../tinyactors-core/docs/requests.md", "../tinyxml/include/**/*", "../tinyactors-cpython/src/**/*", "../tinyactors-cpython/mise/**/*", "../tinyactors-cpython/mise.toml", "../tinyactors-cpython/pyproject.toml", "../tinyactors-test/suites/**/*", "../tinyactors-test/lib/**/*", "../tinyactors-test/lint/**/*", "../tinyactors-test/mise/**/*", "../tinyactors-test/mise.toml", "../mise/lib/**/*", "../mise/ast-grep/**/*", "../sgconfig.yml", "../acronyms.txt", "../acronyms-allow.txt", "../mise.toml", "../LICENSE"]
+#MISE outputs={auto=true}
+#USAGE flag "--full" help="the hibernation, migration and snapshot gates at 2,000,000 actors, 1000 resident, snapshots of 100,000 resident actors, the services gate at 200,000 actors and 1,000,000 round trips, and the scaling gate at 2,000,000 and 4,000,000 actors, 1,000,000 and 2,000,000 all resident (tools/stress.mjs, tools/migration.mjs, tools/snapshot.mjs, tools/services.mjs, tools/scale.mjs)"
+# vim:ft=ruby
+
+# The sources are this project's files and those it builds and tests
+# against: core's (its amalgamation, the lint utilities, requests.md for
+# the mapping table) and the suite's, so a change to either reruns this
+# task from the root's `mise run test` (AGENTS.md, "Tests: what to run").
+#
+# It lints, builds the addon, and runs the binding's own tests (test/,
+# what the suite cannot see) under each runtime on each datamodel (the
+# charts' datamodel is TA_NAPI_DATAMODEL, test/charts.mjs), each file a
+# program of its own (test/harness.mjs). The conformance suite needs the adapter
+# (conform.mjs): without it, this task says so and skips it; with it, the
+# part of the set named by NodeAPI::MILESTONE that NodeAPI::GATE holds now
+# must pass (`mise run conform -- --milestone <it> --suite <each>`, on the
+# gate's datamodels). `mise run conform` on its own runs the whole suite on
+# both datamodels, and fails without the adapter.
+#
+# Then the example applications (examples/*/test.mjs, `mise run examples`)
+# under node and bun, and the example of two systems in two processes
+# (examples/remote-python/,
+# `mise run remote-python --test`): a Python host of tinyactors-cpython,
+# built by that project's own build task (about a minute cold, under a
+# second when up to date), and a Node host over a socket, under node and
+# bun on both datamodels. The Python binding's sources are among this
+# task's sources for it.
+#
+# Then the hibernation stress gate (tools/stress.mjs, `mise run stress`),
+# the migration gate (tools/migration.mjs, `mise run migration`) and the
+# snapshot gate (tools/snapshot.mjs, `mise run snapshot`): 20,000 actors
+# with 100 resident in the fast pass, 2,000,000 with 1000 resident under
+# --full (root AGENTS.md, "Where a new test goes"), on both datamodels under
+# both runtimes; the snapshot gate again with every actor resident (5,000,
+# --full 100,000), so that the datamodel's own state is most of the
+# snapshot; then the services gate (tools/services.mjs, `mise run
+# services`): 10,000 actors and 50,000 round trips, --full 200,000 and
+# 1,000,000; with --full, the scaling gate (tools/scale.mjs, `mise run
+# scale`) at 2,000,000 and 4,000,000 actors, whose fast pass,
+# test/scale.test.mjs, runs with the other tests (20,000 and 40,000).
+
+require_relative '../napi'
+
+NodeAPI.run('mise', 'run', 'lint')
+NodeAPI.run('mise', 'run', 'build')
+# the WebAssembly module of @tinyactors/wasm and its loaders (mise/wasm.rb):
+# built, its imports and exports checked, its tests in node, bun and Chromium
+NodeAPI.run('mise', 'run', 'wasm:test')
+# the parity check: both packages' exports, the objects they hand out and
+# their refusals compared property by property under node and bun, and
+# each against index.d.ts (tools/parity.mjs; the accepted differences in
+# wasm/test/differences.mjs, each with its reason)
+NodeAPI.run(NodeAPI.pinned('node'), 'tools/parity.mjs', NodeAPI.pinned('tsc'),
+            *NodeAPI::RUNTIMES.map { |runtime| "#{runtime}=#{NodeAPI.pinned(runtime)}" })
+
+NodeAPI::RUNTIMES.each do |runtime|
+  program = NodeAPI.pinned(runtime)
+  version = IO.popen([program, '--version'], &:read).strip
+  puts "test: #{runtime} #{version}: #{program}"
+  NodeAPI::DATAMODELS.each do |datamodel|
+    NodeAPI.tests.each do |file|
+      puts "test: #{runtime} #{datamodel} #{file.relative_path_from(NodeAPI::ROOT)}"
+      NodeAPI.run(program, file.to_s, env: { 'TA_NAPI_DATAMODEL' => datamodel })
+    end
+  end
+end
+
+gate = NodeAPI::GATE
+if !NodeAPI::ADAPTER.exist?
+  puts 'test: conform skipped: no adapter yet (conform.mjs)'
+elsif gate[:suites].empty? || gate[:datamodels].empty?
+  puts 'test: conform skipped: the gate holds no suite yet (GATE, mise/napi.rb)'
+else
+  NodeAPI.run('mise', 'run', 'conform', '--', '--milestone', NodeAPI::MILESTONE,
+              *gate[:suites].flat_map { |suite| ['--suite', suite] },
+              env: { 'TA_NAPI_DATAMODELS' => gate[:datamodels].join(',') })
+end
+
+NodeAPI.examples
+NodeAPI.remote_python(test: true)
+
+full = ENV['usage_full'] == 'true' || ARGV.include?('--full')
+%w[stress migration snapshot].each do |tool|
+  if full
+    NodeAPI.stress(actors: 2_000_000, resident: 1000, events: 200_000, tool: tool)
+  else
+    NodeAPI.stress(actors: 20_000, resident: 100, events: 20_000, tool: tool)
+  end
+end
+if full
+  NodeAPI.stress(actors: 100_000, resident: 100_000, events: 100_000, tool: 'snapshot')
+else
+  NodeAPI.stress(actors: 5000, resident: 5000, events: 5000, tool: 'snapshot')
+end
+if full
+  NodeAPI.services(actors: 200_000, events: 1_000_000)
+else
+  NodeAPI.services(actors: 10_000, events: 50_000)
+end
+# the scaling gate: its fast pass is test/scale.test.mjs, above
+NodeAPI.scale(actors: 2_000_000, resident: 1_000_000) if full

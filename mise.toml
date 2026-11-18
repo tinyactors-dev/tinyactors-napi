@@ -1,0 +1,24 @@
+# tinyactors-napi's toolchain (AGENTS.md, "Tasks"): only this project
+# downloads it. Tasks are Ruby file tasks in mise/tasks/.
+#
+# The C compiler, LLVM's binutils, ast-grep and zig are the root mise.toml's
+# (mise/lib/toolchain/): the addon compiles with Toolchain::Target, and a
+# release with the root's zig (docs/adr/0001, decisions 5 and 10). A second
+# pin of zig here could drift from the one every other release uses.
+
+[tools]
+# The oldest Node.js the package claims: the addon is built and tested on
+# it. The root pins node 22 too, for its own tools; this pin is the
+# package's, and moves with the package.
+node = "22"
+# Bun runs the same addon through its Node-API (AGENTS.md: the timer is
+# setTimeout because Bun has no uv_timer_*). 1.4.1 is the version the
+# spikes of 2026-10-12 ran on (AGENTS.md, "An actor reference is a
+# string"; the adapter importing the package by its name).
+bun = "1.4.1"
+# Installs the package's development dependencies (none yet).
+pnpm = "12.12.1"
+# tsc, for `mise run lint`: index.d.ts checked against the documentation's
+# examples and test/types (tools/typecheck.mjs). A tool of the checks, not
+# a dependency of the package.
+"npm:typescript" = "5.9.3"

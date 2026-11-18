@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A well-behaved customer chart: the door sensor reads 1 when open. An
+     open door is an alert only when it stays open for 3 readings in a row;
+     a closed door clears it. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="door-left-open" initial="closed">
+  <datamodel>
+    <data id="device" expr="null"/>
+    <data id="open" expr="0"/>
+  </datamodel>
+  <state id="closed">
+    <transition event="reading" cond="_event.data.metric === 'door' &amp;&amp; _event.data.value === 1">
+      <assign location="open" expr="open + 1"/>
+    </transition>
+    <transition event="reading" cond="_event.data.metric === 'door'">
+      <assign location="open" expr="0"/>
+    </transition>
+    <transition cond="open &gt;= 3" target="left-open"/>
+  </state>
+  <state id="left-open">
+    <onentry>
+      <send type="urn:iot:alert" event="alert.raised">
+        <param name="message" expr="'door ' + device + ' left open'"/>
+      </send>
+    </onentry>
+    <transition event="reading" cond="_event.data.metric === 'door' &amp;&amp; _event.data.value === 0" target="closed">
+      <assign location="open" expr="0"/>
+      <send type="urn:iot:alert" event="alert.cleared"/>
+    </transition>
+  </state>
+</scxml>

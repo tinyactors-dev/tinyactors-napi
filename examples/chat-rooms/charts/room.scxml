@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One chat room: who is in it, and what was said.
+
+     The room is the authority on its membership: a user joins and leaves
+     by asking the room, and only a member may post. Each message gets the
+     room's next sequence number, goes into the history (the last
+     historyLimit entries) and is sent to every member's actor, which
+     pushes it to the user's connection or keeps it for later.
+
+     Every variable is a plain value (strings, numbers, arrays, objects),
+     and the chart has no script, so a room hibernates whenever it is at
+     rest: its members and history go into its blob, and come back with
+     it. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="room" initial="open">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="room" expr="null"/>
+    <data id="capacity" expr="100"/>
+    <data id="historyLimit" expr="50"/>
+    <data id="maxLength" expr="500"/>
+    <!-- the room's own -->
+    <data id="members" expr="[]"/>
+    <data id="history" expr="[]"/>
+    <data id="seq" expr="0"/>
+  </datamodel>
+
+  <state id="open">
+    <!-- joining: idempotent, so a retried join is answered again -->
+    <transition event="join" cond="members.includes(_event.data.user)">
+      <send event="joined" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+        <param name="members" expr="members"/>
+        <param name="history" expr="history.slice(-20)"/>
+      </send>
+    </transition>
+    <transition event="join" cond="members.length &gt;= capacity">
+      <send event="refused.join" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+        <param name="reason" expr="'the room is full'"/>
+      </send>
+    </transition>
+    <transition event="join">
+      <assign location="members" expr="members.concat([_event.data.user])"/>
+      <assign location="seq" expr="seq + 1"/>
+      <assign location="history" expr="history.concat([{ seq: seq, kind: 'joined', user: _event.data.user }]).slice(-historyLimit)"/>
+      <send event="joined" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+        <param name="members" expr="members"/>
+        <param name="history" expr="history.slice(-20)"/>
+      </send>
+    </transition>
+
+    <transition event="leave" cond="members.includes(_event.data.user)">
+      <assign location="members" expr="members.filter((m) => m !== _event.data.user)"/>
+      <assign location="seq" expr="seq + 1"/>
+      <assign location="history" expr="history.concat([{ seq: seq, kind: 'left', user: _event.data.user }]).slice(-historyLimit)"/>
+      <send event="left" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+      </send>
+    </transition>
+    <transition event="leave">
+      <send event="left" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+      </send>
+    </transition>
+
+    <!-- posting: members only, within the length limit -->
+    <transition event="post" cond="!members.includes(_event.data.user)">
+      <send event="refused.post" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+        <param name="reason" expr="'not a member of ' + room"/>
+      </send>
+    </transition>
+    <transition event="post" cond="typeof _event.data.text !== 'string' || _event.data.text.length === 0 || _event.data.text.length &gt; maxLength">
+      <send event="refused.post" targetexpr="_event.origin">
+        <param name="room" expr="room"/>
+        <param name="reason" expr="'a message is 1 to ' + maxLength + ' characters'"/>
+      </send>
+    </transition>
+    <transition event="post">
+      <assign location="seq" expr="seq + 1"/>
+      <assign location="history" expr="history.concat([{ seq: seq, kind: 'message', user: _event.data.user, text: _event.data.text }]).slice(-historyLimit)"/>
+      <foreach array="members" item="member">
+        <send event="message" targetexpr="'tinyactors://chat/@user-' + member">
+          <param name="room" expr="room"/>
+          <param name="seq" expr="seq"/>
+          <param name="user" expr="_event.data.user"/>
+          <param name="text" expr="_event.data.text"/>
+        </send>
+      </foreach>
+    </transition>
+
+    <!-- the application reads the room -->
+    <transition event="history">
+      <send type="urn:chat:reply" event="history" target="app">
+        <param name="request" expr="_event.data.request"/>
+        <param name="room" expr="room"/>
+        <param name="seq" expr="seq"/>
+        <param name="members" expr="members"/>
+        <param name="history" expr="history"/>
+      </send>
+    </transition>
+  </state>
+</scxml>

@@ -1,0 +1,63 @@
+# The GitHub release of a version of @tinyactors/node and @tinyactors/wasm.
+#
+# This file lives in the monorepo's tinyactors-napi/ and reaches the release
+# repository, tinyactors-dev/tinyactors-napi, with each release's snapshot of
+# that directory; GitHub runs it there (a workflow below a repository's root
+# does nothing in the monorepo). A cloud session's git proxy pushes branches
+# but not tags, so the release pushes the snapshot to main and this makes
+# the rest, with the workflow's own token: the tag v<version> on the
+# snapshot and its GitHub release. It writes nothing of its own. The notes
+# are RELEASE_NOTES.md, which the release committed; the files are the
+# packages npm serves for the version, the same bytes the release built
+# (its builds are reproducible), with their SHA256SUMS.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Release the snapshot's version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag has its release already"
+            exit 0
+          fi
+          title=$(head -n 1 RELEASE_NOTES.md | sed 's/^# //')
+          case "$title" in
+            *" $version") ;;
+            *) echo "::error::RELEASE_NOTES.md is not $version's (its title: $title)"; exit 1 ;;
+          esac
+          packages=$(node -p "const p = require('./package.json'); [p.name, ...Object.keys(p.optionalDependencies || {}), '@tinyactors/wasm'].join(' ')")
+          mkdir -p dist
+          # A staged publish is public once the maintainer approves it, so
+          # wait for npm to serve every package, up to two hours.
+          for attempt in $(seq 1 60); do
+            missing=""
+            for package in $packages; do
+              npm view "$package@$version" version >/dev/null 2>&1 || missing="$missing $package"
+            done
+            [ -z "$missing" ] && break
+            echo "npm does not serve$missing at $version yet; waiting"
+            sleep 120
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::npm does not serve$missing at $version"
+            exit 1
+          fi
+          (cd dist && for package in $packages; do npm pack "$package@$version" --silent; done && sha256sum *.tgz > SHA256SUMS)
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file RELEASE_NOTES.md dist/*

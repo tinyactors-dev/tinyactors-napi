@@ -1,0 +1,59 @@
+#!/usr/bin/env ruby
+#MISE description="Where the work stands after a container restart: the checkout against main, uncommitted files by project, the plan's unfinished steps and the log's open entries"
+# vim:ft=ruby
+
+# A cloud container can be rebuilt at any time, and the agents running in it
+# stop. What survives is git, docs/plan.xml and docs/log.xml; this task reads
+# them back so the coordinator can resume. It changes nothing.
+
+require "rexml/document"
+
+napi = File.expand_path("../..", __dir__)
+root = File.expand_path("..", napi)
+
+def run(dir, *cmd)
+  IO.popen(cmd, chdir: dir, err: File::NULL, &:read).to_s
+end
+
+def elements(path, name)
+  doc = REXML::Document.new(File.read(path))
+  found = []
+  doc.root.each_recursive { |e| found << e if e.name == name }
+  found
+end
+
+branch = run(root, "git", "branch", "--show-current").strip
+run(root, "git", "fetch", "--quiet", "origin", "main")
+behind, ahead = run(root, "git", "rev-list", "--left-right", "--count", "origin/main...HEAD").split.map(&:to_i)
+puts "checkout: #{branch.empty? ? '(detached)' : branch}, #{ahead} ahead and #{behind} behind origin/main"
+puts "  the work happens on main (AGENTS.md, \"Version control\")" unless branch == "main"
+
+changed = run(root, "git", "status", "--porcelain").lines.map { |l| l[3..].strip }
+if changed.empty?
+  puts "uncommitted: none"
+else
+  puts "uncommitted (an agent stopped mid-step left these; read before keeping or discarding):"
+  changed.group_by { |p| p.split("/").first }.each do |project, paths|
+    puts "  #{project}: #{paths.size} — #{paths.first(5).join(', ')}#{paths.size > 5 ? ', ...' : ''}"
+  end
+end
+
+steps = elements(File.join(napi, "docs/plan.xml"), "step")
+unfinished = steps.reject { |s| s.attributes["status"] == "done" }
+puts "plan: #{steps.size - unfinished.size} of #{steps.size} steps done"
+unfinished.each do |s|
+  title = s.elements["title"]&.text.to_s.strip
+  puts "  #{s.attributes['status']}: #{s.attributes['id']} — #{title}"
+end
+
+entries = elements(File.join(napi, "docs/log.xml"), "entry")
+by_status = entries.group_by { |e| e.attributes["status"] }
+puts "log: " + by_status.map { |status, list| "#{list.size} #{status}" }.join(", ")
+(by_status["open"] || []).each { |e| puts "  open: #{e.attributes['id']}" }
+puts "  for the maintainer: docs/maintainer.md" if by_status["for-maintainer"]
+
+puts <<~NEXT
+  to resume: a step marked doing was cut off; its agent's pushed commits are
+  on main, and its uncommitted files above are its unfinished work. Dispatch
+  the step again with docs/step-brief.md and tell the agent what it finds.
+NEXT

@@ -1,0 +1,26 @@
+# Every function the wasm module's C layer (wasm/src/) defines or declares
+# is named ta_web_* (docs/browser.md, "What is C and what is JavaScript"),
+# static helpers and the imports' declarations included: the module's
+# exports are those names (mise/wasm.rb reads them), and nothing of a
+# platform's is defined there (the reactor's _initialize is wasi-libc's).
+id: web-functions-carry-the-prefix
+language: c
+severity: error
+message: "a function the wasm layer defines or declares is named ta_web_*"
+files:
+  - wasm/src/**/*.c
+  - wasm/src/**/*.h
+rule:
+  kind: identifier
+  not:
+    regex: '^ta_web_\w+$'
+  inside:
+    kind: function_declarator
+    field: declarator
+    all:
+      - not: {inside: {kind: parameter_list, stopBy: end}}
+      - inside:
+          stopBy: end
+          any:
+            - kind: function_definition
+            - kind: declaration

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A player: one named actor, `player-<name>`, with a rating and a
+     record. `queue` asks for a game; it carries a ticket, the client's
+     count of the games it asked for, so a request sent twice (a retry
+     after a crash) is one request. A `queue` while a game is on asks for
+     the next one, which starts when this one ends. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="player" initial="idle">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="name" expr="''"/>
+    <data id="rating" expr="1000"/>
+    <!-- the player's own -->
+    <data id="ticket" expr="0"/>
+    <data id="requeue" expr="false"/>
+    <data id="match" expr="null"/>
+    <data id="games" expr="0"/>
+    <data id="wins" expr="0"/>
+    <data id="losses" expr="0"/>
+    <data id="draws" expr="0"/>
+  </datamodel>
+
+  <state id="idle">
+    <transition cond="requeue" target="queued">
+      <assign location="requeue" expr="false"/>
+    </transition>
+    <transition event="queue" cond="_event.data.ticket &gt; ticket" target="queued">
+      <assign location="ticket" expr="_event.data.ticket"/>
+    </transition>
+  </state>
+
+  <state id="queued">
+    <onentry>
+      <send event="join" target="tinyactors://game/@lobby">
+        <param name="player" expr="name"/>
+        <param name="rating" expr="rating"/>
+      </send>
+    </onentry>
+    <transition event="leave" target="idle">
+      <send event="leave" target="tinyactors://game/@lobby">
+        <param name="player" expr="name"/>
+      </send>
+    </transition>
+    <transition event="matched" target="playing">
+      <assign location="match" expr="_event.data.match"/>
+    </transition>
+  </state>
+
+  <state id="playing">
+    <transition event="queue" cond="_event.data.ticket &gt; ticket">
+      <assign location="ticket" expr="_event.data.ticket"/>
+      <assign location="requeue" expr="true"/>
+    </transition>
+    <transition event="match.over" cond="_event.data.match === match" target="idle">
+      <assign location="games" expr="games + 1"/>
+      <if cond="_event.data.winner === name">
+        <assign location="wins" expr="wins + 1"/>
+        <assign location="rating" expr="rating + 16"/>
+      <elseif cond="_event.data.winner === null"/>
+        <assign location="draws" expr="draws + 1"/>
+      <else/>
+        <assign location="losses" expr="losses + 1"/>
+        <assign location="rating" expr="rating - 16"/>
+      </if>
+      <assign location="match" expr="null"/>
+    </transition>
+  </state>
+</scxml>

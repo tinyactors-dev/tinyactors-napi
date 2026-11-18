@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A document on its way to approval. The author submits it; legal and
+  finance review it at the same time, each region of the parallel `review`
+  moving from queued to reviewing to approved on its own. A reviewer may
+  request changes: the author revises, and a resubmission returns each
+  reviewer to where they were (one shallow history per region), unless the
+  change is material, which restarts the review. When both regions reach
+  their final state, the review is done and the document goes to sign-off.
+
+  Every stage has an SLA: a delayed send armed when the stage is entered
+  and cancelled when it is left. A breach pauses the document (escalated)
+  until a manager resumes it, and the deep history of `active` puts it
+  back exactly where it was, both regions included.
+
+  The application sees the document through two I/O processors: notify
+  (to people) and archive, which gets the approved document's metadata as
+  an XML record.
+-->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="document" initial="draft">
+  <datamodel>
+    <data id="docID" expr="''"/>
+    <data id="title" expr="''"/>
+    <data id="author" expr="''"/>
+    <data id="amount" expr="0"/>
+    <!-- At or above this amount, finance may approve only after legal. -->
+    <data id="legalFirstAt" expr="10000"/>
+    <data id="version" expr="0"/>
+    <!-- The SLA of each stage, in milliseconds. -->
+    <data id="slaMs" expr="({ legal: 172800000, finance: 172800000, signoff: 86400000 })"/>
+    <data id="legalReviewer" expr="null"/>
+    <data id="financeReviewer" expr="null"/>
+    <data id="legalNote" expr="''"/>
+    <data id="financeNote" expr="''"/>
+    <!-- Filled from the regions' <donedata>, one entry per stage. -->
+    <data id="approvals" expr="({})"/>
+    <data id="changeRequests" expr="[]"/>
+    <data id="escalations" expr="[]"/>
+    <data id="pausedStage" expr="null"/>
+    <data id="archiveAttempts" expr="0"/>
+    <data id="receipt" expr="null"/>
+    <data id="outcome" expr="null"/>
+  </datamodel>
+
+  <!-- Helpers declared at the chart level. A script that declares
+       top-level functions gives each actor a context of its own, so the
+       functions see this actor's variables. -->
+  <script><![CDATA[
+    function ms(n) { return Math.max(0, Math.round(n)) + 'ms'; }
+    function legalFirst() { return amount >= legalFirstAt; }
+    function escapeXML(text) {
+      return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function approvalXML(stage) {
+      var a = approvals[stage];
+      return '  <approval stage="' + stage + '" by="' + escapeXML(a.by) + '">' + escapeXML(a.note) + '</approval>\n';
+    }
+    function metadataXML() {
+      var xml = '<document id="' + escapeXML(docID) + '" version="' + version + '">\n'
+        + '  <title>' + escapeXML(title) + '</title>\n'
+        + '  <author>' + escapeXML(author) + '</author>\n'
+        + '  <amount currency="EUR">' + amount + '</amount>\n';
+      for (var stage of ['legal', 'finance', 'signoff']) if (approvals[stage]) xml += approvalXML(stage);
+      for (var c of changeRequests) {
+        xml += '  <changes stage="' + c.stage + '" by="' + escapeXML(c.by) + '" version="' + c.version + '">' + escapeXML(c.note) + '</changes>\n';
+      }
+      for (var e of escalations) xml += '  <escalation stage="' + e.stage + '" version="' + e.version + '"/>\n';
+      return xml + '</document>\n';
+    }
+  ]]></script>
+
+  <state id="draft">
+    <transition event="submit" target="inFlight">
+      <assign location="version" expr="1"/>
+    </transition>
+    <transition event="withdraw" target="withdrawn"/>
+  </state>
+
+  <state id="inFlight" initial="active">
+    <transition event="withdraw" target="withdrawn"/>
+
+    <state id="active" initial="review">
+      <!-- Where an escalation pause returns to: every active state below
+           `active`, both review regions included. -->
+      <history id="resumePoint" type="deep">
+        <transition target="review"/>
+      </history>
+
+      <transition event="sla.expired" target="escalated">
+        <assign location="pausedStage" expr="_event.data.stage"/>
+        <script>escalations.push({ stage: _event.data.stage, version: version });</script>
+      </transition>
+
+      <parallel id="review">
+        <onentry>
+          <send type="urn:approval:notify" event="review.started">
+            <param name="docID" expr="docID"/>
+            <param name="version" expr="version"/>
+          </send>
+        </onentry>
+
+        <!-- A region's final state ends it with <donedata>; done.state.legal
+             and done.state.finance carry it here. -->
+        <transition event="done.state.legal done.state.finance">
+          <!-- A region entered again through a history state ends again: keep
+               the approval as it was first given. -->
+          <script>approvals[_event.data.stage] ??= { by: _event.data.by, note: _event.data.note, version: version };</script>
+        </transition>
+        <!-- Both regions are final: the review is done. -->
+        <transition event="done.state.review" target="signoff"/>
+
+        <state id="legal" initial="legalQueued">
+          <history id="legalWasAt" type="shallow">
+            <transition target="legalQueued"/>
+          </history>
+          <onentry>
+            <send event="sla.expired" id="legalSLA" delayexpr="ms(slaMs.legal)">
+              <param name="stage" expr="'legal'"/>
+            </send>
+          </onentry>
+          <onexit><cancel sendid="legalSLA"/></onexit>
+
+          <state id="legalQueued">
+            <transition event="legal.claim" target="legalReviewing">
+              <assign location="legalReviewer" expr="_event.data.reviewer"/>
+            </transition>
+          </state>
+          <state id="legalReviewing">
+            <transition event="legal.approve" target="legalApproved">
+              <assign location="legalNote" expr="_event.data.note ?? ''"/>
+            </transition>
+            <transition event="legal.changes" target="revising">
+              <script>changeRequests.push({ stage: 'legal', by: legalReviewer, note: _event.data.note, version: version });</script>
+            </transition>
+            <transition event="legal.reject" target="rejected">
+              <assign location="outcome" expr="({ by: legalReviewer, stage: 'legal', note: _event.data.note })"/>
+            </transition>
+          </state>
+          <final id="legalApproved">
+            <onentry><cancel sendid="legalSLA"/></onentry>
+            <donedata>
+              <param name="stage" expr="'legal'"/>
+              <param name="by" expr="legalReviewer"/>
+              <param name="note" expr="legalNote"/>
+            </donedata>
+          </final>
+        </state>
+
+        <state id="finance" initial="financeQueued">
+          <history id="financeWasAt" type="shallow">
+            <transition target="financeQueued"/>
+          </history>
+          <onentry>
+            <send event="sla.expired" id="financeSLA" delayexpr="ms(slaMs.finance)">
+              <param name="stage" expr="'finance'"/>
+            </send>
+          </onentry>
+          <onexit><cancel sendid="financeSLA"/></onexit>
+
+          <state id="financeQueued">
+            <transition event="finance.claim" target="financeReviewing">
+              <assign location="financeReviewer" expr="_event.data.reviewer"/>
+            </transition>
+          </state>
+          <state id="financeReviewing">
+            <!-- A large amount needs legal's approval first. -->
+            <transition event="finance.approve" cond="!legalFirst() || In('legalApproved')" target="financeApproved">
+              <assign location="financeNote" expr="_event.data.note ?? ''"/>
+            </transition>
+            <transition event="finance.approve">
+              <send type="urn:approval:notify" event="verdict.refused">
+                <param name="docID" expr="docID"/>
+                <param name="to" expr="financeReviewer"/>
+                <param name="reason" expr="'legal approves first at ' + legalFirstAt + ' or more'"/>
+              </send>
+            </transition>
+            <transition event="finance.changes" target="revising">
+              <script>changeRequests.push({ stage: 'finance', by: financeReviewer, note: _event.data.note, version: version });</script>
+            </transition>
+            <transition event="finance.reject" target="rejected">
+              <assign location="outcome" expr="({ by: financeReviewer, stage: 'finance', note: _event.data.note })"/>
+            </transition>
+          </state>
+          <final id="financeApproved">
+            <onentry><cancel sendid="financeSLA"/></onentry>
+            <donedata>
+              <param name="stage" expr="'finance'"/>
+              <param name="by" expr="financeReviewer"/>
+              <param name="note" expr="financeNote"/>
+            </donedata>
+          </final>
+        </state>
+      </parallel>
+
+      <state id="revising">
+        <onentry>
+          <send type="urn:approval:notify" event="changes.requested">
+            <param name="docID" expr="docID"/>
+            <param name="to" expr="author"/>
+            <param name="request" expr="changeRequests[changeRequests.length - 1]"/>
+          </send>
+        </onentry>
+        <!-- A material change is reviewed again from the start. -->
+        <transition event="resubmit" cond="_event.data &amp;&amp; _event.data.material" target="review">
+          <assign location="version" expr="version + 1"/>
+          <assign location="approvals" expr="({})"/>
+          <assign location="legalReviewer" expr="null"/>
+          <assign location="financeReviewer" expr="null"/>
+        </transition>
+        <!-- Otherwise each reviewer is back where they were. -->
+        <transition event="resubmit" target="legalWasAt financeWasAt">
+          <assign location="version" expr="version + 1"/>
+        </transition>
+      </state>
+
+      <state id="signoff">
+        <onentry>
+          <send event="sla.expired" id="signoffSLA" delayexpr="ms(slaMs.signoff)">
+            <param name="stage" expr="'signoff'"/>
+          </send>
+          <send type="urn:approval:notify" event="signoff.requested">
+            <param name="docID" expr="docID"/>
+            <param name="version" expr="version"/>
+          </send>
+        </onentry>
+        <onexit><cancel sendid="signoffSLA"/></onexit>
+        <transition event="signoff.approve" cond="approvals.legal &amp;&amp; approvals.finance" target="archiving">
+          <script>approvals.signoff = { by: _event.data.by, note: _event.data.note ?? '', version: version };</script>
+        </transition>
+        <transition event="signoff.reject" target="rejected">
+          <assign location="outcome" expr="({ by: _event.data.by, stage: 'signoff', note: _event.data.note })"/>
+        </transition>
+      </state>
+    </state>
+
+    <!-- An SLA was breached: the document waits for a manager. Verdicts
+         that come in meanwhile are refused, and their senders told. -->
+    <state id="escalated">
+      <onentry>
+        <send type="urn:approval:notify" event="sla.breached">
+          <param name="docID" expr="docID"/>
+          <param name="stage" expr="pausedStage"/>
+          <param name="reviewer" expr="pausedStage === 'legal' ? legalReviewer : pausedStage === 'finance' ? financeReviewer : null"/>
+        </send>
+      </onentry>
+      <transition event="resume" target="resumePoint">
+        <if cond="_event.data &amp;&amp; _event.data.reviewer &amp;&amp; pausedStage === 'legal'">
+          <assign location="legalReviewer" expr="_event.data.reviewer"/>
+        <elseif cond="_event.data &amp;&amp; _event.data.reviewer &amp;&amp; pausedStage === 'finance'"/>
+          <assign location="financeReviewer" expr="_event.data.reviewer"/>
+        </if>
+        <assign location="pausedStage" expr="null"/>
+      </transition>
+      <transition event="legal finance signoff resubmit">
+        <send type="urn:approval:notify" event="verdict.refused">
+          <param name="docID" expr="docID"/>
+          <param name="refused" expr="_event.name"/>
+          <param name="reason" expr="'paused: the ' + pausedStage + ' SLA was breached'"/>
+        </send>
+      </transition>
+    </state>
+
+    <!-- Approved: the archive takes the record, as XML, before the
+         document ends. A failed archive is retried every second.
+         The record is XML text that metadataXML() writes, not an inline
+         XML <content>: inline XML would reach the I/O processor as its
+         text on both datamodels, but it is fixed in the chart, and the
+         record holds the document's variables. -->
+    <state id="archiving">
+      <onentry>
+        <assign location="archiveAttempts" expr="archiveAttempts + 1"/>
+        <send type="urn:approval:archive" event="archive.store">
+          <content expr="metadataXML()"/>
+        </send>
+      </onentry>
+      <transition event="archived" target="approved">
+        <assign location="receipt" expr="_event.data.receipt"/>
+      </transition>
+      <transition event="error.communication" target="archiveRetry"/>
+    </state>
+    <state id="archiveRetry">
+      <onentry><send event="archive.retry" delay="1s"/></onentry>
+      <transition event="archive.retry" target="archiving"/>
+    </state>
+  </state>
+
+  <final id="approved">
+    <onentry>
+      <send type="urn:approval:notify" event="document.approved">
+        <param name="docID" expr="docID"/>
+        <param name="version" expr="version"/>
+        <param name="receipt" expr="receipt"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="rejected">
+    <onentry>
+      <send type="urn:approval:notify" event="document.rejected">
+        <param name="docID" expr="docID"/>
+        <param name="version" expr="version"/>
+        <param name="outcome" expr="outcome"/>
+      </send>
+    </onentry>
+  </final>
+  <final id="withdrawn">
+    <onentry>
+      <send type="urn:approval:notify" event="document.withdrawn">
+        <param name="docID" expr="docID"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

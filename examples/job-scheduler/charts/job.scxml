@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One scheduled job, from its submission to its end.
+
+     A job is one of three kinds:
+       recurring  runs every `interval` ms, `limit` times (0: for ever);
+       once       runs once, at the absolute time `at`;
+       deadline   runs once, at `at`, and must have succeeded by the
+                  absolute time `deadline`, retrying until then.
+
+     Every kind runs through the same attempt loop: an attempt is a send to
+     the urn:jobs:run I/O processor, which runs the job's worker, and a
+     timeout of its own (`timeout` ms), so a worker that hangs is given up
+     on. A failed or timed-out attempt is retried after an exponential
+     backoff (`backoff`, doubled each time, at most `backoffMax`), up to
+     `maxAttempts` attempts per run. Each attempt's send has an id of its
+     own (`idlocation`), and an answer is taken only when its sendid is the
+     current attempt's: an answer from an attempt that timed out goes
+     nowhere. Leaving an attempt that is still in flight (a timeout, a
+     cancel, the deadline) asks the processor to abort its worker.
+
+     A chart has no clock, so the application stamps time: `start` (its
+     clock at the submission), `at` and `deadline` are times of its clock,
+     and the urn:jobs:clock processor answers what time it is (a chart
+     cannot read the host's time: docs/log.xml, l-p4-examples-jobs-chart-clock). A recurring
+     job with cadence "fixed-rate" keeps a schedule of absolute times
+     (`nextDue`) and asks the clock before arming each tick, so lateness
+     does not add up; "fixed-delay" arms each tick `interval` after the
+     last one ran, and drifts by the lateness of every tick.
+
+     Events from the application: `cancel`, `reschedule` ({ interval } or
+     { at, now }), `drain` (the scheduler is shutting down: a waiting job
+     stops now, a running one stops after its current attempt). -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="job" initial="active">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="id" expr="null"/>
+    <data id="kind" expr="'once'"/>
+    <data id="worker" expr="null"/>
+    <data id="payload" expr="null"/>
+    <data id="start" expr="0"/>
+    <data id="at" expr="0"/>
+    <data id="deadline" expr="null"/>
+    <data id="interval" expr="1000"/>
+    <data id="limit" expr="0"/>
+    <data id="cadence" expr="'fixed-rate'"/>
+    <data id="timeout" expr="1000"/>
+    <data id="maxAttempts" expr="1"/>
+    <data id="backoff" expr="100"/>
+    <data id="backoffMax" expr="10000"/>
+    <!-- the job's own -->
+    <data id="nextDue" expr="0"/>
+    <data id="runDue" expr="0"/>
+    <data id="runs" expr="0"/>
+    <data id="skipped" expr="0"/>
+    <data id="failures" expr="0"/>
+    <data id="attempt" expr="0"/>
+    <data id="runID" expr="null"/>
+    <data id="inFlight" expr="false"/>
+    <data id="draining" expr="false"/>
+    <data id="lastError" expr="null"/>
+    <data id="outcome" expr="null"/>
+  </datamodel>
+
+  <state id="active" initial="arming">
+    <onentry>
+      <if cond="deadline !== null">
+        <send id="deadlineTimer" event="deadline.passed" delayexpr="Math.max(0, deadline - start) + 'ms'"/>
+      </if>
+    </onentry>
+
+    <transition event="cancel" target="ended">
+      <assign location="outcome" expr="'cancelled'"/>
+    </transition>
+    <transition event="deadline.passed" target="ended">
+      <assign location="outcome" expr="'expired'"/>
+    </transition>
+    <!-- the clock's answer: arm the next tick at the absolute time nextDue -->
+    <transition event="clock" cond="!draining">
+      <send id="due" event="due" delayexpr="Math.max(0, Math.round(nextDue - _event.data.now)) + 'ms'"/>
+    </transition>
+
+    <!-- the first arming: when the job is first due -->
+    <state id="arming">
+      <onentry>
+        <if cond="kind === 'recurring'">
+          <assign location="nextDue" expr="start + interval"/>
+        <else/>
+          <assign location="nextDue" expr="at"/>
+        </if>
+        <send id="due" event="due" delayexpr="Math.max(0, Math.round(nextDue - start)) + 'ms'"/>
+      </onentry>
+      <transition target="waiting"/>
+    </state>
+
+    <state id="waiting">
+      <transition event="drain" target="ended">
+        <assign location="outcome" expr="'stopped'"/>
+      </transition>
+      <transition event="due" target="running"/>
+      <transition event="reschedule" cond="kind === 'recurring'" target="waiting">
+        <cancel sendid="due"/>
+        <assign location="interval" expr="_event.data.interval"/>
+        <assign location="nextDue" expr="_event.data.now + interval"/>
+        <send id="due" event="due" delayexpr="interval + 'ms'"/>
+      </transition>
+      <transition event="reschedule" target="waiting">
+        <cancel sendid="due"/>
+        <assign location="at" expr="_event.data.at"/>
+        <assign location="nextDue" expr="at"/>
+        <send id="due" event="due" delayexpr="Math.max(0, Math.round(at - _event.data.now)) + 'ms'"/>
+      </transition>
+    </state>
+
+    <state id="running" initial="attempting">
+      <onentry>
+        <assign location="runs" expr="runs + 1"/>
+        <assign location="attempt" expr="0"/>
+        <assign location="runDue" expr="nextDue"/>
+        <!-- a recurring job arms its next tick as the run starts, so a slow
+             run does not push the schedule back -->
+        <if cond="kind === 'recurring' &amp;&amp; (limit === 0 || runs + skipped &lt; limit)">
+          <assign location="nextDue" expr="nextDue + interval"/>
+          <if cond="cadence === 'fixed-rate'">
+            <send type="urn:jobs:clock" event="now"/>
+          <else/>
+            <send id="due" event="due" delayexpr="interval + 'ms'"/>
+          </if>
+        </if>
+      </onentry>
+
+      <!-- a tick while the last run is still going: skipped, not queued -->
+      <transition event="due">
+        <assign location="skipped" expr="skipped + 1"/>
+        <send type="urn:jobs:report" event="skipped">
+          <param name="job" expr="id"/>
+          <param name="run" expr="runs"/>
+        </send>
+        <if cond="!draining &amp;&amp; (limit === 0 || runs + skipped &lt; limit)">
+          <assign location="nextDue" expr="nextDue + interval"/>
+          <if cond="cadence === 'fixed-rate'">
+            <send type="urn:jobs:clock" event="now"/>
+          <else/>
+            <send id="due" event="due" delayexpr="interval + 'ms'"/>
+          </if>
+        </if>
+      </transition>
+      <!-- the shutdown: finish this attempt, arm nothing more -->
+      <transition event="drain">
+        <assign location="draining" expr="true"/>
+        <cancel sendid="due"/>
+      </transition>
+      <transition event="reschedule" cond="kind === 'recurring'">
+        <assign location="interval" expr="_event.data.interval"/>
+      </transition>
+
+      <state id="attempting">
+        <onentry>
+          <assign location="attempt" expr="attempt + 1"/>
+          <assign location="inFlight" expr="true"/>
+          <send type="urn:jobs:run" event="run" idlocation="runID">
+            <param name="job" expr="id"/>
+            <param name="worker" expr="worker"/>
+            <param name="payload" expr="payload"/>
+            <param name="run" expr="runs"/>
+            <param name="attempt" expr="attempt"/>
+            <param name="due" expr="runDue"/>
+          </send>
+          <send id="attemptTimer" event="attempt.timeout" delayexpr="timeout + 'ms'"/>
+        </onentry>
+        <onexit>
+          <cancel sendid="attemptTimer"/>
+          <if cond="inFlight">
+            <send type="urn:jobs:run" event="abort">
+              <param name="runID" expr="runID"/>
+            </send>
+            <assign location="inFlight" expr="false"/>
+          </if>
+        </onexit>
+
+        <transition event="result.ok" cond="_event.sendid === runID" target="succeeded">
+          <assign location="inFlight" expr="false"/>
+        </transition>
+        <transition event="result.failed" cond="_event.sendid === runID" target="failing">
+          <assign location="inFlight" expr="false"/>
+          <assign location="lastError" expr="_event.data.message"/>
+        </transition>
+        <!-- the processor could not run it at all -->
+        <transition event="error.communication" cond="_event.sendid === runID" target="failing">
+          <assign location="inFlight" expr="false"/>
+          <assign location="lastError" expr="'the worker could not be started'"/>
+        </transition>
+        <transition event="attempt.timeout" target="failing">
+          <assign location="lastError" expr="'timed out after ' + timeout + ' ms'"/>
+        </transition>
+        <!-- a late answer of an earlier attempt: nothing to do -->
+        <transition event="result"/>
+      </state>
+
+      <state id="failing">
+        <onentry>
+          <assign location="failures" expr="failures + 1"/>
+          <send type="urn:jobs:report" event="attempt.failed">
+            <param name="job" expr="id"/>
+            <param name="run" expr="runs"/>
+            <param name="attempt" expr="attempt"/>
+            <param name="error" expr="lastError"/>
+          </send>
+        </onentry>
+        <transition cond="draining" target="ended">
+          <assign location="outcome" expr="'stopped'"/>
+        </transition>
+        <transition cond="attempt &lt; maxAttempts" target="backingOff"/>
+        <transition cond="kind === 'recurring'" target="runEnded"/>
+        <transition target="ended">
+          <assign location="outcome" expr="'failed'"/>
+        </transition>
+      </state>
+
+      <state id="backingOff">
+        <onentry>
+          <send id="retryTimer" event="retry"
+                delayexpr="Math.min(backoffMax, backoff * Math.pow(2, attempt - 1)) + 'ms'"/>
+        </onentry>
+        <onexit>
+          <cancel sendid="retryTimer"/>
+        </onexit>
+        <transition event="drain" target="ended">
+          <assign location="outcome" expr="'stopped'"/>
+        </transition>
+        <transition event="retry" target="attempting"/>
+      </state>
+
+      <state id="succeeded">
+        <onentry>
+          <send type="urn:jobs:report" event="run.ok">
+            <param name="job" expr="id"/>
+            <param name="run" expr="runs"/>
+            <param name="attempt" expr="attempt"/>
+            <param name="due" expr="runDue"/>
+          </send>
+        </onentry>
+        <transition cond="draining" target="ended">
+          <assign location="outcome" expr="'stopped'"/>
+        </transition>
+        <transition cond="kind === 'recurring'" target="runEnded"/>
+        <transition target="ended">
+          <assign location="outcome" expr="'succeeded'"/>
+        </transition>
+      </state>
+
+      <!-- a recurring run is over: wait for the next tick, or end at the limit -->
+      <state id="runEnded">
+        <transition cond="limit !== 0 &amp;&amp; runs + skipped &gt;= limit" target="ended">
+          <assign location="outcome" expr="'completed'"/>
+        </transition>
+        <transition target="waiting"/>
+      </state>
+    </state>
+  </state>
+
+  <final id="ended">
+    <onentry>
+      <send type="urn:jobs:report" event="ended">
+        <param name="job" expr="id"/>
+        <param name="outcome" expr="outcome"/>
+        <param name="runs" expr="runs"/>
+        <param name="skipped" expr="skipped"/>
+        <param name="failures" expr="failures"/>
+        <param name="lastError" expr="lastError"/>
+      </send>
+    </onentry>
+  </final>
+</scxml>

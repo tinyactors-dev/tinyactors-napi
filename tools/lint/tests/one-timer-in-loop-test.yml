@@ -1,0 +1,9 @@
+id: one-timer-in-loop
+valid:
+  - "static napi_status ta_napi_name(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, \"Host\", out); }"
+  - "static const char ta_napi_message[] = \"setTimeout failed\";"
+invalid:
+  - "static napi_status ta_napi_arm(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, \"setTimeout\", out); }"
+  - "static napi_status ta_napi_disarm(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, \"clearTimeout\", out); }"
+  - "static napi_status ta_napi_turn(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, \"setImmediate\", out); }"
+  - "static napi_status ta_napi_every(napi_env env, napi_value global, napi_value *out) { return napi_get_named_property(env, global, \"setInterval\", out); }"

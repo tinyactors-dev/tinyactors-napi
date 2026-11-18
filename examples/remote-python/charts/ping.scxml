@@ -1,0 +1,60 @@
+<!-- The Node system's actor, named "ping": at "start" it plays ping-pong
+     with the Python system's "pong" for `rounds` rounds, replying each time
+     to the address the pong came from, and probes an actor the Python
+     system does not have. After "again" (sent once the Python process is
+     gone) its ping fails with error.communication. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="ping" initial="idle">
+  <datamodel>
+    <data id="rounds" expr="0"/>
+  </datamodel>
+  <state id="idle">
+    <transition event="start" target="talking">
+      <assign location="rounds" expr="_event.data.rounds"/>
+    </transition>
+  </state>
+  <state id="talking" initial="playing">
+    <transition event="probe.failed">
+      <log label="probe" expr="'python reports ' + _event.data.name + ' for ' + _event.data.sendid"/>
+    </transition>
+    <transition event="relay">
+      <send event="echo" target="tinyactors://py/@pong"><content expr="_event.data"/></send>
+    </transition>
+    <transition event="echoed">
+      <send type="urn:example:app" event="echoed"><content expr="_event.data"/></send>
+    </transition>
+    <transition event="error.communication">
+      <log label="failed" expr="_event.name + ' ' + _event.sendid"/>
+    </transition>
+    <transition event="error.execution">
+      <log label="error" expr="_event.name + ' ' + JSON.stringify(_event.data)"/>
+    </transition>
+    <state id="playing">
+      <onentry>
+        <send event="ping" target="tinyactors://py/@pong" id="ping-0">
+          <content expr="({ count: 0, trail: ['node'], numbers: [1, 2, 3],
+                            meta: { from: 'node', tags: ['größe', '✓'], ok: true, none: null, ratio: 0.5 } })"/>
+        </send>
+        <send event="hello" target="tinyactors://py/@nobody" id="node-probe"/>
+        <send event="probe" target="tinyactors://py/@pong"/>
+      </onentry>
+      <transition event="pong" cond="_event.data.count &lt; rounds">
+        <log label="pong" expr="JSON.stringify(_event.data) + ' from ' + _event.origin"/>
+        <send event="ping" targetexpr="_event.origin">
+          <content expr="({ count: _event.data.count, trail: _event.data.trail.concat(['node']),
+                            numbers: _event.data.numbers.concat([_event.data.sum]), meta: _event.data.echo })"/>
+        </send>
+      </transition>
+      <transition event="pong" target="finished">
+        <log label="done" expr="JSON.stringify(_event.data) + ' from ' + _event.origin"/>
+      </transition>
+    </state>
+    <state id="finished">
+      <transition event="again">
+        <send event="ping" target="tinyactors://py/@pong" id="after-exit">
+          <content expr="({ count: 0, trail: [], numbers: [], meta: null })"/>
+        </send>
+      </transition>
+    </state>
+  </state>
+</scxml>

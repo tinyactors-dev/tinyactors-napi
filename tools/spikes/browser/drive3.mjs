@@ -1,0 +1,14 @@
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+const { chromium } = createRequire(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim() + '/')('playwright');
+const dir = new URL('.', import.meta.url).pathname;
+const server = createServer(async (q, s) => { const p = new URL(q.url, 'http://x').pathname;
+  if (p === '/self.html') return s.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" }).end('<!doctype html><body><script type="module" src="/csp.mjs"></script>');
+  try { s.writeHead(200, { 'content-type': p.endsWith('.wasm') ? 'application/wasm' : 'text/javascript' }).end(await readFile(dir + p.slice(1))); } catch { s.writeHead(404).end(); } });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const browser = await chromium.launch(); const page = await browser.newPage();
+await page.goto(`http://127.0.0.1:${server.address().port}/self.html`); await page.waitForFunction(() => window.cspResult);
+console.log("script-src 'self':", JSON.stringify(await page.evaluate(() => window.cspResult)));
+await browser.close(); server.close();

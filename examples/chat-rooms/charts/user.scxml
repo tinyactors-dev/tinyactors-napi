@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One user: the rooms they are in, and what reached them while they were
+     away.
+
+     The application turns what the user does (join, leave, say, connect,
+     disconnect) into events for this actor; the actor asks the rooms, and
+     pushes what comes back to the user's connection through the
+     urn:chat:client I/O processor.
+
+     Offline, a message is kept in the inbox (the last inboxLimit of them)
+     and counted as unread. The first unread message starts a digest
+     timer: when it falls due and the user is still away, the actor sends
+     a digest through urn:chat:mail (an email, say). Connecting cancels the
+     timer and pushes the inbox as the backlog.
+
+     The timer is a delayed send, so a hibernated user with unread messages
+     is woken when the digest falls due. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="user" initial="account">
+  <datamodel>
+    <!-- given at spawn -->
+    <data id="user" expr="null"/>
+    <data id="inboxLimit" expr="20"/>
+    <data id="digestDelayMs" expr="60000"/>
+    <!-- the user's own -->
+    <data id="rooms" expr="[]"/>
+    <data id="inbox" expr="[]"/>
+    <data id="unread" expr="0"/>
+    <data id="digests" expr="0"/>
+  </datamodel>
+
+  <state id="account" initial="offline">
+    <!-- what the user asks for, in any state -->
+    <transition event="join">
+      <send event="join" targetexpr="'tinyactors://chat/@room-' + _event.data.room">
+        <param name="user" expr="user"/>
+      </send>
+    </transition>
+    <transition event="leave">
+      <send event="leave" targetexpr="'tinyactors://chat/@room-' + _event.data.room">
+        <param name="user" expr="user"/>
+      </send>
+    </transition>
+    <transition event="say" cond="!rooms.includes(_event.data.room)">
+      <send type="urn:chat:client" event="error" targetexpr="user">
+        <param name="room" expr="_event.data.room"/>
+        <param name="reason" expr="'join ' + _event.data.room + ' first'"/>
+      </send>
+    </transition>
+    <transition event="say">
+      <send event="post" targetexpr="'tinyactors://chat/@room-' + _event.data.room">
+        <param name="user" expr="user"/>
+        <param name="text" expr="_event.data.text"/>
+      </send>
+    </transition>
+
+    <!-- what the rooms answer, in any state -->
+    <transition event="joined">
+      <if cond="!rooms.includes(_event.data.room)">
+        <assign location="rooms" expr="rooms.concat([_event.data.room])"/>
+      </if>
+      <send type="urn:chat:client" event="joined" targetexpr="user">
+        <param name="room" expr="_event.data.room"/>
+        <param name="members" expr="_event.data.members"/>
+        <param name="history" expr="_event.data.history"/>
+      </send>
+    </transition>
+    <transition event="left">
+      <assign location="rooms" expr="rooms.filter((r) => r !== _event.data.room)"/>
+      <send type="urn:chat:client" event="left" targetexpr="user">
+        <param name="room" expr="_event.data.room"/>
+      </send>
+    </transition>
+    <!-- named refused.*, not join.refused: SCXML matches event names by
+         prefix, so the transition on "join" above would take a
+         "join.refused" and ask the room again, forever -->
+    <transition event="refused">
+      <send type="urn:chat:client" event="error" targetexpr="user">
+        <param name="room" expr="_event.data.room"/>
+        <param name="reason" expr="_event.data.reason"/>
+      </send>
+    </transition>
+    <!-- a send to a room that does not exist -->
+    <transition event="error.communication">
+      <send type="urn:chat:client" event="error" targetexpr="user">
+        <param name="reason" expr="'no such room'"/>
+      </send>
+    </transition>
+
+    <state id="offline">
+      <transition event="message">
+        <assign location="unread" expr="unread + 1"/>
+        <assign location="inbox" expr="inbox.concat([_event.data]).slice(-inboxLimit)"/>
+        <if cond="unread === 1">
+          <!-- a delayexpr gives text with a unit (l-p4-examples-order-delayexpr) -->
+          <send id="digest" event="digest" delayexpr="digestDelayMs + 'ms'"/>
+        </if>
+      </transition>
+      <transition event="digest" cond="unread &gt; 0">
+        <assign location="digests" expr="digests + 1"/>
+        <send type="urn:chat:mail" event="digest" targetexpr="user">
+          <param name="unread" expr="unread"/>
+          <param name="rooms" expr="[...new Set(inbox.map((m) => m.room))]"/>
+          <param name="latest" expr="inbox.slice(-3)"/>
+        </send>
+      </transition>
+      <transition event="connect" target="online"/>
+    </state>
+
+    <state id="online">
+      <onentry>
+        <cancel sendid="digest"/>
+        <send type="urn:chat:client" event="backlog" targetexpr="user">
+          <param name="unread" expr="unread"/>
+          <param name="messages" expr="inbox"/>
+        </send>
+        <assign location="inbox" expr="[]"/>
+        <assign location="unread" expr="0"/>
+      </onentry>
+      <transition event="message">
+        <send type="urn:chat:client" event="message" targetexpr="user">
+          <param name="room" expr="_event.data.room"/>
+          <param name="seq" expr="_event.data.seq"/>
+          <param name="user" expr="_event.data.user"/>
+          <param name="text" expr="_event.data.text"/>
+        </send>
+      </transition>
+      <!-- the last push to the connection: the application closes it then,
+           so no message pushed before the disconnect is lost -->
+      <transition event="disconnect" target="offline">
+        <send type="urn:chat:client" event="disconnected" targetexpr="user"/>
+      </transition>
+    </state>
+  </state>
+</scxml>

@@ -1,0 +1,72 @@
+id: functions-carry-the-prefix
+snapshots:
+  napi_value napi_register_module_v2(napi_env env, napi_value exports) { return exports; }:
+    labels:
+    - source: napi_register_module_v2
+      style: primary
+      start: 11
+      end: 34
+    - source: napi_value napi_register_module_v2(napi_env env, napi_value exports) { return exports; }
+      style: secondary
+      start: 0
+      end: 88
+    - source: napi_register_module_v2(napi_env env, napi_value exports)
+      style: secondary
+      start: 11
+      end: 68
+  static napi_value convert(napi_env env, napi_value value);:
+    labels:
+    - source: convert
+      style: primary
+      start: 18
+      end: 25
+    - source: static napi_value convert(napi_env env, napi_value value);
+      style: secondary
+      start: 0
+      end: 58
+    - source: convert(napi_env env, napi_value value)
+      style: secondary
+      start: 18
+      end: 57
+  static napi_value host_send(napi_env env, napi_callback_info info) { return NULL; }:
+    labels:
+    - source: host_send
+      style: primary
+      start: 18
+      end: 27
+    - source: static napi_value host_send(napi_env env, napi_callback_info info) { return NULL; }
+      style: secondary
+      start: 0
+      end: 83
+    - source: host_send(napi_env env, napi_callback_info info)
+      style: secondary
+      start: 18
+      end: 66
+  static ta_status ta_python_spawn(ta_host *host) { return TA_OK; }:
+    labels:
+    - source: ta_python_spawn
+      style: primary
+      start: 17
+      end: 32
+    - source: static ta_status ta_python_spawn(ta_host *host) { return TA_OK; }
+      style: secondary
+      start: 0
+      end: 65
+    - source: ta_python_spawn(ta_host *host)
+      style: secondary
+      start: 17
+      end: 47
+  static void finalize(napi_env env, void *data, void *hint) {}:
+    labels:
+    - source: finalize
+      style: primary
+      start: 12
+      end: 20
+    - source: static void finalize(napi_env env, void *data, void *hint) {}
+      style: secondary
+      start: 0
+      end: 61
+    - source: finalize(napi_env env, void *data, void *hint)
+      style: secondary
+      start: 12
+      end: 58

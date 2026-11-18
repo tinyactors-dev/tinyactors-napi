@@ -1,0 +1,44 @@
+id: web-functions-carry-the-prefix
+snapshots:
+  TA_WEB_EXPORT uint32_t turn(ta_web_host *host) { return 0; }:
+    labels:
+    - source: turn
+      style: primary
+      start: 23
+      end: 27
+    - source: TA_WEB_EXPORT uint32_t turn(ta_web_host *host) { return 0; }
+      style: secondary
+      start: 0
+      end: 60
+    - source: turn(ta_web_host *host)
+      style: secondary
+      start: 23
+      end: 46
+  int32_t effect(uint32_t host, uint32_t index, uint32_t extra);:
+    labels:
+    - source: effect
+      style: primary
+      start: 8
+      end: 14
+    - source: int32_t effect(uint32_t host, uint32_t index, uint32_t extra);
+      style: secondary
+      start: 0
+      end: 62
+    - source: effect(uint32_t host, uint32_t index, uint32_t extra)
+      style: secondary
+      start: 8
+      end: 61
+  static void ta_napi_put(void);:
+    labels:
+    - source: ta_napi_put
+      style: primary
+      start: 12
+      end: 23
+    - source: static void ta_napi_put(void);
+      style: secondary
+      start: 0
+      end: 30
+    - source: ta_napi_put(void)
+      style: secondary
+      start: 12
+      end: 29

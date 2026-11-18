@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Buggy: waits for a reading to become null, which none ever is: a
+     `while (true) {}` in disguise. (It declares no counter: a top-level
+     `let` in a transition's script fails every run after the first, on the
+     redeclaration, before any limit applies; docs/log.xml,
+     l-p4-examples-iot-script-let.) -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="spin" initial="watching">
+  <state id="watching">
+    <transition event="reading">
+      <script>while (_event.data.value !== null) {}</script>
+    </transition>
+  </state>
+</scxml>

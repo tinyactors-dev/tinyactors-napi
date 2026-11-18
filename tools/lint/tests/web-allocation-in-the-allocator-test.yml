@@ -1,0 +1,9 @@
+id: web-allocation-in-the-allocator
+valid:
+  - "static void *ta_web_allocator_alloc(void *context, size_t size, size_t align) { return ta_wasm_alloc(size, align); }"
+  - "static void ta_web_allocator_free(void *context, void *ptr, size_t size) { ta_wasm_free(ptr, size, 8); }"
+  - "void ta_web_f(ta_web_env *env) { env->allocator.alloc(env->allocator.context, 8, 8); }"
+invalid:
+  - "void ta_web_f(void) { ta_wasm_alloc(8, 8); }"
+  - "void ta_web_f(void *p) { free(p); }"
+  - "void ta_web_f(void) { malloc(8); }"

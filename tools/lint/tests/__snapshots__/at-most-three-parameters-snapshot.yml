@@ -1,0 +1,52 @@
+id: at-most-three-parameters
+snapshots:
+  static int ta_napi_helper(int a, int b, int c, int d) { return 0; }:
+    labels:
+    - source: ta_napi_helper(int a, int b, int c, int d)
+      style: primary
+      start: 11
+      end: 53
+    - source: (int a, int b, int c, int d)
+      style: secondary
+      start: 25
+      end: 53
+  static napi_value ta_napi_convert(napi_env env, napi_value value, int depth, uint32_t flags);:
+    labels:
+    - source: ta_napi_convert(napi_env env, napi_value value, int depth, uint32_t flags)
+      style: primary
+      start: 18
+      end: 92
+    - source: (napi_env env, napi_value value, int depth, uint32_t flags)
+      style: secondary
+      start: 33
+      end: 92
+  static void ta_napi_call_js(napi_env env, napi_value callback, void *context, uint32_t flags) {}:
+    labels:
+    - source: ta_napi_call_js(napi_env env, napi_value callback, void *context, uint32_t flags)
+      style: primary
+      start: 12
+      end: 93
+    - source: (napi_env env, napi_value callback, void *context, uint32_t flags)
+      style: secondary
+      start: 27
+      end: 93
+  typedef int (*ta_napi_callback)(void *context, int a, int b, int c);:
+    labels:
+    - source: (*ta_napi_callback)(void *context, int a, int b, int c)
+      style: primary
+      start: 12
+      end: 67
+    - source: (void *context, int a, int b, int c)
+      style: secondary
+      start: 31
+      end: 67
+  typedef struct ta_napi_hooks { void (*drop)(napi_env env, void *data, int a, int b); } ta_napi_hooks;:
+    labels:
+    - source: (*drop)(napi_env env, void *data, int a, int b)
+      style: primary
+      start: 36
+      end: 83
+    - source: (napi_env env, void *data, int a, int b)
+      style: secondary
+      start: 43
+      end: 83

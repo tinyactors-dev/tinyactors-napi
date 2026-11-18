@@ -1,0 +1,14 @@
+id: at-most-three-parameters
+valid:
+  - "static napi_value ta_napi_host_send(napi_env env, napi_callback_info info) { return NULL; }"
+  - "static void ta_napi_host_finalize(napi_env env, void *data, void *hint) {}"
+  - "static void ta_napi_call_js(napi_env env, napi_value callback, void *context, void *data) {}"
+  - "static ta_status ta_napi_spawn(ta_napi_host *host, const ta_napi_spawn_arguments *arguments, uint64_t *session) { return TA_OK; }"
+  - "typedef struct ta_napi_hooks { void (*drop)(napi_env env, void *data); } ta_napi_hooks;"
+  - "static void ta_napi_free(void *context, void *pointer, size_t size) { free(pointer); }"
+invalid:
+  - "static int ta_napi_helper(int a, int b, int c, int d) { return 0; }"
+  - "static napi_value ta_napi_convert(napi_env env, napi_value value, int depth, uint32_t flags);"
+  - "typedef int (*ta_napi_callback)(void *context, int a, int b, int c);"
+  - "typedef struct ta_napi_hooks { void (*drop)(napi_env env, void *data, int a, int b); } ta_napi_hooks;"
+  - "static void ta_napi_call_js(napi_env env, napi_value callback, void *context, uint32_t flags) {}"
