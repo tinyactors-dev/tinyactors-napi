@@ -43,7 +43,7 @@ const LISTS = scxml('lists', `
 
 /** A snapshot of `sessions` sessions of LISTS. */
 async function snapshotOf(sessions) {
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   host.addImage(image({ lists: LISTS }));
   const chart = host.chart('lists');
   for (let i = 0; i < sessions; i++) {
@@ -61,7 +61,7 @@ async function snapshotOf(sessions) {
 async function restoreCost(snapshot, sessions) {
   await collect(2);
   const started = performance.now();
-  const restored = Host.restore(snapshot, CONFIG, ENGINE);
+  const restored = Host.restore(snapshot, [], { ...CONFIG, ...ENGINE });
   const cost = (performance.now() - started) / sessions;
   restored.close();
   return cost;

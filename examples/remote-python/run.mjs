@@ -20,7 +20,7 @@ export async function converse({ rounds = 3, value = { hello: 'world' }, datamod
   try {
     let echoed;
     const echoedValue = new Promise((resolve) => { echoed = resolve; });
-    node = await startNode({ port: python.port, datamodel, app: (host, send) => echoed(send.data) });
+    node = await startNode({ port: python.port, datamodel, app: (send) => echoed(send.data) });
     const { host, ping, lines } = node;
 
     host.send(ping, 'start', { rounds });

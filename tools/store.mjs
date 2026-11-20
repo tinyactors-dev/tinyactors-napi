@@ -26,8 +26,10 @@ export function random(seed) {
   };
 }
 
-// The hibernated actors' blobs: one SQLite row per session, written in
-// transactions of 4096. A store opened on a copy's file finds its rows.
+// The hibernated actors' blobs: one SQLite row per session, the host's
+// store (save, load, delete), its writes batched in transactions of 4096
+// (what SQLiteStore does a row at a time). A store opened on a copy's file
+// finds its rows.
 export class Store {
   static async open(file) {
     if (globalThis.Bun) {
@@ -46,24 +48,33 @@ export class Store {
     db.exec('PRAGMA synchronous=OFF');
     db.exec('CREATE TABLE IF NOT EXISTS blobs (session INTEGER PRIMARY KEY, blob BLOB NOT NULL)');
     this.insert = db.prepare('INSERT OR REPLACE INTO blobs VALUES (?, ?)');
+    this.remove = db.prepare('DELETE FROM blobs WHERE session = ?');
     this.select = db.prepare('SELECT blob FROM blobs WHERE session = ?');
-    this.pending = [];
+    this.pending = new Map(); // session -> blob, or null for a delete
     this.puts = 0;
     this.gets = 0;
   }
 
-  put(session, blob) {
-    this.pending.push([session, blob]);
+  save(session, blob) {
+    this.pending.set(session, blob);
     this.puts++;
-    if (this.pending.length >= 4096) this.flush();
+    if (this.pending.size >= 4096) this.flush();
+  }
+
+  delete(session) {
+    this.pending.set(session, null);
+    if (this.pending.size >= 4096) this.flush();
   }
 
   flush() {
-    if (this.pending.length === 0) return;
+    if (this.pending.size === 0) return;
     this.db.exec('BEGIN');
-    for (const [session, blob] of this.pending) this.insert.run(session, blob);
+    for (const [session, blob] of this.pending) {
+      if (blob === null) this.remove.run(session);
+      else this.insert.run(session, blob);
+    }
     this.db.exec('COMMIT');
-    this.pending.length = 0;
+    this.pending.clear();
   }
 
   // A copy of every row in `file` (VACUUM INTO), for another host's store.
@@ -78,9 +89,13 @@ export class Store {
     for (const row of this.db.prepare('SELECT session, blob FROM blobs').iterate()) yield [row.session, row.blob];
   }
 
-  get(session) {
-    this.flush(); // a wake can come before a put settled: read your own writes
+  load(session) {
     this.gets++;
+    if (this.pending.has(session)) { // read your own writes
+      const blob = this.pending.get(session);
+      if (blob === null) throw new Error(`no blob of ${session}`);
+      return blob;
+    }
     return this.select.get(session).blob;
   }
 }

@@ -10,7 +10,7 @@
 //   urn:jobs:report  what happened: run.ok, attempt.failed, skipped, ended
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, TinyactorsError } from '@tinyactors/node';
 
 const CHART = readFileSync(new URL('charts/job.scxml', import.meta.url), 'utf8');
 
@@ -45,22 +45,18 @@ export class Scheduler {
     this.sequence = 0;
     this.origin = performance.now();
 
-    this.host = new Host(
-      {
-        systemID: 'jobs',
-        ioProcessors: [{ type: 'urn:jobs:run' }, { type: 'urn:jobs:clock' }, { type: 'urn:jobs:report' }],
-      },
-      {
+    const compiled = compileCharts([{ name: 'job.scxml', text: CHART }]);
+    this.host = new Host(compiled, {
+        system: 'jobs',
         clock,
         datamodel,
         ioProcessors: {
-          'urn:jobs:run': (host, send) => (send.event === 'abort' ? this.#abort(send.session, send.data.runID) : this.#run(send)),
-          'urn:jobs:clock': (host, send) => send.answer('clock', { now: this.now() }),
-          'urn:jobs:report': (host, send) => this.#report({ event: send.event, ...send.data }),
+          'urn:jobs:run': { receive: (send) => (send.event === 'abort' ? this.#abort(send.session, send.data.runID) : this.#run(send)) },
+          'urn:jobs:clock': { receive: (send) => send.answer('clock', { now: this.now() }) },
+          'urn:jobs:report': { receive: (send) => this.#report({ event: send.event, ...send.data }) },
         },
-      },
-    );
-    this.host.addCharts({ 'job.scxml': CHART });
+      });
+    compiled.close();
   }
 
   /** The application's clock in milliseconds: the simulated clock's, or
@@ -109,7 +105,7 @@ export class Scheduler {
     };
     let end;
     const ended = new Promise((resolve) => { end = resolve; });
-    const session = this.host.spawnChart('job', { name: id, params });
+    const session = this.host.spawn('job', { name: id, params }).id;
     this.jobs.set(id, { id, session, spec: params, ended, end });
     return id;
   }

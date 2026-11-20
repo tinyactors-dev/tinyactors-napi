@@ -2,7 +2,7 @@
 // its parts read by core's parser on each access; made from parts by
 // core's formatter; taken by the inputs wherever an address is.
 import { Address, TinyactorsError } from '@tinyactors/node';
-import { ENDER, equal, hostWith, scxml, status, throws, typeError, until } from './charts.mjs';
+import { ENDER, equal, hostWith, named, scxml, status, throws, typeError, until } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
 const invalid = status('TA_ERROR_INVALID');
@@ -76,13 +76,13 @@ test('send and fail take an Address as target, send an Address as origin', async
   const watcher = scxml('watcher', `
     <state id="s"><transition event="go" target="done"><log expr="_event.origin"/></transition></state>
     <final id="done"/>`);
-  const host = hostWith({ ender: ENDER, sender, watcher }, { log: (h, entry) => origins.push(entry.text) });
+  const host = hostWith({ ender: ENDER, sender, watcher }, { log: (entry) => origins.push(entry.text) });
   const ender = host.spawn(host.chart('ender'), { name: 'e' });
   host.send(Address.fromSession('t', ender), 'go');
-  if (!(await until(() => host.actorByName('e') === undefined))) throw new Error('send to an Address');
+  if (!(await until(() => named(host, 'e') === undefined))) throw new Error('send to an Address');
   host.spawn(host.chart('sender'), { name: 'sender' });
   host.fail(Address.fromName('t', 'sender'), 'o-1');
-  if (!(await until(() => host.actorByName('sender') === undefined))) throw new Error('fail to an Address');
+  if (!(await until(() => named(host, 'sender') === undefined))) throw new Error('fail to an Address');
   const watching = host.spawn(host.chart('watcher'));
   host.send(watching, 'go', undefined, { origin: new Address('tinyactors://far/#_scxml_3') });
   await host.idle();
@@ -95,7 +95,7 @@ test('an Address inside a value a chart takes is its text there', async () => {
   const chart = scxml('reader', `
     <state id="s"><transition event="who"><log label="who" expr="typeof _event.data.who + ' ' + _event.data.who + ' ' + _event.data.list[0]"/></transition></state>`);
   const seen = [];
-  const host = hostWith({ reader: chart }, { log: (h, entry) => seen.push(entry.text) });
+  const host = hostWith({ reader: chart }, { log: (entry) => seen.push(entry.text) });
   const session = host.spawn(host.chart('reader'));
   const who = new Address('tinyactors://shop/@ada');
   host.send(session, 'who', { who, list: [who] });

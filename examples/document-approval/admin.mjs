@@ -5,7 +5,7 @@
 // as text for a terminal (`formatTable`), and as an HTTP endpoint
 // (`serveAdmin`).
 import { createServer } from 'node:http';
-import { TinyactorsError } from '@tinyactors/node';
+import { StaleError, TinyactorsError } from '@tinyactors/node';
 
 /** The atomic states of a state value: `{"a": {"p": {"r1": "x", "r2": "y"}}}`
  * gives `['x', 'y']`. */
@@ -70,8 +70,14 @@ export async function documents(host, { limit = 64 } = {}) {
 
 /** Document `id`, found by its name, or `undefined`. */
 export async function documentByID(host, id) {
-  const session = host.actorByName(id);
-  return session === undefined ? undefined : describe(host, session);
+  let actor;
+  try {
+    actor = host.actor(id);
+  } catch (error) {
+    if (error instanceof StaleError) return undefined;
+    throw error;
+  }
+  return describe(host, actor.id);
 }
 
 /** Milliseconds as hours, or seconds below one: `172800000` is `48h`. */

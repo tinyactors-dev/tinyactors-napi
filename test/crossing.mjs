@@ -16,7 +16,7 @@ const COUNTER = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" da
 
 if (process.argv[2] !== undefined) {
   const compiled = compileCharts([{ name: 'counter.scxml', text: COUNTER }]);
-  const host = new Host({ systemID: 't' });
+  const host = new Host([], { system: 't' });
   host.addImage(compiled.image);
   compiled.close();
   const session = host.spawn(host.chart('counter'), { name: 'c' });

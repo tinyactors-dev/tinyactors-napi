@@ -22,7 +22,7 @@ const COUNTER = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" da
 
 async function count({ compileCharts, Host }, datamodel) {
   const lines = [];
-  const host = new Host({ systemID: 'smoke' }, { datamodel, log: (h, entry) => lines.push(entry.text) });
+  const host = new Host([], { system: 'smoke', datamodel, log: (entry) => lines.push(entry.text) });
   try {
     const compiled = compileCharts([{ name: 'counter.scxml', text: COUNTER }]);
     try {

@@ -1,6 +1,6 @@
 {
   "name": "@tinyactors/node",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "SCXML statecharts as actors on the tinyactors host, from Node.js and Bun (a Node-API addon)",
   "keywords": [
     "actor",
@@ -30,7 +30,8 @@
       "types": "./index.d.ts",
       "tinyactors-wasm": "./wasm/index.mjs",
       "default": "./index.mjs"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",

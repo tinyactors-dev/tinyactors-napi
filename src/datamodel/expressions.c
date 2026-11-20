@@ -1,12 +1,12 @@
 /* The native datamodel's expressions (AGENTS.md, "Rules the suite cannot
  * see": compiled once, lazily, as a strict function inside `with
  * (scope)`). Each expression is a vm.Script of its own, compiled at its
- * first evaluation, so a syntax error is that evaluation's
- * error.execution and the chart's other expressions still run (docs/plan.xml,
- * finding x-syntax). In the shared context it runs once to give a function
- * of the scope, kept in the chart's record; in a declaring session's own
- * context, a script runs as global code and every other expression is a
- * strict function made once per session from the chart's vm.Script. */
+ * first evaluation and run once in the shared context to give a function
+ * of the scope, kept in the chart's record, so a syntax error is that
+ * evaluation's error.execution and the chart's other expressions still run
+ * (docs/plan.xml, finding x-syntax). A script is compiled between the head
+ * and tail the kit gave at chart_attach (its top-level vars read from the
+ * scope and written back), or refused with the kit's reason. */
 #include "datamodel.h"
 
 #include <string.h>
@@ -19,12 +19,6 @@ static const char ta_napi_shared_script[] = "(function(__s){with(__s){(function(
 static const char ta_napi_shared_script_end[] = "\n})();}})";
 static const char ta_napi_shared_setter[] = "(function(__s,__v){with(__s){(function(){'use strict';(\n";
 static const char ta_napi_shared_setter_end[] = "\n) = __v;})();}})";
-static const char ta_napi_strict_block[] = "'use strict';{\n";
-static const char ta_napi_own_value[] = "(function(){'use strict';return (\n";
-static const char ta_napi_own_value_end[] = "\n);})";
-static const char ta_napi_own_setter[] = "(function(__v){'use strict';(\n";
-static const char ta_napi_own_setter_end[] = "\n) = __v;})";
-
 #define TA_NAPI_TEXT(text) ((ta_string_view){(text), sizeof(text) - 1})
 
 bool ta_napi_expression_of(const ta_napi_chart_row *chart, ta_expression e, ta_expression_info *info) {
@@ -33,15 +27,6 @@ bool ta_napi_expression_of(const ta_napi_chart_row *chart, ta_expression e, ta_e
 
 static bool ta_napi_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-bool ta_napi_strict_directive(ta_string_view source) {
-    uint32_t at = 0;
-    while (at < source.length && ta_napi_space(source.pointer[at])) at++;
-    if (source.length - at < 12) return false;
-    char quote = source.pointer[at];
-    return (quote == '\'' || quote == '"') && memcmp(source.pointer + at + 1, "use strict", 10) == 0 &&
-           source.pointer[at + 11] == quote;
 }
 
 /* A value's source without a trailing `;` (expr="new Foo();"). */
@@ -57,13 +42,11 @@ static napi_value ta_napi_fail(napi_env env, const char *message) {
 }
 
 /* The compiled form of `e` in `cache` (a JavaScript array), compiled and
- * kept there at its first use; null kept when it did not compile, so it is
- * not compiled again. `shared` makes a function of the script, run in the
- * shared context (read only here, when it compiles: an evaluation does not
- * read it); without it the vm.Script itself is kept. */
+ * kept there at its first use: a function of the scope, run once in the
+ * shared context. Null is kept when it did not compile, so it is not
+ * compiled again; a string is a refusal, thrown at each evaluation. */
 typedef struct ta_napi_compiled {
     napi_value cache;
-    bool shared; /* false: keep the vm.Script */
     ta_napi_script_of shape;
 } ta_napi_compiled;
 
@@ -74,9 +57,14 @@ static napi_value ta_napi_compiled_of(ta_napi_evaluation *evaluation, const ta_n
     uint32_t e = compiled->shape.index;
     if (napi_get_element(env, compiled->cache, e, &kept) != napi_ok || napi_typeof(env, kept, &type) != napi_ok) return NULL;
     if (type == napi_null) return ta_napi_fail(env, "the expression did not compile");
+    if (type == napi_string) {
+        napi_value error;
+        if (napi_create_error(env, NULL, kept, &error) == napi_ok) napi_throw(env, error);
+        return NULL;
+    }
     if (type != napi_undefined) return kept;
     napi_value made = ta_napi_script(evaluation->native, &compiled->shape), shared, context;
-    if (made != NULL && compiled->shared)
+    if (made != NULL)
         made = (shared = ta_napi_realm_shared(evaluation->native)) != NULL &&
                        napi_get_element(env, shared, TA_NAPI_REALM_CONTEXT, &context) == napi_ok
                    ? ta_napi_run_in(env, made, context)
@@ -92,28 +80,33 @@ static napi_value ta_napi_compiled_of(ta_napi_evaluation *evaluation, const ta_n
     return made;
 }
 
-/* A declaring session's function for `e`, made in its context from the
- * chart's vm.Script (`cache` the session's own, `scripts` the chart's). */
-typedef struct ta_napi_own_of {
-    uint32_t cache, scripts; /* TA_NAPI_OWN_GETTERS / _SETTERS, TA_NAPI_CHART_GETTERS / _SETTERS */
-    ta_napi_script_of shape;
-} ta_napi_own_of;
-
-static napi_value ta_napi_own_function(ta_napi_evaluation *evaluation, const ta_napi_own_of *of) {
+/* A script's function: compiled between the head and tail chart_attach
+ * kept for it (the texts copied into the host's arena for the call), or
+ * its refusal kept in the cache; the plain shape for a script that does
+ * not parse, whose evaluation then throws the SyntaxError. */
+static napi_value ta_napi_script_function(ta_napi_evaluation *evaluation, napi_value cache, const ta_napi_script_of *plain) {
     napi_env env = evaluation->env;
-    napi_value cache, scripts, context, kept;
+    napi_value kept, scripts, prepared, part;
     napi_valuetype type = napi_undefined;
-    uint32_t e = of->shape.index;
-    if (napi_get_element(env, evaluation->own, of->cache, &cache) != napi_ok ||
-        napi_get_element(env, cache, e, &kept) != napi_ok || napi_typeof(env, kept, &type) != napi_ok)
+    uint32_t e = plain->index;
+    if (napi_get_element(env, cache, e, &kept) != napi_ok || napi_typeof(env, kept, &type) != napi_ok) return NULL;
+    if (type != napi_undefined) return ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, *plain});
+    if (napi_get_element(env, evaluation->record, TA_NAPI_CHART_SCRIPTS, &scripts) != napi_ok ||
+        napi_get_element(env, scripts, e, &prepared) != napi_ok || napi_typeof(env, prepared, &type) != napi_ok)
         return NULL;
-    if (type == napi_function) return kept;
-    if (napi_get_element(env, evaluation->record, of->scripts, &scripts) != napi_ok ||
-        napi_get_element(env, evaluation->own, TA_NAPI_OWN_CONTEXT, &context) != napi_ok)
-        return NULL;
-    napi_value script = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){scripts, false, of->shape});
-    napi_value made = script != NULL ? ta_napi_run_in(env, script, context) : NULL;
-    if (made == NULL || napi_set_element(env, cache, e, made) != napi_ok) return NULL;
+    if (type == napi_string) { /* refused: kept, and thrown at each evaluation */
+        if (napi_set_element(env, cache, e, prepared) != napi_ok) return NULL;
+        return ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, *plain});
+    }
+    if (type != napi_object) return ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, *plain});
+    ta_growable_arena *arena = &evaluation->native->host->arena;
+    ta_growable_arena_mark mark = ta_growable_arena_position(arena);
+    ta_napi_text head = {arena, "a script's head", {NULL, 0}}, tail = {arena, "a script's tail", {NULL, 0}};
+    napi_value made = NULL;
+    if (napi_get_element(env, prepared, 0, &part) == napi_ok && ta_napi_text_of(env, part, &head) &&
+        napi_get_element(env, prepared, 1, &part) == napi_ok && ta_napi_text_of(env, part, &tail))
+        made = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, {head.view, plain->source, tail.view, e}});
+    ta_napi_arena_release(arena, mark, TA_NAPI_ARENA_UNCAPPED);
     return made;
 }
 
@@ -122,44 +115,19 @@ napi_value ta_napi_evaluate(ta_napi_evaluation *evaluation, ta_expression e) {
     ta_expression_info info;
     if (!ta_napi_expression_of(&evaluation->row, e, &info)) return ta_napi_fail(env, "no such expression");
     if (info.kind == TA_EXPRESSION_CONTENT) return ta_napi_content(evaluation, info.source);
-    /* a chart's top-level <script> is global code; one in executable content
-     * runs in a block, so its let, const and class are its own at each run */
     bool script = info.kind == TA_EXPRESSION_SCRIPT || info.kind == TA_EXPRESSION_GLOBAL_SCRIPT;
-    bool block = info.kind == TA_EXPRESSION_SCRIPT;
-    ta_string_view source = script ? info.source : ta_napi_trimmed(info.source);
-    napi_value result = NULL, function, undefined;
-    if (napi_get_undefined(env, &undefined) != napi_ok) return NULL;
-    if (evaluation->own == NULL) { /* the shared context: a function of the scope */
-        napi_value cache;
-        if (napi_get_element(env, evaluation->record, TA_NAPI_CHART_GETTERS, &cache) != napi_ok) return NULL;
-        ta_napi_script_of shape = script ? (ta_napi_script_of){TA_NAPI_TEXT(ta_napi_shared_script), source,
-                                                               TA_NAPI_TEXT(ta_napi_shared_script_end), e}
-                                         : (ta_napi_script_of){TA_NAPI_TEXT(ta_napi_shared_value), source,
-                                                               TA_NAPI_TEXT(ta_napi_shared_value_end), e};
-        function = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, true, shape});
-        if (function == NULL ||
-            napi_call_function(env, undefined, function, 1, &evaluation->scope, &result) != napi_ok)
-            return NULL;
-        return result;
-    }
-    if (script) { /* its own context: global code, so its declarations are the session's */
-        napi_value scripts, context;
-        if (napi_get_element(env, evaluation->record, TA_NAPI_CHART_GETTERS, &scripts) != napi_ok ||
-            napi_get_element(env, evaluation->own, TA_NAPI_OWN_CONTEXT, &context) != napi_ok)
-            return NULL;
-        /* a block takes no directive: a script that starts with 'use strict'
-         * is strict as a whole, as it was when it ran as global code */
-        ta_napi_script_of shape = !block ? (ta_napi_script_of){{"\n", 1}, source, {NULL, 0}, e}
-                                  : ta_napi_strict_directive(source)
-                                      ? (ta_napi_script_of){TA_NAPI_TEXT(ta_napi_strict_block), source, {"\n}", 2}, e}
-                                      : (ta_napi_script_of){{"{\n", 2}, source, {"\n}", 2}, e};
-        napi_value made = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){scripts, false, shape});
-        return made != NULL ? ta_napi_run_in(env, made, context) : NULL;
-    }
-    ta_napi_own_of of = {TA_NAPI_OWN_GETTERS, TA_NAPI_CHART_GETTERS,
-                         {TA_NAPI_TEXT(ta_napi_own_value), source, TA_NAPI_TEXT(ta_napi_own_value_end), e}};
-    function = ta_napi_own_function(evaluation, &of);
-    if (function == NULL || napi_call_function(env, undefined, function, 0, NULL, &result) != napi_ok) return NULL;
+    napi_value result = NULL, function, undefined, cache;
+    if (napi_get_undefined(env, &undefined) != napi_ok ||
+        napi_get_element(env, evaluation->record, TA_NAPI_CHART_GETTERS, &cache) != napi_ok)
+        return NULL;
+    if (script)
+        function = ta_napi_script_function(evaluation, cache,
+                                           &(ta_napi_script_of){TA_NAPI_TEXT(ta_napi_shared_script), info.source,
+                                                                TA_NAPI_TEXT(ta_napi_shared_script_end), e});
+    else
+        function = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, {TA_NAPI_TEXT(ta_napi_shared_value), ta_napi_trimmed(info.source),
+                                                                                TA_NAPI_TEXT(ta_napi_shared_value_end), e}});
+    if (function == NULL || napi_call_function(env, undefined, function, 1, &evaluation->scope, &result) != napi_ok) return NULL;
     return result;
 }
 
@@ -196,18 +164,11 @@ bool ta_napi_assign(ta_napi_evaluation *evaluation, const ta_napi_assignment *as
     }
     if (napi_get_undefined(env, &undefined) != napi_ok) return false;
     ta_string_view source = ta_napi_trimmed(info.source);
-    if (evaluation->own == NULL) {
-        napi_value cache, function, argv[2] = {evaluation->scope, assignment->value};
-        if (napi_get_element(env, evaluation->record, TA_NAPI_CHART_SETTERS, &cache) != napi_ok) return false;
-        ta_napi_script_of shape = {TA_NAPI_TEXT(ta_napi_shared_setter), source, TA_NAPI_TEXT(ta_napi_shared_setter_end), e};
-        function = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, true, shape});
-        return function != NULL && napi_call_function(env, undefined, function, 2, argv, &result) == napi_ok;
-    }
-    ta_napi_own_of of = {TA_NAPI_OWN_SETTERS, TA_NAPI_CHART_SETTERS,
-                         {TA_NAPI_TEXT(ta_napi_own_setter), source, TA_NAPI_TEXT(ta_napi_own_setter_end), e}};
-    napi_value function = ta_napi_own_function(evaluation, &of);
-    napi_value value = assignment->value;
-    return function != NULL && napi_call_function(env, undefined, function, 1, &value, &result) == napi_ok;
+    napi_value cache, function, argv[2] = {evaluation->scope, assignment->value};
+    if (napi_get_element(env, evaluation->record, TA_NAPI_CHART_SETTERS, &cache) != napi_ok) return false;
+    ta_napi_script_of shape = {TA_NAPI_TEXT(ta_napi_shared_setter), source, TA_NAPI_TEXT(ta_napi_shared_setter_end), e};
+    function = ta_napi_compiled_of(evaluation, &(ta_napi_compiled){cache, shape});
+    return function != NULL && napi_call_function(env, undefined, function, 2, argv, &result) == napi_ok;
 }
 
 /* ---- SCXML B.2: <content> and <data> text --------------------------------------- */

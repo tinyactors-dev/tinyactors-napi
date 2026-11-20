@@ -479,7 +479,7 @@ static void ta_napi_send_raised(napi_env env, ta_napi_view *view) {
     if (napi_get_and_clear_last_exception(env, &error) != napi_ok) error = NULL;
     ta_napi_send_fail_unanswered(env, view);
     if (error != NULL) napi_throw(env, error);
-    ta_napi_keep_error(env, view->host);
+    ta_napi_handler_failed(env, &(ta_napi_handler_error){view->host, view->self});
 }
 
 /* A handler's promise rejected (bound to its view): the send is failed if
@@ -491,7 +491,11 @@ static napi_value ta_napi_send_rejected(napi_env env, napi_callback_info info) {
     ta_napi_view view;
     if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok) return NULL;
     if (argc < 2) argv[1] = ta_napi_undefined(env);
-    if (ta_napi_view_of(env, argv[0], &view)) ta_napi_send_fail_unanswered(env, &view);
+    if (ta_napi_view_of(env, argv[0], &view)) {
+        ta_napi_send_fail_unanswered(env, &view);
+        /* with a handlerError hook the rejection is the hook's, and the chain goes on */
+        if (ta_napi_handler_rejected(env, &(ta_napi_handler_error){view.host, view.self}, argv[1])) return ta_napi_undefined(env);
+    }
     napi_value ignored;
     napi_get_and_clear_last_exception(env, &ignored);
     napi_throw(env, argv[1]);
@@ -611,13 +615,23 @@ static void ta_napi_dispatch_send(napi_env env, ta_napi_host *host, uint32_t ind
         ta_napi_keep_error(env, host);
         return;
     }
-    if (!ta_napi_is(env, handler, napi_function)) { /* no handler: a failed completion */
+    /* the transport is a function, called with the view; an I/O processor
+     * an object, its receive(send) called on it */
+    napi_value receiver = ta_napi_undefined(env), receive = handler;
+    if (ta_napi_is(env, handler, napi_object)) {
+        receiver = handler;
+        if (napi_get_named_property(env, handler, "receive", &receive) != napi_ok) {
+            ta_napi_send_raised(env, &view);
+            return;
+        }
+    }
+    if (!ta_napi_is(env, receive, napi_function)) { /* no handler: a failed completion */
         ta_napi_answer answer = {NULL, ta_napi_undefined(env), NULL, NULL, NULL};
         if (ta_napi_send_reply(env, &view, &answer) == TA_NAPI_REPLY_REFUSED) ta_napi_keep_error(env, host);
         return;
     }
-    napi_value argv[2] = {view.wrapper, view.self}, result;
-    if (napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok ||
+    napi_value result;
+    if (napi_call_function(env, receiver, receive, 1, &view.self, &result) != napi_ok ||
         !ta_napi_send_follow(env, &view, result))
         ta_napi_send_raised(env, &view);
 }
@@ -639,8 +653,8 @@ static void ta_napi_dispatch_log(napi_env env, ta_napi_host *host, uint32_t inde
         ta_napi_keep_error(env, host);
         return;
     }
-    napi_value argv[2] = {wrapper, view.self};
-    if (napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok) ta_napi_keep_error(env, host);
+    if (napi_call_function(env, ta_napi_undefined(env), handler, 1, &view.self, &result) != napi_ok)
+        ta_napi_handler_failed(env, &(ta_napi_handler_error){host, view.self});
     else ta_napi_follow(env, host, result);
 }
 
@@ -661,8 +675,8 @@ static void ta_napi_dispatch_migrated(napi_env env, ta_napi_host *host, uint32_t
         ta_napi_keep_error(env, host);
         return;
     }
-    napi_value argv[2] = {wrapper, view.self};
-    if (napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok) ta_napi_keep_error(env, host);
+    if (napi_call_function(env, ta_napi_undefined(env), handler, 1, &view.self, &result) != napi_ok)
+        ta_napi_handler_failed(env, &(ta_napi_handler_error){host, view.self});
     else ta_napi_follow(env, host, result);
 }
 
@@ -717,7 +731,7 @@ static napi_value ta_napi_migration_result(napi_env env, ta_napi_host *host, uin
 /* A MIGRATION_DONE: the host's migrationDone handler gets the host and the
  * result; without one nothing is read. */
 static void ta_napi_dispatch_migration_done(napi_env env, ta_napi_host *host, uint32_t index) {
-    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[2], result;
+    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[1], result;
     if (wrapper == NULL) return;
     handler = ta_napi_handler_of(env, wrapper, &(ta_napi_handler_at){"migrationDone", UINT32_MAX});
     if (handler == NULL) {
@@ -725,9 +739,8 @@ static void ta_napi_dispatch_migration_done(napi_env env, ta_napi_host *host, ui
         return;
     }
     if (!ta_napi_is(env, handler, napi_function)) return;
-    argv[0] = wrapper;
-    if ((argv[1] = ta_napi_migration_result(env, host, index)) == NULL ||
-        napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok)
+    if ((argv[0] = ta_napi_migration_result(env, host, index)) == NULL ||
+        napi_call_function(env, ta_napi_undefined(env), handler, 1, argv, &result) != napi_ok)
         ta_napi_keep_error(env, host);
     else ta_napi_follow(env, host, result);
 }
@@ -740,7 +753,7 @@ static void ta_napi_dispatch_migration_done(napi_env env, ta_napi_host *host, ui
  * returns is followed, so idle() waits for it; its rejection is an
  * unhandled rejection. */
 static void ta_napi_dispatch_wake(napi_env env, ta_napi_host *host, uint32_t index) {
-    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[3], result;
+    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[2], result;
     if (wrapper == NULL) return;
     handler = ta_napi_handler_of(env, wrapper, &(ta_napi_handler_at){"wake", UINT32_MAX});
     if (handler == NULL) {
@@ -749,11 +762,36 @@ static void ta_napi_dispatch_wake(napi_env env, ta_napi_host *host, uint32_t ind
     }
     if (!ta_napi_is(env, handler, napi_function)) return;
     uint64_t migration = ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_MIGRATION); /* 0: none asked */
-    argv[0] = wrapper;
-    argv[2] = ta_napi_undefined(env);
-    if (napi_create_bigint_uint64(env, ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_SESSION), &argv[1]) != napi_ok ||
-        (migration != 0 && napi_create_double(env, (double)migration, &argv[2]) != napi_ok) ||
-        napi_call_function(env, ta_napi_undefined(env), handler, 3, argv, &result) != napi_ok)
+    argv[1] = ta_napi_undefined(env);
+    if (napi_create_bigint_uint64(env, ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_SESSION), &argv[0]) != napi_ok ||
+        (migration != 0 && napi_create_double(env, (double)migration, &argv[1]) != napi_ok) ||
+        napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok)
+        ta_napi_keep_error(env, host);
+    else ta_napi_follow(env, host, result);
+}
+
+/* A DONE (its donedata) or an ERROR (a fault, FLAGS its code): a top-level
+ * actor ended. The hook done(session, donedata) or error(session, fault)
+ * gets it (the application layer's Actor.done, onDone and onError);
+ * without one nothing is read. The datamodel's rows went with destroy. */
+static void ta_napi_dispatch_end(napi_env env, ta_napi_host *host, uint32_t index) {
+    bool done = ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_KIND) == TA_EFFECT_DONE;
+    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[2], result;
+    if (wrapper == NULL) return;
+    handler = ta_napi_handler_of(env, wrapper, &(ta_napi_handler_at){done ? "done" : "error", UINT32_MAX});
+    if (handler == NULL) {
+        ta_napi_keep_error(env, host);
+        return;
+    }
+    if (!ta_napi_is(env, handler, napi_function)) return;
+    ta_napi_view view;
+    memset(&view, 0, sizeof view);
+    view.host = host;
+    view.index = index;
+    if (napi_create_bigint_uint64(env, ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_SESSION), &argv[0]) != napi_ok ||
+        (done ? (argv[1] = ta_napi_effect_data(env, &view)) == NULL
+              : napi_create_double(env, (double)ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_FLAGS), &argv[1]) != napi_ok) ||
+        napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok)
         ta_napi_keep_error(env, host);
     else ta_napi_follow(env, host, result);
 }
@@ -767,14 +805,13 @@ static void ta_napi_dispatch_wake(napi_env env, ta_napi_host *host, uint32_t ind
 void ta_napi_telemetry(napi_env env, ta_napi_host *host, const ta_napi_export *export) {
     napi_handle_scope scope;
     if (napi_open_handle_scope(env, &scope) != napi_ok) return;
-    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[3], result;
+    napi_value wrapper = ta_napi_self(env, host), handler = NULL, argv[2], result;
     if (wrapper != NULL) handler = ta_napi_handler_of(env, wrapper, &(ta_napi_handler_at){"telemetry", UINT32_MAX});
     if (handler == NULL) ta_napi_keep_error(env, host);
     else if (ta_napi_is(env, handler, napi_function)) {
-        argv[0] = wrapper;
-        if (napi_create_string_utf8(env, export->signal, NAPI_AUTO_LENGTH, &argv[1]) != napi_ok ||
-            napi_create_buffer_copy(env, export->data.length, export->data.pointer, NULL, &argv[2]) != napi_ok ||
-            napi_call_function(env, ta_napi_undefined(env), handler, 3, argv, &result) != napi_ok)
+        if (napi_create_string_utf8(env, export->signal, NAPI_AUTO_LENGTH, &argv[0]) != napi_ok ||
+            napi_create_buffer_copy(env, export->data.length, export->data.pointer, NULL, &argv[1]) != napi_ok ||
+            napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) != napi_ok)
             ta_napi_keep_error(env, host);
         else if (host->endings == NULL) ta_napi_follow(env, host, result); /* idle() waits for it */
         else if (
@@ -1321,8 +1358,7 @@ static void ta_napi_dispatch_invoke(napi_env env, const ta_napi_batch *batch, ui
         return;
     }
     if (handler != NULL && ta_napi_is(env, handler, napi_function)) {
-        napi_value argv[2] = {wrapper, record};
-        started = napi_call_function(env, ta_napi_undefined(env), handler, 2, argv, &result) == napi_ok &&
+        started = napi_call_function(env, ta_napi_undefined(env), handler, 1, &record, &result) == napi_ok &&
                   ta_napi_thenable(env, result, &thenable);
         if (started && thenable) {
             if (ta_napi_invocation_start(env, &invocation, result)) return;
@@ -1331,8 +1367,7 @@ static void ta_napi_dispatch_invoke(napi_env env, const ta_napi_batch *batch, ui
     }
     if (!started) { /* it does not run: kept as failed, so sends to it fail too, until the UNINVOKE */
         ta_napi_invocation_fail(env, &invocation, &(ta_napi_invocation_failure){NULL, !ta_napi_uninvoked_in_batch(batch, index)});
-        bool pending = false;
-        if (napi_is_exception_pending(env, &pending) == napi_ok && pending) ta_napi_keep_error(env, host);
+        ta_napi_handler_failed(env, &(ta_napi_handler_error){host, record});
         return;
     }
     if (!ta_napi_state_uint32(env, &(ta_napi_slot){invocation.state, TA_NAPI_INVOCATION_FLAGS, &invocation.flags})) {
@@ -1381,9 +1416,9 @@ typedef struct ta_napi_delivery {
 static bool ta_napi_service_receive(napi_env env, const ta_napi_delivery *delivery) {
     ta_napi_instance *instance = ta_napi_instance_of(env);
     ta_napi_view *view = delivery->view;
-    napi_value argv[2] = {view->wrapper, view->self}, result;
+    napi_value result;
     bool thenable = false;
-    bool ok = instance != NULL && napi_call_function(env, delivery->service, delivery->receive, 2, argv, &result) == napi_ok &&
+    bool ok = instance != NULL && napi_call_function(env, delivery->service, delivery->receive, 1, &view->self, &result) == napi_ok &&
               ta_napi_thenable(env, result, &thenable);
     if (ok && thenable) { /* filled before the ack; a rejection is a crash */
         napi_value crashed, bind, bound = NULL, then, args[3];
@@ -1431,7 +1466,7 @@ static napi_value ta_napi_service_method(napi_env env, ta_napi_method *of) {
 }
 
 /* A send to an invoked service (IO_PROCESSOR TA_NIL): its service's
- * receive(host, send), called on the service, with the send as a thin
+ * receive(send), called on the service, with the send as a thin
  * view; a service without receive, or none (done): dropped; one that
  * failed to start or crashed: the send fails with error.communication; a
  * receive that throws: the service crashed. A receive that returns a
@@ -1468,7 +1503,7 @@ static void ta_napi_dispatch_service_send(napi_env env, ta_napi_host *host, uint
 }
 
 /* TA_EFFECT_UNINVOKE: the invoker cancelled it (it left the state, or
- * ended); its entry goes, then the service's stop(host), called on the
+ * ended); its entry goes, then the service's stop(), called on the
  * service; none for one that failed or crashed. One that is starting is
  * marked uninvoked: it is stopped once it resolves. */
 static void ta_napi_dispatch_uninvoke(napi_env env, ta_napi_host *host, uint32_t index) {
@@ -1487,8 +1522,8 @@ static void ta_napi_dispatch_uninvoke(napi_env env, ta_napi_host *host, uint32_t
     }
     if (failed || starting) return;
     ta_napi_method of = {found.service, "stop", false};
-    napi_value stop = ta_napi_service_method(env, &of), argv[1] = {found.invocation.wrapper};
-    if (of.threw || (stop != NULL && napi_call_function(env, found.service, stop, 1, argv, &result) != napi_ok))
+    napi_value stop = ta_napi_service_method(env, &of);
+    if (of.threw || (stop != NULL && napi_call_function(env, found.service, stop, 0, NULL, &result) != napi_ok))
         ta_napi_keep_error(env, host);
 }
 
@@ -1505,7 +1540,7 @@ static napi_value ta_napi_invocation_settle(napi_env env, ta_napi_invocation *in
 
 /* A service handler's promise resolved with the service (bound to its
  * invocation; between turns, never inside a run). Cancelled meanwhile
- * (an UNINVOKE): its stop(host), and the sends queued for it are dropped,
+ * (an UNINVOKE): its stop(), and the sends queued for it are dropped,
  * since the invoker has gone and nothing could answer them. Done in its
  * start: nothing kept, the sends dropped, as a done service's are. Else
  * the service is kept and the queued sends given to its receive in order;
@@ -1523,11 +1558,11 @@ static napi_value ta_napi_service_started(napi_env env, napi_callback_info info)
     if (!ta_napi_invocation_of(env, argv[0], &invocation) || (queue = ta_napi_invocation_settle(env, &invocation)) == NULL)
         return NULL;
     if (invocation.host->host == NULL) return ta_napi_undefined(env); /* closed: dropped, not started */
-    napi_value service = argv[1], args[1] = {invocation.wrapper};
+    napi_value service = argv[1];
     if (invocation.flags & TA_NAPI_INVOCATION_UNINVOKED) { /* cancelled while it started: stopped now */
         ta_napi_method of = {service, "stop", false};
         napi_value stop = ta_napi_service_method(env, &of);
-        if (!of.threw && stop != NULL) napi_call_function(env, service, stop, 1, args, &result);
+        if (!of.threw && stop != NULL) napi_call_function(env, service, stop, 0, NULL, &result);
         return NULL; /* undefined, or what stop threw, thrown on */
     }
     if (invocation.flags & TA_NAPI_INVOCATION_ENDED) return ta_napi_undefined(env); /* done in its start */
@@ -1622,7 +1657,9 @@ void ta_napi_dispatch(napi_env env, const ta_napi_batch *batch, uint32_t index) 
     }
     case TA_HOST_EFFECT_TRACES: ta_napi_take(env, host, true); break;
     case TA_HOST_EFFECT_LOGS: ta_napi_take(env, host, false); break;
-    default: /* DONE, ERROR: no application callback; SEGMENT_FREED: dropped, the host keeps the
+    case TA_EFFECT_DONE:
+    case TA_EFFECT_ERROR: ta_napi_dispatch_end(env, host, index); break;
+    default: /* SEGMENT_FREED: dropped, the host keeps the
                 images, the addon none; a NOTIFICATION it does not know (none is defined); the
                 rest has no API yet */
         break;
@@ -1630,9 +1667,26 @@ void ta_napi_dispatch(napi_env env, const ta_napi_batch *batch, uint32_t index) 
     napi_close_escapable_handle_scope(env, scope);
 }
 
+/* view.host, record.host: the Host that handed it out, open or closed. */
+static napi_value ta_napi_view_host(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    napi_value self = NULL;
+    ta_napi_view view;
+    if (napi_get_cb_info(env, info, &argc, NULL, &self, NULL) != napi_ok || !ta_napi_view_of(env, self, &view)) return NULL;
+    return view.wrapper;
+}
+
+static napi_value ta_napi_invocation_host(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    napi_value self = NULL;
+    ta_napi_invocation invocation;
+    if (napi_get_cb_info(env, info, &argc, NULL, &self, NULL) != napi_ok || !ta_napi_invocation_of(env, self, &invocation))
+        return NULL;
+    return invocation.wrapper;
+}
+
 napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
     ta_napi_instance *instance = ta_napi_instance_of(env);
-    (void)exports;
     if (instance == NULL) return napi_pending_exception;
     napi_property_attributes getter = napi_configurable; /* as a class's accessor: not enumerable */
     napi_property_descriptor send[] = {
@@ -1646,6 +1700,7 @@ napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
         {"traceparent", NULL, NULL, ta_napi_view_get, NULL, NULL, getter,
          TA_NAPI_GETTER(TA_NAPI_KIND_SEND, TA_NAPI_SEND_TRACEPARENT)},
         {"message", NULL, NULL, ta_napi_send_message, NULL, NULL, getter, NULL},
+        {"host", NULL, NULL, ta_napi_view_host, NULL, NULL, getter, NULL},
         {"answer", NULL, ta_napi_send_answer, NULL, NULL, NULL, napi_default_method, NULL},
         {"fail", NULL, ta_napi_send_fail, NULL, NULL, NULL, napi_default_method, NULL},
     };
@@ -1653,6 +1708,7 @@ napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
         {"session", NULL, NULL, ta_napi_view_get, NULL, NULL, getter, TA_NAPI_GETTER(TA_NAPI_KIND_ENTRY, TA_NAPI_ENTRY_SESSION)},
         {"label", NULL, NULL, ta_napi_view_get, NULL, NULL, getter, TA_NAPI_GETTER(TA_NAPI_KIND_ENTRY, TA_NAPI_ENTRY_LABEL)},
         {"text", NULL, NULL, ta_napi_view_get, NULL, NULL, getter, TA_NAPI_GETTER(TA_NAPI_KIND_ENTRY, TA_NAPI_ENTRY_TEXT)},
+        {"host", NULL, NULL, ta_napi_view_host, NULL, NULL, getter, NULL},
     };
     napi_property_descriptor migrated[] = {
         {"session", NULL, NULL, ta_napi_view_get, NULL, NULL, getter,
@@ -1662,6 +1718,7 @@ napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
         {"chart", NULL, NULL, ta_napi_view_get, NULL, NULL, getter, TA_NAPI_GETTER(TA_NAPI_KIND_MIGRATED, TA_NAPI_MIGRATED_CHART)},
         {"migration", NULL, NULL, ta_napi_view_get, NULL, NULL, getter,
          TA_NAPI_GETTER(TA_NAPI_KIND_MIGRATED, TA_NAPI_MIGRATED_MIGRATION)},
+        {"host", NULL, NULL, ta_napi_view_host, NULL, NULL, getter, NULL},
     };
     napi_property_descriptor invocation[] = {
         {"session", NULL, NULL, ta_napi_invocation_get, NULL, NULL, getter, (void *)(uintptr_t)TA_NAPI_INVOCATION_SESSION},
@@ -1672,6 +1729,7 @@ napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
         {"traceparent", NULL, NULL, ta_napi_invocation_get, NULL, NULL, getter, (void *)(uintptr_t)TA_NAPI_INVOCATION_TRACEPARENT},
         {"restored", NULL, NULL, ta_napi_invocation_get, NULL, NULL, getter, (void *)(uintptr_t)TA_NAPI_INVOCATION_GET_RESTORED},
         {"running", NULL, NULL, ta_napi_invocation_get, NULL, NULL, getter, (void *)(uintptr_t)TA_NAPI_INVOCATION_GET_RUNNING},
+        {"host", NULL, NULL, ta_napi_invocation_host, NULL, NULL, getter, NULL},
         {"sendBack", NULL, ta_napi_invocation_send_back, NULL, NULL, NULL, napi_default_method, NULL},
         {"done", NULL, ta_napi_invocation_done, NULL, NULL, NULL, napi_default_method, NULL},
     };
@@ -1680,6 +1738,8 @@ napi_status ta_napi_effects_define(napi_env env, napi_value exports) {
     napi_status status = napi_define_class(env, "Send", NAPI_AUTO_LENGTH, ta_napi_view_construct, NULL,
                                            sizeof send / sizeof send[0], send, &send_class);
     if (status == napi_ok) status = napi_create_reference(env, send_class, 1, &instance->send);
+    /* the direct layer's: the application layer gives a Send its sender */
+    if (status == napi_ok) status = napi_set_named_property(env, exports, "Send", send_class);
     napi_value prototype;
     if (status == napi_ok) status = napi_get_named_property(env, send_class, "prototype", &prototype);
     if (status == napi_ok) status = ta_napi_arities(env, prototype, (const ta_napi_arity[]){{"answer", 3}, {NULL, 0}});

@@ -65,7 +65,9 @@ module WebModule
 
   def target = Toolchain::Target.zig('wasm32-wasi')
 
-  def layer_sources = SOURCES.glob('*.c').sort
+  # The layer's own C, and the addon's language-free C it shares
+  # (src/traces.c: decodeTraces).
+  def layer_sources = [*SOURCES.glob('*.c'), NodeAPI::ROOT.join('src/traces.c')].sort
 
   # The realm's script as REALM_MODULE, written only when it changes.
   def embed_realm
@@ -102,7 +104,7 @@ module WebModule
     txml = compile(NodeAPI::TXML.join('txml.c'), BUILD.join('objects/txml/txml.o'),
                    flags: [*TXML_FLAGS, '-g0', "-I#{NodeAPI::TXML}"], inputs: [NodeAPI::TXML.join('txml.h')])
     variant = probe ? 'probe' : 'layer'
-    headers = [*SOURCES.glob('*.h'), *core_headers, NodeAPI::TXML.join('txml.h')]
+    headers = [*SOURCES.glob('*.h'), NodeAPI::ROOT.join('src/traces.h'), *core_headers, NodeAPI::TXML.join('txml.h')]
     own = layer_sources.map do |source|
       compile(source, BUILD.join("objects/#{variant}", source.basename.sub_ext('.o')),
               flags: [*LAYER_FLAGS, '-g0', *(probe ? %w[-DTA_WEB_STACK_PROBE] : []), "-I#{NodeAPI::CORE_BUILD}",

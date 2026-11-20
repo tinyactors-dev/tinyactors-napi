@@ -1,7 +1,10 @@
 # Capacity and memory
 
-A host keeps its actors in blocks of memory it sizes from the config,
-one block (a **region**) per segment, that is per `addImage`. You can
+This guide is part of operating a host (the README's [Operating a
+host](../../README.md#operating-a-host)).
+
+A host keeps its actors in blocks of memory it sizes from its `config`,
+one block (a **region**) per segment, that is per image. You can
 leave the sizes to the host, which grows a region when something in it
 runs out, or size a host up front for the population you expect. This
 guide says what the sizes are, how a region grows, how to read what a
@@ -9,7 +12,7 @@ host uses, and what an actor costs.
 
 ## The sizes
 
-The config's `system` map gives each new segment its first sizes. Each
+The `config` option's `system` map gives each new segment its first sizes. Each
 key is a whole number; an absent key, or 0, is the default:
 
 | Key | Default | What it counts |
@@ -37,7 +40,7 @@ the system allocator refuses the memory.
 
 `host.hostStats` ([Inspecting a host](inspection.md)) answers with
 `pools`, an array of one entry per live segment, in segment order. Each
-entry has its `segment` (the number `addImage` returned) and, for
+entry has its `segment` (the image's number: its place among `new Host`'s charts, or what `addImage` returned) and, for
 `actors`, `events`, `timers`, `workspaces`, `requests` and `slabBytes`
 (the instance and string memory), the pool's `capacity`, what it holds
 now (`used`) and the most it held at once (`highWater`). Each segment
@@ -54,10 +57,9 @@ const image = compiled.image;
 compiled.close();
 
 for (const system of [{}, { maxActors: 1000 }]) {
-  const host = new Host({ systemID: 'demo', system });
-  host.addImage(image);
+  const host = new Host(image, { system: 'demo', config: { system } });
   const before = (await host.hostStats()).pools[0].actors;
-  for (let i = 0; i < 1000; i++) host.spawn(host.chart('idle'));
+  for (let i = 0; i < 1000; i++) host.spawn('idle');
   const after = (await host.hostStats()).pools[0].actors;
   console.log(`maxActors ${system.maxActors ?? 'default'}: capacity ${before.capacity}, ` +
     `then ${after.used} used, high water ${after.highWater}, grown: ${after.capacity > before.capacity}`);
@@ -96,10 +98,10 @@ import { Host } from '@tinyactors/node';
 const N = 2_000_000; // actors
 const R = 1000;      // resident at most
 const room = 64;
-const host = new Host({ systemID: 'big', system: {
+const host = new Host([], { system: 'big', config: { system: {
   maxActors: N + room, maxEvents: 4096,
   instanceBytes: 2048 * (R + room), stringBytes: 16384 + 64 * (R + room),
-} });
+} } });
 console.log((await host.hostConfig()).system.maxActors);
 host.close();
 ```
@@ -134,9 +136,10 @@ hundreds of thousands of quickjs actors resident raises it
 rest of resident is mostly the engine's fixed cost, which a larger
 population spreads thinner: at 40,000 actors the native datamodel is
 about 750 bytes resident on Node.js and 970 on Bun. The region here was
-sized up front (`maxActors`). A chart whose scripts declare top-level
-names costs a `vm` context per actor on top: about 143 KB on Node.js and
-60 KB on Bun ([Writing charts](charts.md#scripts)). A hibernated actor
+sized up front (`maxActors`). What a chart's scripts declare adds
+nothing per actor: its helpers are the chart's, made once, and a
+top-level `var` is one more variable ([Writing charts](charts.md#scripts)).
+A hibernated actor
 costs about 60 bytes in the host and its blob in your store.
 
 ## Work does not grow with the population
@@ -166,7 +169,7 @@ resident, 20,000 and 40,000 actors each running an invoked service.
 | send (hibernated: woken from the store) | µs per call | 34.97 → 30.14 (0.86) | 33.20 → 40.71 (1.23) | 27.13 → 29.38 (1.08) | 34.26 → 35.97 (1.05) |
 | hibernate | µs per call | 5.94 → 5.78 (0.97) | 4.50 → 4.55 (1.01) | 4.22 → 4.20 (0.99) | 4.37 → 4.32 (0.99) |
 | wake | µs per call | 7.07 → 7.34 (1.04) | 3.84 → 4.02 (1.05) | 7.93 → 7.57 (0.95) | 4.85 → 4.75 (0.98) |
-| actorByName | µs per call | 0.532 → 0.507 (0.95) | 0.415 → 0.426 (1.03) | 0.426 → 0.415 (0.98) | 0.304 → 0.300 (0.99) |
+| actor (by name; measured as actorByName, its direct call) | µs per call | 0.532 → 0.507 (0.95) | 0.415 → 0.426 (1.03) | 0.426 → 0.415 (0.98) | 0.304 → 0.300 (0.99) |
 | actorState | µs per call | 4.63 → 4.38 (0.95) | 4.34 → 4.80 (1.11) | 4.13 → 4.37 (1.06) | 3.95 → 4.20 (1.06) |
 | hostStats | µs per call | 19.28 → 19.47 (1.01) | 19.32 → 19.76 (1.02) | 19.45 → 16.84 (0.87) | 14.51 → 14.14 (0.97) |
 | I/O processor round trip | µs per call | 13.30 → 12.54 (0.94) | 8.47 → 8.33 (0.98) | 9.89 → 9.46 (0.96) | 7.88 → 6.48 (0.82) |

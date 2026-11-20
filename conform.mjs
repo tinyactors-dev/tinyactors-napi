@@ -19,6 +19,7 @@ import process from 'node:process';
 import {
   CompileError,
   Host,
+  MemoryStore,
   ResolveError,
   SimulatedClock,
   TinyactorsError,
@@ -118,7 +119,7 @@ function resolverOf(documents) {
 function compileImage(host, charts, documents) {
   const compiled = compileCharts(
     charts.map(({ name, text }) => ({ name, text })),
-    resolverOf(documents),
+    { resolver: resolverOf(documents) },
   );
   try {
     return host.addImage(compiled.image);
@@ -142,6 +143,43 @@ function wire(value) {
     return out;
   }
   return value;
+}
+
+// An I/O processor a protocol vector's config declares: every send to it
+// fails (error.communication), as the vectors expect of a processor nobody
+// serves.
+class Endpoint {
+  constructor(location) {
+    if (location !== undefined) this.location = location;
+  }
+
+  receive(send) {
+    send.fail();
+  }
+}
+
+// A protocol vector's whole config as Host's options: system, ioProcessors
+// and the rest of the config. Host takes the system id and the I/O
+// processors apart from the config (an object of processors by type), so
+// a config whose shape those options cannot hold (not a map, an
+// ioProcessors that is not a list of maps with a type and at most a
+// location) is no config the binding can send: the suite marks such vectors
+// "only reference", and the adapter refuses one as the driver's own error
+// rather than writing core's (docs/driver.md, "Kinds").
+function hostOptions(config) {
+  const cannot = (path) => new DriverError(-32602, 'type', `params.config${path}`, 'a config Host\'s options cannot hold (a reference-only case)');
+  if (config === null || typeof config !== 'object' || Array.isArray(config) || config instanceof Uint8Array) throw cannot('');
+  const { systemID, ioProcessors: entries, ...rest } = config;
+  const options = { system: systemID, config: rest };
+  if (entries === undefined) return options;
+  if (!Array.isArray(entries)) throw cannot('.ioProcessors');
+  options.ioProcessors = {};
+  entries.forEach((entry, index) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.type !== 'string' ||
+      Object.keys(entry).some((key) => key !== 'type' && key !== 'location')) throw cannot(`.ioProcessors[${index}]`);
+    options.ioProcessors[entry.type] = new Endpoint(entry.location);
+  });
+  return options;
 }
 
 class Adapter {
@@ -172,12 +210,12 @@ class Adapter {
   'host.create'(params) {
     if (this.host !== null) throw new DriverError(-32002, 'state', '', 'a host already: call host.free first');
     const options = engine(params);
-    const config = decode(required(params, 'config'));
+    const config = hostOptions(decode(required(params, 'config')));
     const clock = new SimulatedClock();
     const sends = [];
     // A send to another system: kept for host.run, its data written for the
     // wire (no data reads as undefined, written as null).
-    const transport = (host, send) => {
+    const transport = (send) => {
       sends.push({
         target: send.target.text,
         event: send.event,
@@ -186,7 +224,7 @@ class Adapter {
       });
     };
     try {
-      this.host = new Host(config, { ...options, clock, transport });
+      this.host = new Host([], { ...config, ...options, clock, transport });
     } catch (error) {
       const result = { status: statusOf(error) };
       if (error instanceof TinyactorsError && error.code !== undefined) result.error = encode({ error: errorMap(error) });
@@ -219,8 +257,8 @@ class Adapter {
     try {
       host[typed](
         given,
-        (_, result) => answered.push({ result }),
-        (_, error) => answered.push({ error: errorMap(error) }),
+        (result) => answered.push({ result }),
+        (error) => answered.push({ error: errorMap(error) }),
       );
     } catch (error) {
       return { status: statusOf(error) };
@@ -250,7 +288,7 @@ class Adapter {
     const host = this.needHost();
     let session;
     try {
-      session = host.spawn(host.chart(required(params, 'chart')), { params: params.params });
+      session = host.spawn(host.chart(required(params, 'chart')), { params: params.params }).id;
     } catch (error) {
       return { status: statusOf(error) };
     }
@@ -322,7 +360,7 @@ class Refused extends Error {}
 class Judge {
   constructor() {
     this.outcome = undefined;
-    this.log = (host, entry) => {
+    this.log = (entry) => {
       if (this.outcome === undefined && entry.label === 'Outcome') this.outcome = entry.text === 'pass' ? 'pass' : 'fail';
     };
   }
@@ -332,7 +370,7 @@ class Judge {
 // on a simulated clock, the steps' calls, the turns until idle after each,
 // and the first Outcome log.
 class Scenario {
-  static CONFIG = { systemID: 'conformance', system: { ticksPerSecond: 1000 } };
+  static CONFIG = { system: 'conformance', config: { system: { ticksPerSecond: 1000 } } };
 
   constructor(documents, options) {
     this.documents = documents;
@@ -340,21 +378,17 @@ class Scenario {
     this.aliases = new Map();
     this.judge = new Judge();
     this.clock = new SimulatedClock();
-    this.blobs = new Map(); // the implementation's store (driver.md): hibernated actors' blobs
+    this.store = new MemoryStore(); // the implementation's store (driver.md): hibernated actors' blobs
     this.snapshots = new Map(); // the snapshots the steps took, by name
     this.migrationsDone = []; // the results migrationDone got
-    this.migrationDone = (host, result) => this.migrationsDone.push(result);
-    this.wake = (host, session) => {
-      host.wake(session, this.blobs.get(session)); // WAKE: the actor's blob from the store
-      this.blobs.delete(session);
-    };
+    this.migrationDone = (result) => this.migrationsDone.push(result);
     this.host = null;
   }
 
   // "@alias" at any depth: that actor's address.
   value(value) {
     if (typeof value === 'string' && value.startsWith('@') && this.aliases.has(value.slice(1))) {
-      return `#_scxml_${this.aliases.get(value.slice(1))}`;
+      return `#_scxml_${this.aliases.get(value.slice(1)).id}`;
     }
     if (Array.isArray(value)) return value.map((item) => this.value(item));
     if (value !== null && typeof value === 'object' && !ArrayBuffer.isView(value)) {
@@ -365,11 +399,11 @@ class Scenario {
 
   // The host's options: the datamodel asked for, and the scenario's handlers.
   hostOptions() {
-    return { ...this.options, log: this.judge.log, clock: this.clock, wake: this.wake, migrationDone: this.migrationDone };
+    return { ...Scenario.CONFIG, ...this.options, log: this.judge.log, clock: this.clock, store: this.store, migrationDone: this.migrationDone };
   }
 
   async run(steps) {
-    this.host = new Host(Scenario.CONFIG, this.hostOptions());
+    this.host = new Host([], this.hostOptions());
     try {
       for (const step of steps) {
         try {
@@ -399,8 +433,7 @@ class Scenario {
       if (missing.length > 0) throw new Refused(`image names documents the call does not have: ${missing.join(', ')}`);
       compileImage(host, step.image.map((name) => named.get(name)), this.documents);
     } else if ('spawn' in step) {
-      const session = host.spawn(host.chart(step.chart), { name: step.spawn, params: this.value(step.params) });
-      this.aliases.set(step.spawn, session);
+      this.aliases.set(step.spawn, host.spawn(step.chart, { name: step.spawn, params: this.value(step.params) }));
     } else if ('send' in step) {
       host.send(this.session(step.send), step.event, this.value(step.data));
     } else if ('sendMany' in step) {
@@ -413,13 +446,13 @@ class Scenario {
     } else if ('advance' in step) {
       this.clock.increment(Number(step.advance)); // ticksPerSecond 1000: ticks are milliseconds
     } else if ('hibernate' in step) {
-      const session = this.session(step.hibernate);
-      this.blobs.set(session, host.hibernate(session));
+      const actor = this.session(step.hibernate);
+      this.store.save(actor.id, host.hibernate(actor));
     } else if ('snapshot' in step) {
       this.snapshots.set(step.snapshot, host.snapshot());
     } else if ('restore' in step) {
       if (!this.snapshots.has(step.restore)) throw new Refused(`a restore of a snapshot no step took: ${step.restore}`);
-      const restored = Host.restore(this.snapshots.get(step.restore), Scenario.CONFIG, this.hostOptions());
+      const restored = Host.restore(this.snapshots.get(step.restore), [], this.hostOptions());
       host.close();
       this.host = restored; // a restart: the restored host replaces the running one
     } else if ('migrate' in step) {
@@ -483,11 +516,7 @@ function form(data) {
 class W3C {
   static LOCATION = 'http://localhost:8080/scxml';
   static BASIC_HTTP = 'http://www.w3.org/TR/scxml/#BasicHTTPEventProcessor';
-  static CONFIG = {
-    systemID: 'w3c',
-    system: { ticksPerSecond: 1000, maxEvents: 1024, maxActors: 64 },
-    ioProcessors: [{ type: W3C.BASIC_HTTP, location: W3C.LOCATION }],
-  };
+  static CONFIG = { system: 'w3c', config: { system: { ticksPerSecond: 1000, maxEvents: 1024, maxActors: 64 } } };
   static ROUNDS = 200;
 
   constructor(documents, options) {
@@ -499,7 +528,7 @@ class W3C {
   // A send to BasicHTTP: written as a POST by core's codec, read back as an
   // incoming request, and delivered to its sender; a send to another
   // target, or one that cannot be written, fails.
-  post(host, send) {
+  post(send) {
     const target = send.target ?? '';
     if (!target.startsWith(W3C.LOCATION)) {
       send.fail();
@@ -521,9 +550,10 @@ class W3C {
   async run() {
     const charts = this.documents.filter((document, index) => index === 0 || document.name.endsWith('.scxml'));
     const clock = new SimulatedClock();
-    const host = new Host(W3C.CONFIG, {
+    const host = new Host([], {
+      ...W3C.CONFIG,
       ...this.options,
-      ioProcessors: { [W3C.BASIC_HTTP]: (h, send) => this.post(h, send) },
+      ioProcessors: { [W3C.BASIC_HTTP]: { location: W3C.LOCATION, receive: (send) => this.post(send) } },
       log: this.judge.log,
       clock,
     });

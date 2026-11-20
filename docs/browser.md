@@ -46,7 +46,7 @@ Playwright 1.56.1); the programs are in `tools/spikes/browser/`.
 | Download | built: 137 KiB brotli at `-Oz` (core, the compiler, txml and our C layer; 166 KiB at `-O2`); quickjs later as a second module, about 300 KB brotli more | "Sizes" |
 | Boundary | 5 to 11 ns a call either way, against 75 to 210 ns for a Node-API call; a short string 50 to 600 ns depending on how it is copied | "Boundary costs" |
 | Memory growth | no view of linear memory outlives a call that can allocate: the layer re-derives its views when one reads `byteLength === 0` (1 to 2.4 ns); nothing the application holds is a view | "Memory" |
-| Native datamodel | one shared realm per host (a hidden iframe on a page, `node:vm` in node and bun, the worker's own global in a Worker); a chart that declares nothing: a scope per session, as the addon (49 B); a declaring chart, `var` or lexical: one session function per chart, made once from its chart-level scripts' text, called once per session (634 B, 3.6 us in Chromium), never an iframe per session; what it cannot match is refused at attach or reported, never a silent difference | "The native datamodel without node:vm" |
+| Native datamodel | one shared realm per host (a hidden iframe on a page, `node:vm` in node and bun, the worker's own global in a Worker); a scope per session, as the addon (49 B); a chart-level script's functions the chart's helpers, a top-level `var` the session's, `let`, `const` and `class` refused, as the addon (2026-11-19, replacing M2's session function per declaring chart) | "The native datamodel without node:vm" |
 | CSP | the module needs `'wasm-unsafe-eval'`, the native datamodel `'unsafe-eval'`; without it, under a CSP `sandbox`, or with Trusted Types enforced, a host on the native datamodel is refused at creation (`TA_ERROR_UNSUPPORTED`, the message naming the directive) and quickjs (later) is the way | spike, "CSP" |
 | Exceptions | every import catches and returns a status; an exception that escapes into wasm, or a `WebAssembly.RuntimeError`, poisons the instance, and every host on it refuses with a fault naming the cause; the stack size is set explicitly | the refuter's spike: 1,000 throws leaked 256 KB of shadow stack |
 | Values | CBOR is read and written by core's `ta_cbor_reader` and `ta_cbor_writer` in C, one token per call, and JavaScript makes the values; payloads of the native datamodel are never encoded (a row in `ta_table`, the value at its slot in a JavaScript array, as the addon) | "How values cross" |
@@ -82,10 +82,7 @@ Following [docs/roles.md](../../docs/roles.md):
     each crossing costs 5 to 11 ns where a Node-API call costs 75 to 210
     ns, so the JavaScript side may be cheaper than the addon's
     (unverified until p5-api's benchmark);
-  - *per actor:* the same as the addon for a chart that declares nothing
-    (a scope object); about 634 B for a declaring chart's session (its
-    session function's call), against the addon's 60 to 143 KB `node:vm`
-    context;
+  - *per actor:* the same as the addon (a scope object);
   - *memory:* linear memory never shrinks, so a page keeps its peak
     (core's `allocator_wasm.c`; bindings.md section 11);
   - *API surface:* none: the same `index.d.ts`;
@@ -417,10 +414,9 @@ scheduler:
 ## The native datamodel without node:vm
 
 The addon evaluates charts in `node:vm` contexts, never the
-application's realm: one shared context per host for charts that declare
-nothing at the top of their scripts (a scope object per session), a
-context per session for charts that declare (AGENTS.md, "The native
-"ecmascript" datamodel"). A browser has no `node:vm`.
+application's realm: one shared context per host, a scope object per
+session (AGENTS.md, "The native "ecmascript" datamodel"). A browser has
+no `node:vm`.
 
 **The host's shared realm** (decided, M3):
 
@@ -434,51 +430,21 @@ Not chosen: a Worker per realm (the vtable is synchronous and a page's
 thread cannot `Atomics.wait`); `ShadowRealm` (absent from Chromium 141
 and node 22, and only primitives and callables cross it).
 
-**Sessions** (decided, M2):
-
-- **A chart that declares nothing:** a scope object per session in the
-  shared realm, the addon's code path (49 B).
-- **A declaring chart, whatever it declares:** one session function per
-  chart, made at `chart_attach` from the text of its chart-level scripts
-  with the realm's `Function` (no parser of ours: the engine compiles
-  it), called once per session; its generator runs the session's
-  evaluations as direct `eval`s that see the function's `let`, `const`,
-  `class`, `var` and `function` bindings ("Realms": 634 B and 3.6 us a
-  session in Chromium). No iframe per session, on a page or in a Worker.
-  Expressions are evaluated strict, as the addon's are, so an undeclared
-  assignment in one throws. Whether each distinct expression is compiled
-  once per session into a closure (faster: node's direct `eval` costs
-  1.9 us) or evaluated as a direct `eval` each time is measured in
-  p5-datamodel.
-- **Hibernation, migration and snapshots** as the addon: a `var` and
-  `function` chart's variables are read by name in the session and set
-  again after a restore that runs the function with `throw 0` ahead; a
-  chart that declares with `let`, `const` or `class` refuses hibernation
-  with the addon's message (its sessions stay resident: the addon does
-  the same, `addon-declaring.mjs`).
-- **Where it cannot match the addon, it says so; it never differs
-  silently:**
-  - a chart that declares `eval`, `arguments` or a name with the prefix
-    `__tinyactors_` is refused at attach, the message naming it (the
-    engine's `SyntaxError` for a lexical clash, a check of the scratch
-    session's `eval` and `arguments` for the rest); the function's own
-    `arguments` is shadowed by its prologue;
-  - a chart-level script that throws: the session's `error.execution`
-    says that the chart-level scripts after it did not run (the addon
-    runs them);
-  - an undeclared sloppy assignment in a script lands on the host's
-    shared realm, as it does for the addon's charts that declare nothing;
-    since that name is not the session's, `hibernate` and `snapshot`
-    compare the realm's global names with its baseline (one count, at
-    those calls only) and refuse with `TA_ERROR_UNSUPPORTED` naming the
-    new names, so no state is lost without a word. The README says to
-    declare variables.
-
-Which kind a chart is, is asked of the engine at `chart_attach` as the
-addon asks it (the scripts after `throw 0;` in a scratch realm). The
-suite has one declaring chart (a `var`), the addon's tests have `let` and
-`const` ones (`test/datamodel.test.mjs:148`,
-`test/hibernation.test.mjs:274`).
+**Sessions** (2026-11-19, the maintainer: "cut the declaring-chart
+context, keep native as default"; it replaces M2's session function per
+declaring chart, below in "As built" and in "Realms", a record): a scope
+object per session in the shared realm, the addon's code path (49 B),
+whatever the chart's scripts declare. What a script declares is asked of
+the engine by `realm.js`'s `script`, shared with the addon (a candidate
+name is declared when the script followed by `let <name>` does not parse
+as a strict function body, lexically when the script followed by `var
+<name>` does not either, a function when `typeof` reads one before any
+statement runs): a chart-level script's functions are the chart's
+helpers, made once on its scopes' prototype; a top-level `var` is a
+variable of the session, read from the scope before the script runs and
+written back after; a top-level `let`, `const` or `class` refuses the
+script (its `error.execution`), and `compileCharts` warns of it.
+Hibernation, migration and snapshots have one path, the addon's.
 
 **CSP** (decided, with M3). The native datamodel evaluates chart text,
 so it needs `'unsafe-eval'`; the module itself needs `'wasm-unsafe-eval'`
@@ -494,7 +460,7 @@ nothing run, and is skipped under such a policy, which the README says.
 quickjs (p5-quickjs) is the datamodel for such a page, in a second module
 that a page without it does not download (bindings.md section 11).
 
-**As built (p5-datamodel,** `wasm/lib/datamodel.mjs`, `wasm/lib/realms.mjs`;
+**As built before 2026-11-19 (p5-datamodel,** `wasm/lib/datamodel.mjs`, `wasm/lib/realms.mjs`;
 docs/log.xml, `l-p5-datamodel-*`): the session function is a generator
 made inside `with (scope)` (the session's system variables and `_event`),
 declaring the `<data>` ids, the `<foreach>` names and the vars of the
@@ -511,9 +477,10 @@ less than the addon's (3.7 against 5.0 us on node, 2.7 against 3.7 us on
 bun), its resident memory above the addon's being mostly a fixed cost, V8's
 code for the module (`l-p5-datamodel-benchmark`).
 
-**Observation, out of scope:** the generator works in `node:vm` too, so
-the addon could give a declaring session a few hundred bytes instead of
-a context of 60 to 143 KB. It is not proposed here.
+**Observation, out of scope then:** the generator works in `node:vm`
+too, so the addon could give a declaring session a few hundred bytes
+instead of a context of 60 to 143 KB. Both packages dropped declaring
+sessions instead (2026-11-19, "Sessions" above).
 
 ## Lifetimes
 
@@ -540,11 +507,11 @@ a context of 60 to 143 KB. It is not proposed here.
   subclass), and `HostOptions.datamodel`'s note names the realm per
   runtime; nothing else in it is Node's (`grep Buffer index.d.ts`: lines
   9, 176, 643, 1118, 1127, 1150).
-- **The same exports,** `directoryResolver` included: in the wasm package
-  it uses `node:fs` and `node:path` through `process.getBuiltinModule`
-  where they exist (node, bun) and throws `TinyactorsError` with
-  `TA_ERROR_UNSUPPORTED` at the call where they do not
-  (`l-p3-shapes-browser`).
+- **The same exports,** `compileDir` and `SQLiteStore` included: in the
+  wasm package they use `node:fs`, `node:path`, `node:url` and the
+  runtime's SQLite through `process.getBuiltinModule` where they exist
+  (node, bun) and throw `TinyactorsError` with `TA_ERROR_UNSUPPORTED` at
+  the call where they do not (`l-p3-shapes-browser`).
 - **The convenience layer is one file.** `lib/convenience.mjs` imports
   `#direct`, a subpath import each package's `package.json` maps to its
   direct layer (the addon's `lib/direct.mjs`, the wasm package's own),

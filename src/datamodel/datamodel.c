@@ -2,10 +2,9 @@
  * AGENTS.md, "The native "ecmascript" datamodel"; structured as
  * tinyactors-cpython/src/datamodel/datamodel.c, sharing no code or text with
  * quickjs's datamodel). A chart is a row holding its record (datamodel.h);
- * a session a row whose scope, a scope made by its chart's constructor in
- * the shared context or, for a chart whose scripts declare, the record of
- * a context of its own, is the element at the row's slot of the host's
- * one `scopes` array (rows.c). Every entry opens a handle
+ * a session a row whose scope, made by its chart's constructor in the
+ * shared context, is the element at the row's slot of the host's one
+ * `scopes` array (rows.c). Every entry opens a handle
  * scope of its own (a run is one native call: handles would pile up until
  * it returns); an expression that throws is TA_ERROR_EXECUTION. Values
  * cross by copy, made with the receiving context's constructors (the
@@ -95,19 +94,12 @@ static bool ta_napi_evaluation_of(const ta_datamodel_call *call, ta_napi_evaluat
     if (chart == NULL) return false;
     evaluation->row = *chart;
     evaluation->chart = &evaluation->row;
-    napi_value held = ta_napi_slot_value(native, &(ta_napi_slot){&native->scopes, call->instance}), shared;
-    if (held == NULL || (evaluation->record = ta_napi_native_get(native, chart->functions)) == NULL) return false;
-    if (chart->flags & TA_NAPI_CHART_DECLARES) {
-        evaluation->own = held;
-        if (napi_get_element(env, held, TA_NAPI_OWN_KIT, &evaluation->kit) != napi_ok ||
-            napi_get_named_property(env, evaluation->kit, "global", &evaluation->scope) != napi_ok)
-            return false;
-    } else {
-        evaluation->scope = held;
-        if ((shared = ta_napi_realm_shared(native)) == NULL ||
-            napi_get_element(env, shared, TA_NAPI_REALM_KIT, &evaluation->kit) != napi_ok)
-            return false;
-    }
+    napi_value shared;
+    if ((evaluation->scope = ta_napi_slot_value(native, &(ta_napi_slot){&native->scopes, call->instance})) == NULL ||
+        (evaluation->record = ta_napi_native_get(native, chart->functions)) == NULL ||
+        (shared = ta_napi_realm_shared(native)) == NULL ||
+        napi_get_element(env, shared, TA_NAPI_REALM_KIT, &evaluation->kit) != napi_ok)
+        return false;
     if (call->environment != NULL) ta_datamodel_environment_charge(call->environment, 1); /* fuel once per evaluation */
     return true;
 }
@@ -187,33 +179,78 @@ static napi_value ta_napi_chart_names(napi_env env, const ta_datamodel_chart *ch
     return names;
 }
 
-/* A chart's record (datamodel.h): its scopes' constructor in the shared
- * context (none for a declaring chart), its caches, its names. */
-typedef struct ta_napi_record_of {
+/* A chart's scripts, asked of the kit (its `script`) at chart_attach: each
+ * script's head and tail, or its refusal, kept in `scripts` by expression;
+ * the vars each declares appended to `names`, the session's variables; a
+ * chart-level script's functions, with its source, appended to `helpers`
+ * (the chart's helpers, made by the kit's `shape`). */
+typedef struct ta_napi_scripts_of {
     const ta_datamodel_chart *chart;
-    const ta_napi_chart_of *declaring;
-    napi_value names;
-} ta_napi_record_of;
+    napi_value kit;
+    napi_value names, scripts, helpers; /* arrays, appended to */
+} ta_napi_scripts_of;
 
-static napi_value ta_napi_chart_record(ta_napi_native *native, const ta_napi_record_of *of) {
-    napi_env env = native->host->env;
-    napi_value record, slot, shape, shared, kit;
-    if (napi_create_array_with_length(env, TA_NAPI_CHART_RECORD, &record) != napi_ok) return NULL;
-    bool declares = of->declaring->declares;
-    if (napi_get_undefined(env, &shape) != napi_ok) return NULL;
-    if (!declares) {
-        if ((shared = ta_napi_realm_shared(native)) == NULL || napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
-            (shape = ta_napi_kit(env, kit, &(ta_napi_kit_call){"shape", 1, {of->names}})) == NULL)
-            return NULL;
+static bool ta_napi_append(napi_env env, napi_value array, napi_value value) {
+    uint32_t length = 0;
+    return napi_get_array_length(env, array, &length) == napi_ok && napi_set_element(env, array, length, value) == napi_ok;
+}
+
+static bool ta_napi_chart_scripts(napi_env env, const ta_napi_scripts_of *of) {
+    uint32_t count = ta_image_expression_count(of->chart->image, of->chart->chart);
+    for (uint32_t e = 0; e < count; e++) {
+        ta_expression_info info;
+        if (ta_image_expression(of->chart->image, (ta_chart_item){of->chart->chart, e}, &info) != TA_OK ||
+            (info.kind != TA_EXPRESSION_SCRIPT && info.kind != TA_EXPRESSION_GLOBAL_SCRIPT))
+            continue;
+        napi_value source, found, functions, vars, refused, part, prepared, pair;
+        napi_valuetype type = napi_undefined;
+        uint32_t length = 0;
+        if (napi_create_string_utf8(env, info.source.pointer != NULL ? info.source.pointer : "", info.source.length, &source) != napi_ok ||
+            (found = ta_napi_kit(env, of->kit, &(ta_napi_kit_call){"script", 1, {source}})) == NULL ||
+            napi_typeof(env, found, &type) != napi_ok)
+            return false;
+        if (type != napi_object) continue; /* it does not parse: its evaluation's SyntaxError */
+        if (napi_get_element(env, found, 0, &functions) != napi_ok || napi_get_element(env, found, 1, &vars) != napi_ok ||
+            napi_get_element(env, found, 2, &refused) != napi_ok || napi_typeof(env, refused, &type) != napi_ok)
+            return false;
+        if (type == napi_string) { /* refused: its evaluation's error.execution */
+            if (napi_set_element(env, of->scripts, e, refused) != napi_ok) return false;
+            continue;
+        }
+        if (napi_create_array_with_length(env, 2, &prepared) != napi_ok || napi_get_element(env, found, 3, &part) != napi_ok ||
+            napi_set_element(env, prepared, 0, part) != napi_ok || napi_get_element(env, found, 4, &part) != napi_ok ||
+            napi_set_element(env, prepared, 1, part) != napi_ok || napi_set_element(env, of->scripts, e, prepared) != napi_ok ||
+            napi_get_array_length(env, vars, &length) != napi_ok)
+            return false;
+        for (uint32_t i = 0; i < length; i++)
+            if (napi_get_element(env, vars, i, &part) != napi_ok || !ta_napi_append(env, of->names, part)) return false;
+        if (info.kind != TA_EXPRESSION_GLOBAL_SCRIPT || napi_get_array_length(env, functions, &length) != napi_ok || length == 0)
+            continue;
+        if (napi_create_array_with_length(env, 2, &pair) != napi_ok || napi_set_element(env, pair, 0, source) != napi_ok ||
+            napi_set_element(env, pair, 1, functions) != napi_ok || !ta_napi_append(env, of->helpers, pair))
+            return false;
     }
-    if (napi_set_element(env, record, TA_NAPI_CHART_SHAPE, shape) != napi_ok) return NULL;
-    for (uint32_t i = TA_NAPI_CHART_GETTERS; i < TA_NAPI_CHART_HOISTS; i++)
+    return true;
+}
+
+/* A chart's record (datamodel.h): its scopes' constructor, its caches, its
+ * scripts. */
+static napi_value ta_napi_chart_record(ta_napi_native *native, const ta_datamodel_chart *chart) {
+    napi_env env = native->host->env;
+    napi_value record, slot, shared, kit, names, helpers, shape;
+    if (napi_create_array_with_length(env, TA_NAPI_CHART_RECORD, &record) != napi_ok) return NULL;
+    for (uint32_t i = TA_NAPI_CHART_GETTERS; i < TA_NAPI_CHART_RECORD; i++)
         if (napi_create_array(env, &slot) != napi_ok || napi_set_element(env, record, i, slot) != napi_ok) return NULL;
-    /* a declaring chart's names, for each session's context: kept as the
-     * shape; its scripts' declarations, made again in a woken session's */
-    if (declares && (napi_set_element(env, record, TA_NAPI_CHART_SHAPE, of->names) != napi_ok ||
-                     napi_set_element(env, record, TA_NAPI_CHART_HOISTS, of->declaring->hoists) != napi_ok ||
-                     napi_set_element(env, record, TA_NAPI_CHART_FUNCTIONS, of->declaring->functions) != napi_ok))
+    ta_napi_scripts_of of = {chart, NULL, NULL, NULL, NULL};
+    if ((shared = ta_napi_realm_shared(native)) == NULL || napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
+        (names = ta_napi_chart_names(env, chart)) == NULL || napi_create_array(env, &helpers) != napi_ok ||
+        napi_get_element(env, record, TA_NAPI_CHART_SCRIPTS, &of.scripts) != napi_ok)
+        return NULL;
+    of.kit = kit;
+    of.names = names;
+    of.helpers = helpers;
+    if (!ta_napi_chart_scripts(env, &of) || (shape = ta_napi_kit(env, kit, &(ta_napi_kit_call){"shape", 2, {names, helpers}})) == NULL ||
+        napi_set_element(env, record, TA_NAPI_CHART_SHAPE, shape) != napi_ok)
         return NULL;
     return record;
 }
@@ -224,12 +261,9 @@ static ta_status ta_napi_chart_attach(void *datamodel, const ta_datamodel_chart 
     ta_napi_frame frame;
     if (!ta_napi_frame_open(native, NULL, &frame)) return TA_ERROR_INVALID;
     ta_status status = TA_OK;
-    ta_napi_chart_of declaring = {chart->image, chart->chart, false, false, NULL, NULL};
-    napi_value names = NULL, record = NULL;
+    napi_value record = NULL;
     napi_ref reference = NULL;
-    if (!ta_napi_realm_declares(native, &declaring) || (names = ta_napi_chart_names(env, chart)) == NULL ||
-        (record = ta_napi_chart_record(native, &(ta_napi_record_of){chart, &declaring, names})) == NULL ||
-        napi_create_reference(env, record, 1, &reference) != napi_ok)
+    if ((record = ta_napi_chart_record(native, chart)) == NULL || napi_create_reference(env, record, 1, &reference) != napi_ok)
         status = (ta_napi_failed(env), TA_ERROR_INVALID); /* a chart this datamodel cannot run */
     uint64_t handle = 0;
     ta_napi_chart_row *row = status == TA_OK ? (ta_napi_chart_row *)ta_table_add(&native->host->charts, &handle) : NULL;
@@ -238,8 +272,7 @@ static ta_status ta_napi_chart_attach(void *datamodel, const ta_datamodel_chart 
         status = TA_ERROR_NO_MEMORY;
     }
     if (row != NULL) {
-        uint32_t flags = (declaring.declares ? TA_NAPI_CHART_DECLARES : 0u) | (declaring.lexical ? TA_NAPI_CHART_LEXICAL : 0u);
-        *row = (ta_napi_chart_row){reference, chart->image, chart->chart, flags, chart->segment};
+        *row = (ta_napi_chart_row){reference, chart->image, chart->chart, chart->segment};
         *context = (void *)(uintptr_t)handle; /* the row's handle, never a pointer */
     }
     ta_napi_frame_close(&frame);
@@ -300,8 +333,7 @@ static bool ta_napi_keep_strings(ta_napi_native *native, const ta_datamodel_syst
     return napi_create_reference(env, strings, 1, &native->strings) == napi_ok;
 }
 
-/* A session's scope (shared chart) or the record of its own context
- * (declaring chart), with its link and its init params. */
+/* A session's scope, with its link and its init params. */
 typedef struct ta_napi_start_of {
     const ta_napi_chart_row *chart;
     const ta_datamodel_system_variables *variables;
@@ -321,29 +353,13 @@ static napi_value ta_napi_link_new(napi_env env, napi_value kit, const ta_napi_s
 
 static napi_value ta_napi_session_new(ta_napi_native *native, const ta_napi_start_of *start) {
     napi_env env = native->host->env;
-    napi_value record = ta_napi_native_get(native, start->chart->functions), shape, kit, link, init = start->init, made;
-    if (record == NULL || napi_get_element(env, record, TA_NAPI_CHART_SHAPE, &shape) != napi_ok) return NULL;
-    if (!(start->chart->flags & TA_NAPI_CHART_DECLARES)) {
-        napi_value shared = ta_napi_realm_shared(native);
-        if (shared == NULL || napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
-            (link = ta_napi_link_new(env, kit, start)) == NULL ||
-            napi_set_named_property(env, link, "init", init) != napi_ok || napi_new_instance(env, shape, 1, &link, &made) != napi_ok)
-            return NULL;
-        return made;
-    }
-    napi_value own = ta_napi_realm_new(native), slot, global;
-    if (own == NULL || napi_get_element(env, own, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
-        (link = ta_napi_link_new(env, kit, start)) == NULL)
+    napi_value record = ta_napi_native_get(native, start->chart->functions), shape, kit, link, made, shared;
+    if (record == NULL || napi_get_element(env, record, TA_NAPI_CHART_SHAPE, &shape) != napi_ok ||
+        (shared = ta_napi_realm_shared(native)) == NULL || napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
+        (link = ta_napi_link_new(env, kit, start)) == NULL || napi_set_named_property(env, link, "init", start->init) != napi_ok ||
+        napi_new_instance(env, shape, 1, &link, &made) != napi_ok)
         return NULL;
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, init, &type) != napi_ok) return NULL;
-    if (type != napi_undefined && (init = ta_napi_kit(env, kit, &(ta_napi_kit_call){"copy", 1, {init}})) == NULL) return NULL;
-    if (napi_set_named_property(env, link, "init", init) != napi_ok ||
-        (global = ta_napi_kit(env, kit, &(ta_napi_kit_call){"declare", 2, {shape, link}})) == NULL)
-        return NULL;
-    for (uint32_t i = TA_NAPI_OWN_GETTERS; i < TA_NAPI_OWN_RECORD; i++)
-        if (napi_create_array(env, &slot) != napi_ok || napi_set_element(env, own, i, slot) != napi_ok) return NULL;
-    return own;
+    return made;
 }
 
 static ta_status ta_napi_create(void *datamodel, const ta_datamodel_start *start, uint64_t *instance) {
@@ -490,10 +506,8 @@ static ta_status ta_napi_bind_event(const ta_datamodel_call *call, const ta_even
     field = view->invokeid.length ? ta_napi_kept(env, &(ta_napi_kept_at){invokeids, view->invoke_slot}, view->invokeid)
                                   : undefined;
     ok = ok && field != NULL && napi_set_element(env, fields, 5, field) == napi_ok;
-    /* the data: the payload row's value itself; a session of its own context gets its copy */
+    /* the data: the payload row's value itself */
     field = ta_napi_native_value(native, view->data);
-    if (ok && evaluation->own != NULL && view->data != 0)
-        field = ta_napi_kit(env, evaluation->kit, &(ta_napi_kit_call){"copy", 1, {field}});
     ok = ok && field != NULL && napi_set_element(env, fields, 6, field) == napi_ok &&
          napi_set_element(env, fields, 7,
                           view->size >= sizeof *view ? ta_napi_optional(env, view->raw) : undefined) == napi_ok &&
@@ -793,11 +807,9 @@ static bool ta_napi_event_write(ta_napi_native *native, const ta_napi_event_out 
  * null}, through the value table (no format that runs code when read:
  * bindings.md section 8). Then core calls destroy, which removes the row:
  * a hibernated session holds nothing in the engine. A value outside the
- * table keeps it resident (TA_ERROR_UNSUPPORTED, `reason` says which), and
- * so does a chart whose scripts declare with let, const or class, which a
- * new context cannot be given again. A declaring session's function
- * declarations are not written: the wake makes them again from the
- * chart's scripts. */
+ * table keeps it resident (TA_ERROR_UNSUPPORTED, `reason` says which). The
+ * chart's helpers are not written: they are the chart's, made again when
+ * it is attached. */
 static ta_status ta_napi_serialize(const ta_datamodel_call *call, ta_bytes *out) {
     ta_napi_native *native = (ta_napi_native *)call->datamodel;
     *out = (ta_bytes){NULL, 0};
@@ -809,18 +821,9 @@ static ta_status ta_napi_serialize(const ta_datamodel_call *call, ta_bytes *out)
     if (!ta_napi_enter_entry(call, &entry)) return TA_ERROR_INVALID;
     ta_napi_evaluation *evaluation = &entry.evaluation;
     napi_env env = evaluation->env;
-    if (evaluation->row.flags & TA_NAPI_CHART_LEXICAL) {
-        ta_napi_reason_add(native, "the chart's scripts declare with let, const or class at their top level: "
-                                   "a new context cannot be given those bindings again, so its sessions stay resident");
-        ta_napi_frame_close(&entry.frame);
-        return TA_ERROR_UNSUPPORTED;
-    }
-    napi_value remade = NULL, variables = NULL, names, values, name, value, event;
-    napi_valuetype type = napi_undefined;
+    napi_value variables = NULL, names, values, name, value, event;
     uint32_t count = 0;
-    bool ok = napi_get_element(env, evaluation->record, TA_NAPI_CHART_FUNCTIONS, &remade) == napi_ok &&
-              napi_typeof(env, remade, &type) == napi_ok && (type == napi_object || napi_create_array(env, &remade) == napi_ok) &&
-              (variables = ta_napi_kit(env, evaluation->kit, &(ta_napi_kit_call){"stored", 2, {evaluation->scope, remade}})) != NULL &&
+    bool ok = (variables = ta_napi_kit(env, evaluation->kit, &(ta_napi_kit_call){"stored", 1, {evaluation->scope}})) != NULL &&
               napi_get_element(env, variables, 0, &names) == napi_ok && napi_get_element(env, variables, 1, &values) == napi_ok &&
               napi_get_array_length(env, names, &count) == napi_ok &&
               napi_get_named_property(env, evaluation->scope, "_event", &event) == napi_ok;
@@ -930,10 +933,8 @@ static napi_value ta_napi_event_from(ta_napi_native *native, const ta_napi_event
     return ta_napi_kit(env, in->kit, &(ta_napi_kit_call){"event", 1, {fields}});
 }
 
-/* A session from a blob serialize wrote, for its chart now: a new scope
- * (or, for a declaring chart, a new context, its scripts' declarations
- * made again), the variables of the blob its chart declares (all of them
- * on a declaring session's global), and its _event. Every variable of the
+/* A session from a blob serialize wrote, for its chart now: a new scope,
+ * the variables of the blob its chart declares, and its _event. Every variable of the
  * blob is kept in the session's link as its `init` until the first event
  * or migrate takes it, as a spawn's params are: when the blob is of an
  * older version of the chart, migrate answers them as the old bindings. */
@@ -944,9 +945,9 @@ static ta_status ta_napi_deserialize(void *datamodel, const ta_datamodel_start *
     if (!ta_napi_frame_open(native, NULL, &frame)) return TA_ERROR_NO_MEMORY;
     uint64_t chart_handle = (uint64_t)(uintptr_t)start->chart_context;
     ta_napi_chart_row *found = (ta_napi_chart_row *)ta_table_get(&native->host->charts, chart_handle);
-    ta_napi_chart_row chart = found != NULL ? *found : (ta_napi_chart_row){NULL, NULL, 0, 0, 0};
+    ta_napi_chart_row chart = found != NULL ? *found : (ta_napi_chart_row){NULL, NULL, 0, 0};
     ta_napi_session_row row = {chart_handle, TA_NIL, TA_NIL, TA_NIL};
-    napi_value state = NULL, vars = NULL, fields = NULL, made = NULL, record, kit, target, context, shared, undefined, event;
+    napi_value state = NULL, vars = NULL, fields = NULL, made = NULL, record, kit, shared, undefined, event;
     napi_valuetype type = napi_undefined;
     bool ok = found != NULL && napi_get_undefined(env, &undefined) == napi_ok && ta_napi_keep_strings(native, start->system_variables) &&
               (record = ta_napi_native_get(native, chart.functions)) != NULL &&
@@ -955,19 +956,13 @@ static ta_status ta_napi_deserialize(void *datamodel, const ta_datamodel_start *
               napi_typeof(env, vars, &type) == napi_ok && type == napi_object &&
               napi_get_named_property(env, state, "event", &fields) == napi_ok &&
               (made = ta_napi_session_new(native, &(ta_napi_start_of){&chart, start->system_variables, vars, NULL})) != NULL;
-    if (ok && (chart.flags & TA_NAPI_CHART_DECLARES)) /* its own context: the declarations again, then the values */
-        ok = napi_get_element(env, made, TA_NAPI_OWN_KIT, &kit) == napi_ok &&
-             napi_get_element(env, made, TA_NAPI_OWN_CONTEXT, &context) == napi_ok &&
-             napi_get_named_property(env, kit, "global", &target) == napi_ok && ta_napi_realm_hoist(native, record, context);
-    else if (ok)
-        ok = (shared = ta_napi_realm_shared(native)) != NULL && napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) == napi_ok &&
-             (target = made) != NULL;
-    ok = ok && ta_napi_kit(env, kit, &(ta_napi_kit_call){"restore", 2, {target, vars}}) != NULL &&
+    ok = ok && (shared = ta_napi_realm_shared(native)) != NULL && napi_get_element(env, shared, TA_NAPI_REALM_KIT, &kit) == napi_ok &&
+         ta_napi_kit(env, kit, &(ta_napi_kit_call){"restore", 2, {made, vars}}) != NULL &&
          napi_typeof(env, fields, &type) == napi_ok;
     if (ok && type != napi_null && type != napi_undefined) {
         event = ta_napi_event_from(native, &(ta_napi_event_in){fields, kit, record, &row});
         napi_property_descriptor property = {"_event", NULL, NULL, NULL, NULL, event, napi_enumerable | napi_configurable, NULL};
-        ok = event != NULL && napi_define_properties(env, target, 1, &property) == napi_ok;
+        ok = event != NULL && napi_define_properties(env, made, 1, &property) == napi_ok;
     }
     ta_status status = TA_OK;
     if (!ok) status = (ta_napi_failed(env), TA_ERROR_INVALID);
@@ -990,8 +985,7 @@ static ta_status ta_napi_deserialize(void *datamodel, const ta_datamodel_start *
 /* After deserialize, when the blob was written for an older version of
  * the chart: the old bindings, exactly the old chart's variables as the
  * blob held them, as one payload (an object of name -> value), taken from
- * the link; on a declaring session's global the old variables the new
- * chart does not declare are dropped. Core then initializes the new
+ * the link. Core then initializes the new
  * chart's added <data> and raises error.platform.upgrade with it. */
 static ta_status ta_napi_migrate(const ta_datamodel_call *call, ta_payload *bindings) {
     *bindings = 0;
@@ -1168,8 +1162,8 @@ static bool ta_napi_snapshot_layout(const ta_napi_snapshot_out *out, const ta_ta
 
 /* One session row: [handle, segment, chart index, {name: bytes}, _event's
  * fields as bytes (null when no event came), the link's [sessionid, name,
- * processors] as bytes, its init as bytes or null, the names a restore
- * added as bytes]. Its variables are what hibernation writes. */
+ * processors] as bytes, its init as bytes or null]. Its variables are what
+ * hibernation writes. */
 static bool ta_napi_snapshot_session(const ta_napi_snapshot_out *out, uint32_t slot) {
     ta_napi_native *native = out->native;
     ta_napi_host *host = native->host;
@@ -1184,18 +1178,10 @@ static bool ta_napi_snapshot_session(const ta_napi_snapshot_out *out, uint32_t s
     }
     ta_napi_evaluation *evaluation = &entry.evaluation;
     native->reason[0] = '\0';
-    bool ok = true;
-    if (evaluation->row.flags & TA_NAPI_CHART_LEXICAL) {
-        ta_napi_reason_add(native, "a session of a chart whose scripts declare with let, const or class at their top "
-                                   "level: a new context cannot be given those bindings again");
-        ok = ta_napi_snapshot_refuse(native, &(ta_napi_unstorable){NULL, NULL, TA_ERROR_UNSUPPORTED});
-    }
-    napi_value remade = NULL, variables = NULL, names = NULL, values = NULL, event = NULL, link = NULL, name, value, part;
+    napi_value variables = NULL, names = NULL, values = NULL, event = NULL, link = NULL, name, value, part;
     napi_valuetype type = napi_undefined;
     uint32_t count = 0;
-    ok = ok && napi_get_element(env, evaluation->record, TA_NAPI_CHART_FUNCTIONS, &remade) == napi_ok &&
-         napi_typeof(env, remade, &type) == napi_ok && (type == napi_object || napi_create_array(env, &remade) == napi_ok) &&
-         (variables = ta_napi_kit(env, evaluation->kit, &(ta_napi_kit_call){"stored", 2, {evaluation->scope, remade}})) != NULL &&
+    bool ok = (variables = ta_napi_kit(env, evaluation->kit, &(ta_napi_kit_call){"stored", 1, {evaluation->scope}})) != NULL &&
          napi_get_element(env, variables, 0, &names) == napi_ok && napi_get_element(env, variables, 1, &values) == napi_ok &&
          napi_get_array_length(env, names, &count) == napi_ok &&
          napi_get_named_property(env, evaluation->scope, "_event", &event) == napi_ok &&
@@ -1203,7 +1189,7 @@ static bool ta_napi_snapshot_session(const ta_napi_snapshot_out *out, uint32_t s
     ta_cbor_writer *writer = out->writer;
     ta_napi_room room = {&native->output, &host->allocator, {NULL, 0}};
     if (ok) {
-        ta_cbor_write_array(writer, 8);
+        ta_cbor_write_array(writer, 7);
         ta_cbor_write_uint(writer, handle);
         ta_cbor_write_uint(writer, evaluation->row.segment);
         ta_cbor_write_uint(writer, evaluation->row.chart);
@@ -1227,12 +1213,12 @@ static bool ta_napi_snapshot_session(const ta_napi_snapshot_out *out, uint32_t s
         else ok = ta_napi_snapshot_refuse(native, &(ta_napi_unstorable){NULL, NULL,
                                                                        written ? TA_ERROR_NO_MEMORY : TA_ERROR_UNSUPPORTED});
     }
-    /* the link: [sessionid, name, processors], then init and added */
-    napi_value system = NULL, init = NULL, added = NULL;
+    /* the link: [sessionid, name, processors], then init */
+    napi_value system = NULL, init = NULL;
     ok = ok && napi_create_array_with_length(env, 3, &system) == napi_ok;
     for (uint32_t i = 0; ok && i < 3; i++)
         ok = napi_get_element(env, link, i, &part) == napi_ok && napi_set_element(env, system, i, part) == napi_ok;
-    ok = ok && napi_get_element(env, link, 3, &init) == napi_ok && napi_get_element(env, link, 4, &added) == napi_ok;
+    ok = ok && napi_get_element(env, link, 3, &init) == napi_ok;
     if (ok) {
         ta_status status = ta_napi_snapshot_value(out, system);
         if (status != TA_OK) ok = ta_napi_snapshot_refuse(native, &(ta_napi_unstorable){"the system variables", NULL, status});
@@ -1241,10 +1227,6 @@ static bool ta_napi_snapshot_session(const ta_napi_snapshot_out *out, uint32_t s
     else if (ok) {
         ta_status status = ta_napi_snapshot_value(out, init);
         if (status != TA_OK) ok = ta_napi_snapshot_refuse(native, &(ta_napi_unstorable){"the params", NULL, status});
-    }
-    if (ok) {
-        ta_status status = ta_napi_snapshot_value(out, added);
-        if (status != TA_OK) ok = ta_napi_snapshot_refuse(native, &(ta_napi_unstorable){"the session", NULL, status});
     }
     ta_napi_frame_close(&entry.frame);
     return ok;
@@ -1402,9 +1384,8 @@ static void ta_napi_restore_chart(ta_napi_native *native, ta_napi_attachment *at
     }
 }
 
-/* One session back at its handle: a new scope (or a new context, its
- * scripts' declarations made again), its link from the snapshot's, its
- * variables, its _event. */
+/* One session back at its handle: a new scope, its link from the
+ * snapshot's, its variables, its _event. */
 typedef struct ta_napi_session_in {
     napi_value entry;
     ta_napi_attachment *attachment;
@@ -1412,14 +1393,13 @@ typedef struct ta_napi_session_in {
 
 static bool ta_napi_restore_session(ta_napi_native *native, const ta_napi_session_in *in) {
     napi_env env = native->host->env;
-    napi_value parts[8], system, processors, init, vars, given, keys, name, value, event_fields, added, record, kit, target, context,
-        shared, made, undefined;
+    napi_value parts[7], system, processors, init, vars, given, keys, name, value, event_fields, record, kit, shared, made, undefined;
     uint32_t length = 0;
     bool array = false;
     if (napi_is_array(env, in->entry, &array) != napi_ok || !array || napi_get_array_length(env, in->entry, &length) != napi_ok ||
-        length != 8)
+        length != 7)
         return ta_napi_restore_refuse(env, "not a session of a snapshot");
-    for (uint32_t i = 0; i < 8; i++)
+    for (uint32_t i = 0; i < 7; i++)
         if (napi_get_element(env, in->entry, i, &parts[i]) != napi_ok) return false;
     uint64_t handle = 0, segment = 0, index = 0;
     if (!ta_napi_restore_uint(env, parts[0], &handle) || !ta_napi_restore_uint(env, parts[1], &segment) ||
@@ -1453,19 +1433,12 @@ static bool ta_napi_restore_session(ta_napi_native *native, const ta_napi_sessio
         ok = napi_get_element(env, keys, i, &name) == napi_ok && napi_get_property(env, given, name, &value) == napi_ok &&
              (value = ta_napi_restore_value(env, value)) != NULL && napi_set_property(env, vars, name, value) == napi_ok;
     ok = ok && (made = ta_napi_session_new(native, &(ta_napi_start_of){&chart, NULL, init, system})) != NULL;
-    if (ok && (chart.flags & TA_NAPI_CHART_DECLARES)) /* its own context: the declarations again, then the values */
-        ok = napi_get_element(env, made, TA_NAPI_OWN_KIT, &kit) == napi_ok &&
-             napi_get_element(env, made, TA_NAPI_OWN_CONTEXT, &context) == napi_ok &&
-             napi_get_named_property(env, kit, "global", &target) == napi_ok && ta_napi_realm_hoist(native, record, context);
-    else if (ok) target = made;
-    ok = ok && ta_napi_kit(env, kit, &(ta_napi_kit_call){"restore", 2, {target, vars}}) != NULL &&
-         (added = ta_napi_restore_value(env, parts[7])) != NULL &&
-         ta_napi_kit(env, kit, &(ta_napi_kit_call){"relink", 2, {target, added}}) != NULL &&
+    ok = ok && ta_napi_kit(env, kit, &(ta_napi_kit_call){"restore", 2, {made, vars}}) != NULL &&
          (event_fields = ta_napi_restore_value(env, parts[4])) != NULL && napi_typeof(env, event_fields, &type) == napi_ok;
     if (ok && type != napi_null && type != napi_undefined) {
         napi_value event = ta_napi_event_from(native, &(ta_napi_event_in){event_fields, kit, record, &row});
         napi_property_descriptor property = {"_event", NULL, NULL, NULL, NULL, event, napi_enumerable | napi_configurable, NULL};
-        ok = event != NULL && napi_define_properties(env, target, 1, &property) == napi_ok;
+        ok = event != NULL && napi_define_properties(env, made, 1, &property) == napi_ok;
     }
     if (!ok) return ta_napi_restore_refuse(env, "not a session of a snapshot");
     if (!ta_napi_slot_hold(native, &(ta_napi_slot){&native->scopes, handle}, made)) return false;

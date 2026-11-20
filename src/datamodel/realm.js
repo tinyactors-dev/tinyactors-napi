@@ -1,14 +1,16 @@
 // The realm's script of the native "ecmascript" datamodel (AGENTS.md, "The
 // native "ecmascript" datamodel"; src/datamodel/realms.c): run once in every
-// node:vm context the datamodel makes, the host's shared one and each
-// declaring session's own, with In() as its argument. It returns the
-// context's kit, the functions that make what must be made with that
-// context's constructors: copies of values crossing between actors, the
-// scopes of a chart (one constructor per chart, over a frozen prototype of
-// null prototype holding the system variables), the system variables of a
-// session, _event, and XML documents. The build embeds it in the addon
-// (mise/napi.rb); it is not shipped as a file and never runs in the
-// application's realm.
+// node:vm context the datamodel makes (the host's one shared context), with
+// In() as its argument. It returns the context's kit, the functions that
+// make what must be made with that context's constructors: copies of values
+// crossing between actors, the scopes of a chart (one constructor per
+// chart, over a frozen prototype of null prototype holding the system
+// variables and the chart's helpers), the system variables of a session,
+// _event, and XML documents; and what a chart's scripts declare, asked of
+// the engine (the binding parses no JavaScript). It runs in the
+// application's realm too, once, for the copies the application reads and
+// the compile call's advice. The build embeds it in the addon
+// (mise/napi.rb); it is not shipped as a file.
 (function tinyactorsRealm(In, Address) {
   'use strict';
   const LINK = Symbol('tinyactors.session');
@@ -19,13 +21,7 @@
   const source = Function.prototype.toString;
   const isArray = Array.isArray;
   const isView = ArrayBuffer.isView;
-  const names = Object.getOwnPropertyNames;
-  // The global's own names before any chart's: what a context starts with,
-  // and the system variables a declaring session's context gets (declare).
-  const baseline = new Set(names(globalThis));
-  const systemNames = new Set(['_sessionid', '_name', '_ioprocessors', 'In', '_event']);
-  const indirect = eval; // global code of this context, whatever a chart puts on its global
-  const identifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  const Code = Function; // this context's: what it compiles is this context's
 
   // The errors copy throws for a value that cannot cross, by status: an
   // input refused with them throws a TinyactorsError of that status.
@@ -222,16 +218,115 @@
     In: { value: In, enumerable: true },
   }));
 
+  // ---- what a script declares ----------------------------------------------
+
+  // Whether `body` parses as a function body of this context, nothing run.
+  function parses(body) {
+    try {
+      Code(body); // eslint-disable-line no-new-func
+      return true;
+    } catch (error) {
+      if (error instanceof SyntaxError) return false;
+      throw error;
+    }
+  }
+
+  // What may be an identifier in a script's text: the candidates the
+  // engine is asked about.
+  const candidates = /[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*/gu;
+  const declaring = /\b(?:var|let|const|class|function)\b/;
+
+  // The names a script declares at its top level, asked of the engine:
+  // [functions, vars, lexicals] (let, const and class), each in the order
+  // of the text; null when the script does not parse as the strict
+  // function body the datamodel runs it as. A candidate is declared when
+  // the script followed by `let <name>` does not parse, lexically when the
+  // script followed by `var <name>` does not either; a declared var holds
+  // a function before any statement runs when it is a function
+  // declaration.
+  function declarations(source) {
+    const body = "'use strict';\n" + source;
+    if (!parses(body)) return null;
+    const functions = [], vars = [], lexicals = [];
+    if (!declaring.test(source)) return [functions, vars, lexicals];
+    const seen = new Set(), hoisted = [];
+    for (const [name] of source.matchAll(candidates)) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      if (!parses("'use strict';let " + name + ';') || parses(body + '\n;let ' + name + ';')) continue;
+      if (!parses(body + '\n;var ' + name + ';')) lexicals.push(name);
+      else hoisted.push(name);
+    }
+    if (hoisted.length) {
+      const kinds = Code("'use strict';return [" + hoisted.map((name) => 'typeof ' + name).join(',') + '];\n' + source)();
+      for (let i = 0; i < hoisted.length; i++) (kinds[i] === 'function' ? functions : vars).push(hoisted[i]);
+    }
+    return [functions, vars, lexicals];
+  }
+
+  const advised = (name) => 'declare it with <data id="' + name + '"/> instead';
+
+  // Why the native datamodel refuses a script: its first top-level let,
+  // const or class declaration; undefined when it refuses none.
+  function refusal(found) {
+    if (found === null || !found[2].length) return undefined;
+    return 'a <script> declares ' + found[2][0] + ' with let, const or class at its top level, which the native ' +
+      '"ecmascript" datamodel refuses (the script is error.execution): ' + advised(found[2][0]);
+  }
+
+  // What the compile call warns of in a script: a refusal, or its first
+  // top-level var, which the native datamodel makes a variable of the
+  // session; null for neither.
+  function advice(source) {
+    const found = declarations(source);
+    const refused = refusal(found);
+    if (refused !== undefined) return refused;
+    if (found === null || !found[1].length) return null;
+    return 'a <script> declares var ' + found[1][0] + ' at its top level, which the native "ecmascript" datamodel ' +
+      'makes a variable of the session: ' + advised(found[1][0]);
+  }
+
+  // A script as the datamodel runs it, a function of the session's scope:
+  // [functions, vars, refusal, head, tail], the head and tail around its
+  // source; null when it does not parse (its evaluation's SyntaxError). Its
+  // top-level vars are the session's variables: read from the scope before
+  // it runs and written back after, as global code would keep them.
+  function script(source) {
+    const found = declarations(source);
+    if (found === null) return null;
+    const [functions, vars] = found;
+    let head = "(function(__s){with(__s){(function(){'use strict';", tail = '\n';
+    if (vars.length) {
+      head += vars.map((name) => name + '=__s.' + name + ';').join('') + 'try{';
+      tail += '}finally{' + vars.map((name) => '__s.' + name + '=' + name + ';').join('') + '}';
+    }
+    return [functions, vars, refusal(found), head + '\n', tail + '})();}})'];
+  }
+
   // A chart's constructor of scopes: the session's link, then every name the
   // chart declares, then _event, so every scope of the chart has one shape.
-  function shape(names) {
-    const declared = names.slice();
+  // Its prototype holds the system variables and, when its chart-level
+  // scripts declare functions, those: made once per chart from each
+  // script's text ([source, function names] in `scripts`), no statement of
+  // it run, so they close over this context's globals and nothing of a
+  // session's.
+  function shape(names, scripts) {
+    const declared = [...new Set(names)];
+    let prototype = variables;
+    if (scripts.length) {
+      const helpers = {};
+      for (const [source, functions] of scripts) {
+        const made = Code("'use strict';return {" + functions.join(',') + '};\n' + source)();
+        for (const name of functions) helpers[name] = { value: made[name], enumerable: true };
+      }
+      prototype = freeze(create(variables, helpers));
+    }
     function Scope(link) {
       this[LINK] = link;
       for (let i = 0; i < declared.length; i++) own(this, declared[i], undefined);
       defineProperty(this, '_event', { value: undefined, enumerable: true, configurable: true });
     }
-    Scope.prototype = variables;
+    Scope.prototype = prototype;
     return Scope;
   }
 
@@ -261,19 +356,6 @@
     return { sessionid, name, io: same(processors, sessionid) ? undefined : processors, init: undefined };
   }
 
-  // A context of its own session: the names on its global object.
-  function declare(names, link) {
-    const global = globalThis;
-    global[LINK] = link;
-    for (const name of names) if (!hasOwn(global, name)) own(global, name, undefined);
-    defineProperty(global, '_sessionid', { get() { return link.sessionid; }, enumerable: true });
-    defineProperty(global, '_name', { get() { return link.name; }, enumerable: true });
-    defineProperty(global, '_ioprocessors', { get() { return ioprocessors(link); }, enumerable: true });
-    defineProperty(global, 'In', { value: In, enumerable: true });
-    defineProperty(global, '_event', { value: undefined, enumerable: true, configurable: true });
-    return global;
-  }
-
   function event(fields) {
     const [name, type, sendid, origin, origintype, invokeid, data, raw] = fields;
     const made = { name, type, sendid, origin, origintype, invokeid, data };
@@ -281,67 +363,41 @@
     return freeze(made);
   }
 
-  // A session's variables, what hibernation writes: [names, values]. A
-  // shared chart's scope: its own names but _event. A declaring session's
-  // global: the names its chart and scripts put there (var, function, an
-  // implicit global); one in `remade` (a function declaration of the
-  // chart's scripts) is left out while it holds a function, since the
-  // wake makes it again from the scripts.
-  // A global's binding is read by its name, not as the global object's
-  // property: bun's vm context leaves that property stale after a function
-  // writes the var (spike, bun 1.4.1, 2026-10-16: `total += k` in a
-  // function, globalThis.total still the old value, `total` the new one).
-  function stored(target, remade) {
+  // A session's variables, what hibernation writes: [names, values], its
+  // scope's own names but _event.
+  function stored(target) {
     const found = [];
     const values = [];
-    const global = target === globalThis;
-    for (const name of global ? names(target) : keys(target)) {
-      if (name === '_event' || (global && (baseline.has(name) || systemNames.has(name)))) continue;
-      const value = global && identifier.test(name) ? indirect(name) : target[name];
-      if (global && typeof value === 'function' && remade.includes(name)) continue;
+    for (const name of keys(target)) {
+      if (name === '_event') continue;
       found.push(name);
-      values.push(value);
+      values.push(target[name]);
     }
     return [found, values];
   }
 
   // A woken session's variables, `vars` of a hibernation blob (made in
-  // another realm), copied into this context: a shared scope keeps the
-  // names its chart declares; a declaring session's global takes them all,
-  // and its link keeps the names its chart did not declare, which upgrade
-  // drops should the blob be of another version.
+  // another realm), copied into this context: the scope keeps the names its
+  // chart declares.
   function restore(target, vars) {
-    const added = [];
-    for (const name of keys(vars)) {
-      if (hasOwn(target, name)) target[name] = copy(vars[name], 0);
-      else if (target === globalThis) {
-        own(target, name, copy(vars[name], 0));
-        added.push(name);
-      }
-    }
-    if (added.length) target[LINK].added = added;
+    for (const name of keys(vars)) if (hasOwn(target, name)) target[name] = copy(vars[name], 0);
   }
 
   // A woken session migrated to a new version of its chart: the old
   // bindings, the blob's variables its link kept since the wake, taken
-  // from it; on a declaring session's global the names the new chart did
-  // not declare go.
+  // from it.
   function upgrade(target) {
     const link = target[LINK];
     const old = link.init;
     link.init = undefined;
-    if (link.added !== undefined) {
-      for (const name of link.added) delete target[name];
-      link.added = undefined;
-    }
     return old;
   }
 
   // A session's link as a host snapshot holds it: [sessionid, name, its I/O
-  // processors as [type, location] pairs, init, added]. The processors are
-  // the template's with this session's id, the pairs the link kept, or,
-  // once _ioprocessors was read, its entries (an alias, `scxml` or
-  // `basichttp`, is the same frozen entry as the type before it).
+  // processors as [type, location] pairs, init]. The processors are the
+  // template's with this session's id, the pairs the link kept, or, once
+  // _ioprocessors was read, its entries (an alias, `scxml` or `basichttp`,
+  // is the same frozen entry as the type before it).
   function linked(target) {
     const link = target[LINK];
     let processors = link.io;
@@ -359,36 +415,7 @@
       }
       processors = pairs;
     }
-    return [link.sessionid, link.name, processors, link.init, link.added];
-  }
-
-  // A restored session's link gets the names a snapshot recorded as added
-  // (restore computed its own), or none.
-  function relink(target, added) {
-    target[LINK].added = isArray(added) ? added.slice() : undefined;
-  }
-
-  // In a scratch context after a chart's scripts were instantiated: the
-  // names they declared as functions.
-  function functions() {
-    const found = [];
-    for (const name of names(globalThis)) if (!baseline.has(name) && typeof globalThis[name] === 'function') found.push(name);
-    return found;
-  }
-
-  // The global's names a chart's scripts made (globals), and the names
-  // made again from them on a wake (remade): the functions they declare,
-  // and the names a strict scratch context's global (`strict`, its
-  // globals()) lacks: a sloppy block's function declarations (Annex B),
-  // whose var a script in executable content fills each time it runs.
-  function globals() {
-    return names(globalThis).filter((name) => !baseline.has(name));
-  }
-  function remade(strict) {
-    const kept = new Set(strict);
-    const found = functions();
-    for (const name of globals()) if (!kept.has(name) && !found.includes(name)) found.push(name);
-    return found;
+    return [link.sessionid, link.name, processors, link.init];
   }
 
   function record(names, values) {
@@ -399,24 +426,20 @@
 
   return freeze({
     LINK,
-    global: globalThis,
     objectPrototype: Object.prototype,
     copy: (value) => copy(value, 0),
     exported: (value) => exported(value, 0),
     refusal: (error) => refusals.get(error),
     shape,
+    script,
+    advice,
     system,
-    declare,
     event,
     record,
     stored,
     restore,
     upgrade,
     linked,
-    relink,
-    functions,
-    globals,
-    remade,
     dom,
     parse: (text) => JSON.parse(text),
   });

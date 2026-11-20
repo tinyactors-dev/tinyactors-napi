@@ -40,6 +40,16 @@ snapshots:
       style: secondary
       start: 21
       end: 27
+  const ffi = process.getBuiltinModule('bun:ffi');:
+    labels:
+    - source: process.getBuiltinModule('bun:ffi')
+      style: primary
+      start: 12
+      end: 47
+    - source: process.getBuiltinModule
+      style: secondary
+      start: 12
+      end: 36
   const fs = process.getBuiltinModule('node:fs');:
     labels:
     - source: process.getBuiltinModule('node:fs')
@@ -62,6 +72,16 @@ snapshots:
       style: primary
       start: 16
       end: 46
+  const sqlite = process.getBuiltinModule('node:sqlite/x');:
+    labels:
+    - source: process.getBuiltinModule('node:sqlite/x')
+      style: primary
+      start: 15
+      end: 56
+    - source: process.getBuiltinModule
+      style: secondary
+      start: 15
+      end: 39
   const vm = process.getBuiltinModule(name);:
     labels:
     - source: process.getBuiltinModule(name)
@@ -82,6 +102,36 @@ snapshots:
       style: secondary
       start: 0
       end: 28
+  export { default } from '../package.json';:
+    labels:
+    - source: '''../package.json'''
+      style: primary
+      start: 24
+      end: 41
+    - source: export { default } from '../package.json';
+      style: secondary
+      start: 0
+      end: 42
+  export { version } from '../version.mjs';:
+    labels:
+    - source: '''../version.mjs'''
+      style: primary
+      start: 24
+      end: 40
+    - source: export { version } from '../version.mjs';
+      style: secondary
+      start: 0
+      end: 41
+  export { version } from './version.js';:
+    labels:
+    - source: '''./version.js'''
+      style: primary
+      start: 24
+      end: 38
+    - source: export { version } from './version.js';
+      style: secondary
+      start: 0
+      end: 39
   import addon from '../build/tinyactors.node';:
     labels:
     - source: '''../build/tinyactors.node'''
@@ -102,6 +152,56 @@ snapshots:
       style: secondary
       start: 0
       end: 26
+  'import data from ''../build/data.json'' with { type: ''json'' };':
+    labels:
+    - source: '''../build/data.json'''
+      style: primary
+      start: 17
+      end: 37
+    - source: 'import data from ''../build/data.json'' with { type: ''json'' };'
+      style: secondary
+      start: 0
+      end: 60
+  'import pkg from ''../../package.json'' with { type: ''json'' };':
+    labels:
+    - source: '''../../package.json'''
+      style: primary
+      start: 16
+      end: 36
+    - source: 'import pkg from ''../../package.json'' with { type: ''json'' };'
+      style: secondary
+      start: 0
+      end: 59
+  'import pkg from ''../package.json'' with { type: ''json'' };':
+    labels:
+    - source: '''../package.json'''
+      style: primary
+      start: 16
+      end: 33
+    - source: 'import pkg from ''../package.json'' with { type: ''json'' };'
+      style: secondary
+      start: 0
+      end: 56
+  import pkg from '../package.json';:
+    labels:
+    - source: '''../package.json'''
+      style: primary
+      start: 16
+      end: 33
+    - source: import pkg from '../package.json';
+      style: secondary
+      start: 0
+      end: 34
+  'import pkg from ''./package.json'' with { type: ''json'' };':
+    labels:
+    - source: '''./package.json'''
+      style: primary
+      start: 16
+      end: 32
+    - source: 'import pkg from ''./package.json'' with { type: ''json'' };'
+      style: secondary
+      start: 0
+      end: 55
   import { Host } from '#direct?raw';:
     labels:
     - source: '''#direct?raw'''

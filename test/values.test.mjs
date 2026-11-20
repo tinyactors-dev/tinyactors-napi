@@ -6,7 +6,9 @@
 // from null and refuses what is not a value (docs/values.md, "encode and a
 // datamodel's to_wire"); those cases are listed in DIFFERS with what encode
 // gives instead, and each must still be in values.txt.
-import { Address, decode, encode, TinyactorsError } from '@tinyactors/node';
+import {
+  Address, decode, encode, InvalidError, StaleError, StateError, TinyactorsError, UnsupportedError,
+} from '@tinyactors/node';
 import { hex, toHex, values } from './vectors.mjs';
 import { run, test } from './harness.mjs';
 
@@ -207,14 +209,34 @@ test('marks nest: a getter that encodes leaves the outer value intact', () => {
 test('TinyactorsError: an Error with code, reason, path and status', () => {
   const error = new TinyactorsError('m', { code: -32602, reason: 'type', path: 'params.x', status: 'TA_ERROR_INVALID' });
   equal(error instanceof Error, true, 'an Error');
-  equal(error.name, 'TinyactorsError', 'its name');
+  equal(error instanceof InvalidError, true, 'the subclass of its status');
+  equal(error.name, 'InvalidError', 'its name');
   equal(error.message, 'm', 'message');
   equal(error.code, -32602, 'code');
   equal(error.reason, 'type', 'reason');
   equal(error.path, 'params.x', 'path');
   equal(error.status, 'TA_ERROR_INVALID', 'status');
   equal(new TinyactorsError('n').status, undefined, 'no status given');
+  equal(new TinyactorsError('n').name, 'TinyactorsError', 'no status: the class itself');
   equal(typeof error.stack, 'string', 'a stack');
+});
+
+test('a TinyactorsError is the subclass of its status, or of a typed method\'s code', () => {
+  const classes = { TA_ERROR_STALE: StaleError, TA_ERROR_STATE: StateError, TA_ERROR_INVALID: InvalidError,
+    TA_ERROR_UNSUPPORTED: UnsupportedError };
+  for (const [status, subclass] of Object.entries(classes)) {
+    const error = new TinyactorsError('m', { status });
+    equal(error instanceof subclass && error instanceof TinyactorsError, true, status);
+    equal(error.name, subclass.name, `${status}: its name`);
+    equal(new subclass('m').status, status, `${subclass.name} made directly has its status`);
+  }
+  equal(new TinyactorsError('m', { status: 'TA_ERROR_NO_MEMORY' }).name, 'TinyactorsError', 'a status with no subclass');
+  for (const [code, subclass] of [[-32001, StaleError], [-32002, StateError], [-32602, InvalidError], [-32601, InvalidError]]) {
+    const error = new TinyactorsError('m', { code, reason: 'r' });
+    equal(error instanceof subclass, true, `code ${code}`);
+    equal(error.status, undefined, `code ${code}: no status`);
+    equal(error.code, code, `code ${code}: kept`);
+  }
 });
 
 await run();

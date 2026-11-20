@@ -165,6 +165,17 @@ module NodeAPI
       map.transform_values { |conditions| conditions.is_a?(Hash) ? conditions.except('tinyactors-wasm') : conditions }
     end
 
+    # The version module the convenience layer exports `version` from
+    # (lib/version.mjs), written with the packed version: the repository's
+    # holds the last release's, a package its own (a development build's
+    # too).
+    def write_version!(path, version)
+      text = ROOT.join('lib/version.mjs').read
+      pattern = /^export const version = '[^']*';$/
+      fail!('lib/version.mjs has no version line') unless text.match?(pattern)
+      path.write(text.sub(pattern, "export const version = '#{version}';"))
+    end
+
     # Stages the main package in `dir`: its files and a package.json listing
     # every platform package at `version`.
     def stage_main(dir, version)
@@ -173,6 +184,7 @@ module NodeAPI
         FileUtils.mkdir_p(dir.join(file).dirname)
         FileUtils.cp_r(file == 'LICENSE' ? LICENSE : ROOT.join(file), dir.join(file))
       end
+      write_version!(dir.join('lib/version.mjs'), version)
       staged = manifest.merge(
         'version' => version,
         'exports' => without_wasm(manifest.fetch('exports')),
@@ -284,6 +296,7 @@ module NodeAPI
       WASM_FILES.each { |file| FileUtils.cp(WebModule::ROOT.join(file), dir.join(file)) }
       WebModule::ROOT.glob('lib/*.mjs').each { |file| FileUtils.cp(file, dir.join('lib', file.basename)) }
       FileUtils.cp(ROOT.join('lib/convenience.mjs'), dir.join('lib/convenience.mjs'))
+      write_version!(dir.join('lib/version.mjs'), version)
       FileUtils.cp(WebModule::MODULE, dir.join('tinyactors.wasm'))
       FileUtils.cp(ROOT.join('index.d.ts'), dir.join('index.d.ts'))
       FileUtils.cp(WASM_README, dir.join('README.md'))

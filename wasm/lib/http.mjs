@@ -6,6 +6,7 @@
 // strings).
 import { bytesOf, optionalText, textOf } from './checks.mjs';
 import { refusal } from './errors.mjs';
+import * as cbor from './cbor.mjs';
 import { instance } from './state.mjs';
 
 const utf8 = new TextDecoder('utf-8', { fatal: true });
@@ -50,6 +51,24 @@ function strict(module, pointer, length) {
   } catch {
     throw refusal('TA_ERROR_INVALID', 'the request holds text that is not UTF-8');
   }
+}
+
+// decodeTraces(bytes) -> spans: an OTLP ExportTraceServiceRequest's spans
+// (the addon's src/traces.c, compiled into the module), read as CBOR.
+export function decodeTraces(traces) {
+  const bytes = bytesOf(traces, 'decodeTraces takes a Uint8Array or an ArrayBuffer');
+  const module = instance();
+  const scratch = module.scratch;
+  return module.scoped(scratch, () => {
+    const [at, length] = module.copyIn(scratch, bytes);
+    module.setWord(0, at);
+    module.setWord(1, length);
+    const status = module.call('ta_web_traces_decode', module.env);
+    if (status !== 0) {
+      throw refusal(module.statusName(status), status === -3 ? 'the bytes are not an ExportTraceServiceRequest' : 'no memory for the spans');
+    }
+    return cbor.read(module, scratch, module.word(0), module.word(1), { addresses: false });
+  });
 }
 
 // parseHTTPRequest(message) -> {method, target, body, event, fields}

@@ -7,13 +7,15 @@
 import { spawnSync } from 'node:child_process';
 import { run, test } from './harness.mjs';
 
-const index = new URL('../index.mjs', import.meta.url).href;
+// the package under test, by its name, from the project's directory: the
+// addon, or @tinyactors/wasm under the export condition the child inherits
+const project = new URL('..', import.meta.url);
 
 // Runs `body` (the text of an async function's body, given the module as
 // `m`) in a child; its exit status, output and whether it ran out of time.
 function child(body) {
-  const code = `import(${JSON.stringify(index)}).then(async (m) => { ${body} });`;
-  const result = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 20000 });
+  const code = `import('@tinyactors/node').then(async (m) => { ${body} });`;
+  const result = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 20000, cwd: project });
   return { status: result.status, output: `${result.stdout}${result.stderr}`, timedOut: result.error?.code === 'ETIMEDOUT' };
 }
 
@@ -25,12 +27,12 @@ function exits(body, what) {
 }
 
 test('a process with only an open host exits', () => {
-  exits(`globalThis.host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });`, 'a host never turned');
+  exits(`globalThis.host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });`, 'a host never turned');
 });
 
 test('a process exits after an idle turn, the host still open', () => {
   const output = exits(`
-    globalThis.host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
+    globalThis.host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
     await host.idle();
     console.log('idle', host.closed, host.nextDeadline);`, 'a host idle');
   if (!output.includes('idle false undefined')) throw new Error(`the child said: ${output}`);
@@ -39,14 +41,14 @@ test('a process exits after an idle turn, the host still open', () => {
 test('a process exits with a simulated clock moved', () => {
   exits(`
     const clock = new m.SimulatedClock();
-    globalThis.host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native', clock });
+    globalThis.host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native', clock });
     clock.increment(3600 * 1000);
     await host.idle();`, 'a host on a simulated clock');
 });
 
 test('a process exits when a waiting idle() is rejected by close()', () => {
   const output = exits(`
-    const host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
+    const host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
     const waiting = host.idle();
     host.close();
     await waiting.catch((error) => console.log('rejected', error.status));`, 'a host closed while idle() waits');
@@ -63,7 +65,7 @@ function delayed(ms, after) {
     const started = Date.now();
     process.on('exit', () => console.log('lived', Date.now() - started));
     const compiled = m.compileCharts([{ name: 'later.scxml', text: chart }]);
-    globalThis.host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
+    globalThis.host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native' });
     host.addImage(compiled.image);
     compiled.close();
     host.spawn(host.chart('later'), { name: 'later' });

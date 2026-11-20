@@ -5,6 +5,7 @@
  * leaves it), and what it gives back a view there, read by JavaScript
  * before the leave. */
 #include "web.h"
+#include "../../src/traces.h"
 
 /* ---- Address ------------------------------------------------------------------------- */
 
@@ -84,6 +85,21 @@ TA_WEB_EXPORT int32_t ta_web_http_encode(ta_web_env *env) {
     }
     ta_web_set_bytes(word, 0, (ta_bytes){out.pointer, status == TA_OK ? out.length : 0});
     return status;
+}
+
+/* decodeTraces. Record: 0-1 the request's bytes. Answers the status; the
+ * record: 0-1 the spans as one CBOR array (the addon's src/traces.c, which
+ * this module compiles too), in the environment's arena. */
+TA_WEB_EXPORT int32_t ta_web_traces_decode(ta_web_env *env) {
+    uint32_t *word = env->record.word;
+    ta_allocator scratch = ta_growable_arena_allocator(&env->scratch.arena);
+    ta_cbor_writer writer;
+    ta_cbor_writer_init(&writer, (ta_buffer){NULL, 0, 0}, &scratch);
+    ta_status status = ta_napi_traces_write(ta_web_bytes_at(word, 0), &writer);
+    ta_bytes cbor = {NULL, 0};
+    if (status == TA_OK) status = ta_cbor_writer_bytes(&writer, &cbor);
+    ta_web_set_bytes(word, 0, status == TA_OK ? cbor : (ta_bytes){NULL, 0});
+    return status; /* the bytes stay in the arena until the call's mark is released */
 }
 
 /* parseHTTPRequest. Record: 0-1 the message. Answers the status; the

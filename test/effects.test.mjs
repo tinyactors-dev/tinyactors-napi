@@ -6,10 +6,9 @@
 // the transport, with and without a handler; an I/O processor without one;
 // log entries. The actors are observed through their <log> lines.
 import { Address, decode, encode, Host, TinyactorsError } from '@tinyactors/node';
-import { CONFIG, DATAMODEL, ENGINE, equal, hostWith, image, scxml, sleep, status, throws, typeError, until } from './charts.mjs';
+import { CONFIG, DATAMODEL, ENGINE, equal, hostWith, image, named, processor, scxml, sleep, status, throws, typeError, until } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
-const OUT = { systemID: 't', ioProcessors: [{ type: 'urn:out' }] };
 
 /** A chart that sends `out` to urn:out (sendid x1, data {n: 1}) and logs
  * how it was answered under the label "outcome", then ends. */
@@ -28,9 +27,8 @@ const CALLER = scxml('caller', `
 function caller(processor, options = {}) {
   const outcomes = [];
   const host = hostWith({ caller: CALLER }, {
-    config: OUT,
-    log: (h, entry) => { if (entry.label === 'outcome') outcomes.push(entry.text); },
-    ioProcessors: processor === undefined ? undefined : { 'urn:out': processor },
+    log: (entry) => { if (entry.label === 'outcome') outcomes.push(entry.text); },
+    ioProcessors: processor === undefined ? undefined : { 'urn:out': { receive: processor } },
     ...options,
   });
   host.spawn(host.chart('caller'), { name: 'caller' });
@@ -41,13 +39,13 @@ const stale = status('TA_ERROR_STALE');
 
 test('a send view: each field read on first access and cached, valid until the ack', async () => {
   let seen;
-  const { host, outcomes } = caller((h, send) => {
+  const { host, outcomes } = caller((send) => {
     const data = send.data;
     equal(send.data, data, 'data is cached: the same object');
-    h.actorByName('caller'); // a call into the host in the same batch: the view is still valid
+    named(host, 'caller'); // a call into the host in the same batch: the view is still valid
     seen = {
       session: send.session, event: send.event, target: send.target, sendid: send.sendid, data,
-      type: send.type, origin: send.origin, traceparent: send.traceparent, message: send.message, host: h,
+      type: send.type, origin: send.origin, traceparent: send.traceparent, message: send.message, host: send.host,
     };
     send.answer('reply', { ok: 1 }, { origin: new Address('tinyactors://t/@back') });
   });
@@ -73,7 +71,7 @@ test('a send view: each field read on first access and cached, valid until the a
 
 test('a view read after its ack throws TA_ERROR_STALE; what was read stays', async () => {
   let kept;
-  const { host, outcomes } = caller((h, send) => {
+  const { host, outcomes } = caller((send) => {
     kept = send;
     void send.event;
   });
@@ -90,7 +88,7 @@ test('a view read after its ack throws TA_ERROR_STALE; what was read stays', asy
 
 test('a view kept and used from a bare timer is stale there', async () => {
   let late;
-  const { host, outcomes } = caller((h, send) => {
+  const { host, outcomes } = caller((send) => {
     setTimeout(() => {
       try { send.answer('reply'); } catch (error) { late = error; }
     }, 1);
@@ -104,7 +102,7 @@ test('a view kept and used from a bare timer is stale there', async () => {
 
 test('answer and fail: once, refused after either; options are checked', async () => {
   const refusals = [];
-  const { host, outcomes } = caller((h, send) => {
+  const { host, outcomes } = caller((send) => {
     for (const bad of [() => send.answer(1), () => send.answer('reply', undefined, { traceID: 'x' }),
       () => send.answer('reply', undefined, 'options'), () => send.answer('reply', undefined, { origin: 5 })]) {
       try { bad(); } catch (error) { refusals.push(error instanceof TypeError); }
@@ -121,7 +119,7 @@ test('answer and fail: once, refused after either; options are checked', async (
 
 test('answer() and fail() give true when delivered and false when the sender ended; a closed host still throws', async () => {
   const now = [];
-  const first = caller((h, send) => { now.push(send.answer('reply', { n: 2 })); });
+  const first = caller((send) => { now.push(send.answer('reply', { n: 2 })); });
   await first.host.idle();
   equal(now.join(), 'true', 'delivered in the handler');
   first.host.close();
@@ -129,10 +127,10 @@ test('answer() and fail() give true when delivered and false when the sender end
     let release, view;
     const gate = new Promise((resolve) => { release = resolve; });
     const got = [];
-    const { host, outcomes } = caller(async (h, send) => { view = send; await gate; got.push(reply(send)); });
+    const { host, outcomes } = caller(async (send) => { view = send; await gate; got.push(reply(send)); });
     if (!(await until(() => view !== undefined))) throw new Error('the handler was never called');
-    host.terminate(host.actorByName('caller'));
-    if (!(await until(() => host.actorByName('caller') === undefined))) throw new Error('the caller did not end');
+    host.terminate(named(host, 'caller'));
+    if (!(await until(() => named(host, 'caller') === undefined))) throw new Error('the caller did not end');
     release();
     if (!(await until(() => got.length > 0))) throw new Error('the late reply never ran');
     equal(got.join(), 'false', 'not delivered: the sender ended');
@@ -157,13 +155,12 @@ test('answer keeps the send\'s trace; traceparent: null starts a new one', async
     <state id="u"><onentry><send type="urn:out" target="c" event="third"/></onentry></state>`);
   const traces = {};
   const host = hostWith({ tracer: chart }, {
-    config: OUT,
     ioProcessors: {
-      'urn:out': (h, send) => {
+      'urn:out': processor((send) => {
         traces[send.event] = send.traceparent.split('-')[1];
         if (send.event === 'first') send.answer('kept');
         if (send.event === 'second') send.answer('fresh', undefined, { traceparent: null });
-      },
+      }),
     },
   });
   const trace = '0af7651916cd43dd8448eb211c80319c';
@@ -177,11 +174,11 @@ test('answer keeps the send\'s trace; traceparent: null starts a new one', async
 
 test('an untraced send has no traceparent', async () => {
   let traceparent = 'unread';
-  const { host } = caller((h, send) => {
+  const { host } = caller((send) => {
     traceparent = send.traceparent;
     equal('traceparent' in send.message, true, 'message has the key');
     send.answer('reply');
-  }, { config: { ...OUT, system: { tracing: false } } });
+  }, { config: { system: { tracing: false } } });
   await host.idle();
   equal(traceparent, undefined, 'traceparent');
   host.close();
@@ -189,12 +186,12 @@ test('an untraced send has no traceparent', async () => {
 
 test('a handler returning a promise: its view is filled before the ack and answers after it; idle() waits for it', async () => {
   for (const make of [
-    (resolve) => async (h, send) => { await resolve; send.answer('reply', { late: send.sendid }); },
-    (resolve) => (h, send) => resolve.then(() => send.answer('reply', { late: send.target })), // a plain function
+    (resolve) => async (send) => { await resolve; send.answer('reply', { late: send.sendid }); },
+    (resolve) => (send) => resolve.then(() => send.answer('reply', { late: send.target })), // a plain function
   ]) {
     let release, called = false;
     const gate = new Promise((resolve) => { release = resolve; });
-    const { host, outcomes } = caller((h, send) => { called = true; return make(gate)(h, send); });
+    const { host, outcomes } = caller((send) => { called = true; return make(gate)(send); });
     if (!(await until(() => called))) throw new Error('the handler was never called');
     equal(outcomes.length, 0, 'not answered yet');
     setTimeout(release, 20);
@@ -239,7 +236,7 @@ test('a promise that rejects before an answer fails the send and stays unhandled
 test('a promise that rejects after an answer fails nothing', async () => {
   let outcomes;
   const seen = await unhandled(async () => {
-    const made = caller(async (h, send) => { send.answer('reply'); await sleep(1); throw new Error('late'); });
+    const made = caller(async (send) => { send.answer('reply'); await sleep(1); throw new Error('late'); });
     outcomes = made.outcomes;
     await made.host.idle();
     await sleep(20);
@@ -262,17 +259,22 @@ test('a handler that throws: error.communication for the sender, the error rejec
 });
 
 test('a handler that answers, then throws: the answer stands', async () => {
-  const { host, outcomes } = caller((h, send) => { send.answer('reply'); throw new Error('after'); });
+  const { host, outcomes } = caller((send) => { send.answer('reply'); throw new Error('after'); });
   await host.idle().catch(() => {});
   await host.idle();
   equal(outcomes.join(), 'reply undefined x1 undefined undefined', 'answered');
   host.close();
 });
 
-test('an I/O processor without a handler fails each send to it', async () => {
-  const { host, outcomes } = caller(undefined);
+test('a send to a type no I/O processor serves is error.execution, as SCXML has it', async () => {
+  const lines = [];
+  const host = hostWith({ undeclared: scxml('undeclared', `<state id="s">
+    <onentry><send type="urn:out" event="out"/></onentry>
+    <transition event="error.execution"><log expr="'execution'"/></transition>
+    <transition event="error.communication"><log expr="'communication'"/></transition></state>`) }, { log: (entry) => lines.push(entry.text) });
+  host.spawn('undeclared');
   await host.idle();
-  equal(outcomes.join(), 'failed x1', 'error.communication');
+  equal(lines.join(), 'execution', 'error.execution');
   host.close();
 });
 
@@ -296,7 +298,7 @@ const PONG = scxml('pong', `
 
 test('the transport without a handler fails each send to another system', async () => {
   const outcomes = [];
-  const host = hostWith({ remote: REMOTE }, { log: (h, entry) => outcomes.push(entry.text) });
+  const host = hostWith({ remote: REMOTE }, { log: (entry) => outcomes.push(entry.text) });
   const session = host.spawn(host.chart('remote'));
   host.send(session, 'go', { to: 'tinyactors://elsewhere/#_scxml_5' });
   await host.idle();
@@ -306,12 +308,12 @@ test('the transport without a handler fails each send to another system', async 
 
 test('the transport: send.target and send.origin are Addresses, send.message crosses to the other host', async () => {
   const lines = [];
-  const other = new Host({ systemID: 'other' }, { ...ENGINE, log: (h, entry) => lines.push(entry.text) });
+  const other = new Host([], { system: 'other', ...ENGINE, log: (entry) => lines.push(entry.text) });
   other.addImage(image({ pong: PONG }));
   const pong = other.spawn(other.chart('pong'), { name: 'pong' });
   let seen;
   const host = hostWith({ remote: REMOTE }, {
-    transport: (h, send) => {
+    transport: (send) => {
       seen = { type: send.type, target: send.target, origin: send.origin };
       other.send(send.message);
     },
@@ -322,8 +324,8 @@ test('the transport: send.target and send.origin are Addresses, send.message cro
   equal(seen.type, undefined, 'the transport\'s type');
   if (!(seen.target instanceof Address) || !(seen.origin instanceof Address)) throw new Error('Addresses');
   equal(seen.target.system, 'other', 'target system');
-  equal(seen.target.session, pong, 'target session');
-  equal(seen.origin.session, session, 'origin session');
+  equal(seen.target.session, pong.id, 'target session');
+  equal(seen.origin.session, session.id, 'origin session');
   await other.idle();
   equal(lines.join(), `ping 2 ${seen.origin.text} p1`, 'the other side got it, with origin and sendid');
   host.close();
@@ -336,7 +338,7 @@ test('send.message: a text field the send lacks is null, so encoded it is absent
   let message;
   const host = hostWith({ bare: chart }, {
     config: { ...CONFIG, system: { tracing: false } },
-    transport: (h, send) => { message = send.message; },
+    transport: (send) => { message = send.message; },
   });
   host.spawn(host.chart('bare'));
   await host.idle();
@@ -355,7 +357,7 @@ test('log entries: session, label, text, stale after the ack; none without a han
   const entries = [];
   let kept;
   const host = hostWith({ logger: chart }, {
-    log: (h, entry) => {
+    log: (entry) => {
       kept = entry;
       entries.push([entry.session, entry.label, entry.text]);
     },
@@ -363,7 +365,7 @@ test('log entries: session, label, text, stale after the ack; none without a han
   const session = host.spawn(host.chart('logger'));
   await host.idle();
   equal(entries.length, 2, 'two lines');
-  equal(entries[0][0], session, 'session');
+  equal(entries[0][0], session.id, 'session');
   equal(entries[0][1], 'greeting', 'label');
   equal(entries[0][2], 'hello', 'text');
   equal(entries[1][1], '', 'no label');
@@ -378,7 +380,7 @@ test('log entries: session, label, text, stale after the ack; none without a han
 test('a log entry not read in its handler is stale after the ack', async () => {
   let kept;
   const host = hostWith({ logger: scxml('logger', `<state id="s"><onentry><log label="l" expr="'x'"/></onentry></state>`) }, {
-    log: (h, entry) => { kept = entry; },
+    log: (entry) => { kept = entry; },
   });
   host.spawn(host.chart('logger'));
   await host.idle();
@@ -388,7 +390,7 @@ test('a log entry not read in its handler is stale after the ack', async () => {
 
 test('views are made by the host only', () => {
   let made;
-  const { host } = caller((h, send) => { made = send; send.answer('reply'); });
+  const { host } = caller((send) => { made = send; send.answer('reply'); });
   return host.idle().then(() => {
     throws(() => new made.constructor(), typeError, 'new Send()');
     throws(() => Object.getOwnPropertyDescriptor(Object.getPrototypeOf(made), 'event').get.call({}), typeError, 'a getter on another object');
@@ -409,11 +411,10 @@ test('send.data is the application\'s: its arrays are Arrays here, and XML conte
     </state>`);
   const got = {};
   const host = hostWith({ realm: chart }, {
-    config: OUT,
     ioProcessors: {
-      'urn:out': (h, send) => {
+      'urn:out': processor((send) => {
         try { got[send.event] = send.data; } catch (error) { got[send.event] = error.status; }
-      },
+      }),
     },
   });
   host.spawn(host.chart('realm'));
@@ -434,7 +435,7 @@ test('send.data and undefined: kept on the native datamodel, JSON\'s rules on qu
       <onentry><send type="urn:out" event="holes"><content expr="({ a: undefined, b: [undefined, 1] })"/></send></onentry>
     </state>`);
   let data;
-  const host = hostWith({ holes: chart }, { config: OUT, ioProcessors: { 'urn:out': (h, send) => { data = send.data; } } });
+  const host = hostWith({ holes: chart }, { ioProcessors: { 'urn:out': processor((send) => { data = send.data; }) } });
   host.spawn(host.chart('holes'));
   await host.idle();
   host.close();

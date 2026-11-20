@@ -73,7 +73,7 @@ function heap() {
 }
 
 const gc = await collector();
-const host = new Host({ systemID: 'm', system: { maxActors: 2 * N + 16, maxEvents: N + 4096, tracing: false } }, { datamodel: DATAMODEL });
+const host = new Host([], { system: 'm', config: { system: { maxActors: 2 * N + 16, maxEvents: N + 4096, tracing: false } }, datamodel: DATAMODEL });
 const compiled = compileCharts([{ name: 'fit.scxml', text: await chartText() }]);
 host.addImage(compiled.image);
 compiled.close();

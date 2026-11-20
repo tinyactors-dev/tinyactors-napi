@@ -4,7 +4,7 @@
 // examples` (`node test.mjs`, `bun test ./test.mjs`).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SimulatedClock } from '@tinyactors/node';
+import { SimulatedClock, UnsupportedError } from '@tinyactors/node';
 import { Billing } from './billing.mjs';
 import { DAY, HOUR, run } from './main.mjs';
 import { drive, rollout } from './rollout.mjs';
@@ -29,10 +29,9 @@ const events = (billing, session) => of(billing, session).map((m) => m.event);
 const variables = async (billing, session) => (await billing.host.actorContext({ session })).variables;
 const state = async (billing, session) => (await billing.host.actorState({ session })).value;
 
-/** Runs `migration` to its end, waking what it asks for `batch` at a time
- * and moving the clock `stepMs` a round. */
-const finish = (billing, migration, { batch = 100, stepMs = 1000, maxResident = Infinity } = {}) =>
-  drive(billing, [migration], { batch, stepMs, maxResident }).then(([result]) => result);
+/** Runs `migration` to its end, moving the clock `stepMs` a round. */
+const finish = (billing, migration, { stepMs = 1000 } = {}) =>
+  drive(billing, [migration], { stepMs }).then(([result]) => result);
 
 for (const datamodel of ['native', 'quickjs']) {
   test(`${datamodel}: a subscription moves to release 2 with its invoices and its pending renewal`, async () => {
@@ -119,7 +118,7 @@ for (const datamodel of ['native', 'quickjs']) {
         assert.deepEqual(migration.result, { migration: migration.id, migrated: 1, failed: 1, pending: [] });
         assert.deepEqual(migration.moved, [{ session: bob, segment, chart: 'subscription' }]);
         assert.equal(await billing.releaseOf(ada), 1);
-        assert.equal(billing.hibernate(ada), false, 'what a migration cannot write out, hibernation cannot either');
+        assert.throws(() => billing.host.hibernate(ada), UnsupportedError, 'what a migration cannot write out, hibernation cannot either');
 
         // it goes on, on release 1: the discounted renewal clears the stamp
         await billing.advance(30 * DAY);
@@ -232,44 +231,42 @@ for (const datamodel of ['native', 'quickjs']) {
     }
   });
 
-  test(`${datamodel}: hibernated actors hold a migration without wake until its timeout; with wake they are asked for and woken a batch at a time`, async () => {
-    const { billing } = setup(datamodel);
+  test(`${datamodel}: hibernated actors hold a migration without wake until its timeout; with wake the host loads them as its resident bound allows`, async () => {
+    const clock = new SimulatedClock();
+    const billing = new Billing({
+      clock, gateway: new PaymentGateway({ clock }), datamodel, maxResident: 1,
+      plan: { cycleMs: 30 * DAY, retryMs: DAY, maxRetries: 6, graceMs: 3 * DAY },
+    });
     try {
+      billing.deploy(1);
       const sessions = ['a', 'b', 'c', 'd', 'e'].map((customer) => billing.subscribe(customer));
       await billing.settle();
-      billing.evict(0);
-      assert.equal(billing.store.size, 5);
+      assert.equal(billing.store.size, 4, 'one in memory, the rest in the store');
+      const [awake] = sessions.filter((session) => !billing.store.has(session));
+      const asleep = sessions.filter((session) => billing.store.has(session));
       billing.deploy(2);
 
       const cold = billing.migrate({ chart: 'subscription', timeout: 60_000 });
       await billing.advance(60_000);
       assert.deepEqual({ ...cold.result, pending: cold.result.pending.toSorted() },
-        { migration: cold.id, migrated: 0, failed: 0, pending: sessions });
-      assert.deepEqual(billing.migrationWakes, [], 'no wake was asked for');
-      assert.equal(await billing.releaseOf(sessions[0]), 1, 'a hibernated actor answers actorGet');
+        { migration: cold.id, migrated: 1, failed: 0, pending: asleep });
+      assert.equal(await billing.releaseOf(awake), 2, 'the one in memory moved');
+      assert.equal(await billing.releaseOf(asleep[0]), 1, 'a hibernated actor answers actorGet');
 
+      const loaded = billing.counts.woken;
       const warm = billing.migrate({ chart: 'subscription', wake: true });
-      await billing.settle();
-      assert.deepEqual(billing.migrationWakes.toSorted((a, b) => Number(a.session - b.session)),
-        sessions.map((session) => ({ session, migration: warm.id })));
-      // an event for one of them wakes it at once, and the migration takes it
-      billing.changePlan('e', 'pro', 2900);
-      await billing.settle();
-      assert.equal(billing.counts.wokenForEvents, 1);
-      assert.deepEqual(warm.moved.map((moved) => moved.session), [sessions[4]]);
-      billing.evict(0);
-
       let mostResident = 0;
       while (warm.result === undefined) {
-        billing.wakeForMigrations(2);
         await billing.advance(1000);
         mostResident = Math.max(mostResident, (await billing.counters()).resident);
-        billing.evict(0);
       }
-      assert.deepEqual(warm.result, { migration: warm.id, migrated: 5, failed: 0, pending: [] });
-      assert.equal(mostResident, 2, 'two at a time');
-      assert.equal(billing.counts.wokenForMigrations, 4);
+      assert.deepEqual(warm.result, { migration: warm.id, migrated: 4, failed: 0, pending: [] });
+      assert.equal(mostResident, 1, 'one at a time, between turns');
+      assert.equal(billing.counts.woken - loaded, 4, 'each loaded once');
       for (const session of sessions) assert.equal(await billing.releaseOf(session), 2);
+      // an event for one of them loads it, and it runs release 2's chart
+      billing.changePlan('e', 'pro', 2900);
+      await billing.settle();
       assert.deepEqual(of(billing, sessions[4], 'plan.changed').map((m) => m.price), [2900]);
     } finally {
       billing.close();
@@ -330,7 +327,7 @@ for (const datamodel of ['native', 'quickjs']) {
       for (const migration of report.migrations) assert.equal(migration.moved, migration.result.migrated);
       assert.ok(result.v2Invoices > 0);
       assert.equal(result.after.retired, 1);
-      assert.ok(result.counts.wokenForMigrations > 0, 'hibernated actors were woken for the rollout');
+      assert.ok(result.counts.woken > 0, 'hibernated actors were loaded for the rollout');
     } finally {
       result.close();
     }

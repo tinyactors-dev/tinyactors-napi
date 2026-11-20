@@ -18,6 +18,8 @@ export const REASONS = {
 export const EXCLUDED = {
   'address.test.mjs': {
   },
+  'actors.test.mjs': {
+  },
   'compile.test.mjs': {
   },
   'convenience.test.mjs': {
@@ -64,9 +66,9 @@ export const EXCLUDED = {
   'services.test.mjs': {
   },
   'shapes.test.mjs': {
-    "directoryResolver reads source relative to base under its root": ['fs', 'browser'],
-    "directoryResolver refuses what leaves its root: .., an absolute path, a symbolic link": ['fs', 'browser'],
-    "directoryResolver: text is UTF-8 or refused; other errors of the file system pass; the root must exist": ['fs', 'browser'],
+    "compileDir compiles every *.scxml under the directory, named by its path and sorted; a src read relative to its document": ['fs', 'browser'],
+    "compileDir refuses a src that leaves the directory: .., an absolute path, a symbolic link": ['fs', 'browser'],
+    "compileDir refuses what is not a directory of charts, and src that is not UTF-8": ['fs', 'browser'],
   },
   'snapshot.test.mjs': {
   },

@@ -93,27 +93,26 @@ const chart = `
 // 2. Compile it into an image the host can load.
 const compiled = compileCharts([{ name: 'order.scxml', text: chart }]);
 
-// 3. A host, with a handler for what the chart sends to urn:payments.
-const host = new Host(
-  { systemID: 'shop', ioProcessors: [{ type: 'urn:payments' }] },
-  {
-    ioProcessors: {
-      'urn:payments': (host, send) => {
+// 3. A host of the image, with a processor for what the chart sends to urn:payments.
+const host = new Host(compiled, {
+  system: 'shop',
+  ioProcessors: {
+    'urn:payments': {
+      receive(send) {
         console.log(`charging ${send.data.amount} to ${send.target}`);
         send.answer('charged');
       },
     },
-    log: (host, entry) => console.log(`${entry.label}: ${entry.text}`),
   },
-);
-host.addImage(compiled.image);
+  log: (entry) => console.log(`${entry.label}: ${entry.text}`),
+});
 compiled.close();
 
 // 4. An actor of the chart, and three events for it.
-const order = host.spawn(host.chart('order'));
-host.send(order, 'add', { price: 4 });
-host.send(order, 'add', { price: 7 });
-host.send(order, 'checkout');
+const order = host.spawn('order');
+order.send('add', { price: 4 });
+order.send('add', { price: 7 });
+order.send('checkout');
 
 // 5. Let it run, then stop.
 await host.idle();
@@ -139,14 +138,15 @@ What happened, step by step:
    `CompileError` here, before anything runs. JavaScript that does not
    parse is a warning in `compiled.diagnostics` (SCXML makes it an
    `error.execution` when it runs), and an error with
-   `compileCharts(sources, undefined, { warningsAsErrors: true })`.
-3. **`new Host(config, options)`** makes a host. The config names this
-   system (`systemID`) and the I/O processors its charts may send to; the
-   options hold your handlers. The `urn:payments` handler gets each send
-   to that type: its data, its target, and `answer()`, which sends an
-   event back to the actor that sent it.
-4. **`host.spawn`** starts an actor of the chart and returns its session
-   id, a `bigint`. `host.send` puts an event in its queue.
+   `compileCharts(sources, { warningsAsErrors: true })`.
+3. **`new Host(charts, options)`** makes a host and adds the compiled
+   images to it, so the compile result can be closed at once. `system`
+   names this system; `ioProcessors` are the I/O processors its charts
+   may send to, each an object whose `receive(send)` gets each send to
+   that type: its data, its target, and `answer()`, which sends an event
+   back to the actor that sent it.
+4. **`host.spawn('order')`** starts an actor of the chart named `order`
+   and returns it, an `Actor`. `order.send` puts an event in its queue.
 5. **`await host.idle()`** waits until the host has nothing left to do.
    The actor runs on the event loop on its own; `idle()` only watches.
    `host.close()` frees the host.
@@ -194,8 +194,7 @@ for how such a loop shows in the host's counters.
 
 [Writing charts](docs/guide/charts.md) covers the JavaScript a chart may
 hold, `<script>`, XML data, several charts in one image (and
-`host.addCharts`, `host.spawnChart` and `directoryResolver`, which save
-the steps), and `<invoke>`.
+`compileDir`, which compiles a directory of them), and `<invoke>`.
 
 ### Starting an actor with data
 
@@ -219,13 +218,12 @@ const compiled = compileCharts([{ name: 'greeter.scxml', text: `
   </state>
 </scxml>` }]);
 
-const host = new Host({ systemID: 'demo' }, { log: (host, entry) => console.log(entry.text) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'demo', log: (entry) => console.log(entry.text) });
 compiled.close();
 
-host.spawn(host.chart('greeter'));
-host.spawn(host.chart('greeter'), { params: { who: 'Ada' } });
-host.spawn(host.chart('greeter'), { params: { greeting: 'Hi', who: 'Bob', mood: 'ignored' } });
+host.spawn('greeter');
+host.spawn('greeter', { params: { who: 'Ada' } });
+host.spawn('greeter', { params: { greeting: 'Hi', who: 'Bob', mood: 'ignored' } });
 await host.idle();
 host.close();
 ```
@@ -253,11 +251,6 @@ handler starts and does not return is not waited for). It is for tests, scripts 
 call it. A handler may call the host (send an event, spawn an actor): the
 input applies at once, and the actors run in the same or a later turn.
 
-Each `addImage` makes a **segment**: the host's memory for that image's
-actors, numbered from 0, which `addImage` returns. A host runs many
-segments as one; you need the number for `boot` and see it in the host's
-statistics.
-
 A host also keeps time. A delayed `<send>` or a timeout is a deadline,
 and an idle host arms one `setTimeout` for its next one. That timer keeps
 the process alive while the host is open, as any `setTimeout` does, and
@@ -268,29 +261,40 @@ frees the host, and drops every handler that was still waiting.
 
 ### Actors, sessions and addresses
 
-`spawn` returns the actor's **session**, a `bigint` unique in its host.
-Inputs take it back: `host.send(session, event, data)`,
-`host.terminate(session)`. They also take a number that is a safe
-integer, since that is what a database or JSON gives back. The calls and
-views return sessions as `bigint`s (`console.log` prints `1n`, and
+`spawn` returns an **`Actor`**: the host it lives in and its **session**,
+`actor.id`, a `bigint` unique in its host. The actor takes inputs itself
+(`actor.send(event, data)`, `actor.terminate()`), answers the typed
+methods as promises (`await actor.state()`, `actor.context()`,
+`actor.get()`), and `actor.done` settles with its donedata when it ends.
+`host.actor(which)` gives the `Actor` of a session (a `bigint`, or a
+number that is a safe integer, since that is what a database or JSON
+gives back), of a name or of an address, and throws `StaleError` for one
+that is not live; two `Actor`s of one session are `equals`, not `===`.
+The host's own inputs take an `Actor` or a session alike:
+`host.send(actor, event, data)`, `host.terminate(actor.id)`.
+
+The views a handler gets hold the session as a `bigint` (`send.session`,
+with `send.sender` its `Actor`; `console.log` prints `1n`, and
 `JSON.stringify` refuses one: convert with `String()` or `Number()`
 yourself), while the results of the typed methods
 ([Inspecting a host](docs/guide/inspection.md)) hold them as numbers. So
-compare with `Number(session) === listed`, never `===` across the two;
-either kind may be passed back to an input.
+compare with `Number(actor.id) === listed`, never `===` across the two,
+and `await host.actors()` gives the `Actor`s themselves.
 
 ```js
-import { Host } from '@tinyactors/node';
+import { compileCharts, Host } from '@tinyactors/node';
 
-const host = new Host({ systemID: 'demo' });
-host.addCharts({ 'idle.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
-    datamodel="ecmascript" name="idle"><state id="s"/></scxml>` });
-const session = host.spawnChart('idle', { name: 'first' });
+const compiled = compileCharts([{ name: 'idle.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+    datamodel="ecmascript" name="idle"><state id="s"/></scxml>` }]);
+const host = new Host(compiled, { system: 'demo' });
+compiled.close();
+const actor = host.spawn('idle', { name: 'first' });
 const { sessions } = await host.actorList();
-console.log(typeof session, typeof sessions[0]);
-console.log(sessions.includes(Number(session)), sessions.map(BigInt).includes(session));
-const byKey = new Map([[String(session), 'kept under its text']]);
-console.log(byKey.get(String(sessions[0])), host.actorByName('first') === session);
+console.log(typeof actor.id, typeof sessions[0]);
+console.log(sessions.includes(Number(actor.id)), host.actor(sessions[0]).equals(actor));
+const byKey = new Map([[String(actor.id), 'kept under its text']]);
+console.log(byKey.get(String(sessions[0])), host.actor('first').equals(actor));
+console.log((await host.actors()).length, (await actor.state()).value);
 host.close();
 ```
 
@@ -298,33 +302,35 @@ host.close();
 bigint number
 true true
 kept under its text true
+1 s
 ```
 
-`sessions.includes(session)` would be `false` (TypeScript refuses it),
+`sessions.includes(actor.id)` would be `false` (TypeScript refuses it),
 and a `Map` keyed by the `bigint` misses the number: key it by
-`String(session)`, which is the same for both kinds.
+`String(actor.id)`, which is the same for both kinds.
 
 An actor may also have a **name**, given at spawn, and
-`host.actorByName(name)` finds it. An actor that reaches a `<final>`
+`host.actor(name)` finds it. An actor that reaches a `<final>`
 state, or is terminated, ends: its session is refused from then on with
 `TA_ERROR_STALE`, and its name finds nothing. The events still in its
 queue when it ends are dropped, as SCXML ends a session at its top-level
-`<final>`: a `host.send` that returned before the end is never handled,
+`<final>`: an `actor.send` that returned before the end is never handled,
 and nothing tells the application. A chart whose events stand for
 requests your program holds (an HTTP response, a promise) tells your
 program from its `<final>` first:
 [I/O processors](docs/guide/io-processors.md#when-the-sender-ends) has the
-pattern.
+pattern. `actor.done`, and the host's `onDone(actor, donedata)`, tell your
+program when an actor started with `spawn` ends.
 
-Actors find each other by **address**. Every system has its `systemID`,
-and an actor's address is `tinyactors://<systemID>/#_scxml_<session>`, or
-`tinyactors://<systemID>/@<name>` for a named one. A chart sends to
+Actors find each other by **address**. Every system has its name, the
+host's `system` option, and an actor's address is `tinyactors://<system>/#_scxml_<session>`, or
+`tinyactors://<system>/@<name>` for a named one. A chart sends to
 another actor with `<send target="tinyactors://shop/@pong" event="ping"/>`,
-and the receiver answers to `_event.origin`. The `Address` class reads
-and makes them:
+and the receiver answers to `_event.origin`. `actor.address` is an
+actor's address, and `host.actor` takes one:
 
 ```js
-import { compileCharts, Host, Address } from '@tinyactors/node';
+import { compileCharts, Host } from '@tinyactors/node';
 
 const pong = `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
@@ -347,20 +353,22 @@ const ping = `
 </scxml>`;
 
 const compiled = compileCharts([{ name: 'ping.scxml', text: ping }, { name: 'pong.scxml', text: pong }]);
-const host = new Host({ systemID: 'demo' }, { log: (host, entry) => console.log(entry.text) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'demo', log: (entry) => console.log(entry.text) });
 compiled.close();
 
-const pongSession = host.spawn(host.chart('pong'), { name: 'pong' });
-const pingSession = host.spawn(host.chart('ping'));
+const pongActor = host.spawn('pong', { name: 'pong' });
+const pingActor = host.spawn('ping');
 await host.idle();
 
-console.log(Address.fromSession('demo', pongSession).text);
-console.log(new Address('tinyactors://demo/@pong').name);
-console.log(host.actorByName('pong') === pongSession);
-host.terminate(pongSession);
+console.log(pongActor.address.text);
+console.log(host.actor('pong').equals(pongActor), host.actor('tinyactors://demo/@pong').id);
+pongActor.terminate();
 await host.idle();
-console.log(host.actorByName('pong'), pingSession);
+try {
+  host.actor('pong');
+} catch (error) {
+  console.log(error.constructor.name, pingActor.id);
+}
 host.close();
 ```
 
@@ -368,10 +376,16 @@ host.close();
 pong got ping
 ping got pong
 tinyactors://demo/#_scxml_1
-pong
-true
-undefined 2n
+true 1n
+StaleError 2n
 ```
+
+A send to an actor that is not there fails: the chart gets
+`error.communication`, your program a `StaleError`. What to do instead
+(keep the actor and let it hibernate, route the send through your code,
+or handle the failure) is your application's choice, per kind of actor:
+[When the actor is not there](docs/guide/missing-actors.md) shows all
+three, and how to choose names that an address holds as they are.
 
 ### Effects and handlers
 
@@ -380,18 +394,18 @@ a handler you give the host in its options:
 
 | The chart does | Your handler | Guide |
 |---|---|---|
-| `<send type="urn:x">` to an I/O processor the config lists | `ioProcessors: { 'urn:x': (host, send) => ... }` | [I/O processors](docs/guide/io-processors.md) |
-| `<send>` to an actor of another system | `transport: (host, send) => ...` | [Other systems](docs/guide/other-systems.md) |
-| `<invoke type="urn:y">` of a service you run | `services: { 'urn:y': (host, invocation) => service }` | [Invoked services](docs/guide/services.md) |
-| `<log>` | `log: (host, entry) => ...` | this README |
-| spans, logs and metrics as OpenTelemetry (OTLP) | `telemetry: (host, signal, data) => ...` | [Telemetry](docs/guide/telemetry.md) |
-| an event for an actor you took out of memory | `wake: (host, session, migration) => ...` | [Hibernation](docs/guide/hibernation.md) |
+| `<send type="urn:x">` to an I/O processor | `ioProcessors: { 'urn:x': { receive(send) { ... } } }` | [I/O processors](docs/guide/io-processors.md) |
+| `<send>` to an actor of another system | `transport: (send) => ...` | [Other systems](docs/guide/other-systems.md) |
+| `<invoke type="urn:y">` of a service you run | `services: { 'urn:y': (invocation) => service }` | [Invoked services](docs/guide/services.md) |
+| `<log>` | `log: (entry) => ...` | this README |
+| spans, logs and metrics as OpenTelemetry (OTLP) | `telemetry: (signal, data) => ...` | [Telemetry](docs/guide/telemetry.md) |
+| reaches a top-level `<final>` | `onDone: (actor, donedata) => ...`, or `await actor.done` | this README |
+| more actors than `resident` in memory | `store: { save, load, delete }` | [Hibernation](docs/guide/hibernation.md) |
 
-A send to an I/O processor the config lists but no handler serves is
-failed: the sender gets the event `error.communication`, so a chart can
-always react. A send to a type the config does not list at all raises
-`error.execution` in the chart. `<log>` lines without
-a `log` handler are dropped.
+A send to a type no I/O processor serves raises `error.execution` in the
+chart. `<log>` lines without a `log` handler are dropped. Each view a
+handler gets has its `host` (`send.host`, `entry.host`), so a handler
+needs no closure over the host it serves.
 
 **A handler's argument is a view, valid while the handler runs.** The
 `send` an I/O processor gets reads each field from the host's memory when
@@ -413,30 +427,8 @@ chart never holds your object, and what a chart hands you (`send.data`,
 `instanceof Array`, and `assert.deepStrictEqual` compares it with a
 literal. `undefined` and `null` stay apart; a
 whole number past 2^53 comes back as a `bigint`.
-
-`encode(value)` and `decode(bytes)` give that table as CBOR bytes, the
-form a value takes when you store or send it:
-
-```js
-import { encode, decode } from '@tinyactors/node';
-
-const bytes = encode({ sku: 'tea', qty: 2, big: 2n ** 60n, gone: undefined });
-const value = decode(bytes);
-console.log(bytes.length, 'bytes');
-console.log(value.sku, value.qty, value.big, 'gone' in value, value.gone);
-```
-
-```output
-33 bytes
-tea 2 1152921504606846976n true undefined
-```
-
-`encode` also writes an `Address` (from "Actors, sessions and
-addresses"), as CBOR's tag 32, and `decode` reads one back as an
-`Address`: that is how a transport's message keeps its addresses
-([Other systems](docs/guide/other-systems.md)).
 [docs/values.md](docs/values.md) has every row of the table and every
-refusal.
+refusal, and "Wire format" (below) the table as bytes.
 
 ### Time and the SimulatedClock
 
@@ -469,11 +461,10 @@ const compiled = compileCharts([{ name: 'door.scxml', text: `
 </scxml>` }]);
 
 const clock = new SimulatedClock();
-const host = new Host({ systemID: 'demo' }, { clock, log: (host, entry) => console.log(entry.text, 'at', clock.now) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'demo', clock, log: (entry) => console.log(entry.text, 'at', clock.now) });
 compiled.close();
 
-host.spawn(host.chart('door'));
+host.spawn('door');
 await host.idle();
 console.log('next deadline in', host.nextDeadline, 'ms');
 clock.increment(29_999);
@@ -517,9 +508,13 @@ Errors surface in four places:
   message is the first error as `file:line:column: error: message`, and
   whose `diagnostics` holds them all.
 - **At a call,** the host throws a `TinyactorsError` for what it refuses
-  at once: a chart it does not have, a session that ended or never was, a
-  config it does not take. Branch on `error.status` (`'TA_ERROR_STALE'`,
-  `'TA_ERROR_INVALID'`, ...); the message is for people. A refused config
+  at once, as the subclass of its status: `StaleError` for a session that
+  ended or never was, `StateError` for a call the host cannot make now (a
+  closed host), `InvalidError` for an argument it refuses (a chart it does
+  not have, a config it does not take), `UnsupportedError` for a value it
+  does not take. Catch the class you handle; `error.status` is core's name
+  for the status (`'TA_ERROR_STALE'`, ...), and the message is for people.
+  A typed method's error is the subclass of its code too. A refused config
   also has `error.path`, the key it is about (`system.maxActors`), and
   `error.reason`. Arguments of the
   wrong JavaScript type throw a `TypeError`.
@@ -539,8 +534,10 @@ Errors surface in four places:
   action failed, turn on [telemetry](docs/guide/telemetry.md), whose spans
   and log records mark the failed action.
 - **In your handlers,** an error a handler throws is reported after its
-  turn: it rejects a waiting `host.idle()`, or, with none waiting, is
-  thrown as an uncaught exception (below).
+  turn: to the host's `onHandlerError(error, effect)` when you give one
+  (with the view the handler was given), else it rejects a waiting
+  `host.idle()`, or, with none waiting, is thrown as an uncaught
+  exception (below).
 
 ```js
 import { compileCharts, CompileError, Host, TinyactorsError } from '@tinyactors/node';
@@ -554,9 +551,9 @@ try {
   console.log(error.message);
 }
 
-const host = new Host({ systemID: 'demo' });
+const host = new Host([], { system: 'demo' });
 try {
-  host.chart('missing');
+  host.spawn('missing');
 } catch (error) {
   if (!(error instanceof TinyactorsError)) throw error;
   console.log(error.status, '-', error.message);
@@ -574,8 +571,8 @@ TA_ERROR_INVALID - the host has no chart of that name
 - **Chart code is trusted code.** On the native datamodel (the default)
   a chart's expressions and scripts run in `node:vm` contexts of your own
   engine, and a `vm` context is not a security boundary. Run charts you do
-  not trust on quickjs, the sandbox: `new Host(config, { datamodel:
-  'quickjs', quickjs: { maxOps, memoryLimit } })`
+  not trust on quickjs, the sandbox: `new Host(charts, { system,
+  datamodel: 'quickjs', quickjs: { maxOps, memoryLimit } })`
   ([the quickjs sandbox](docs/guide/quickjs.md)).
 - **An open host with a pending deadline keeps the process alive, and
   only then** (a delayed `<send>`, a timeout, the telemetry flush): the host arms one
@@ -589,7 +586,8 @@ TA_ERROR_INVALID - the host has no chart of that name
   a handler (an I/O processor's, the log handler, the result handler of
   a typed method, one of the host's queries in
   [Inspecting a host](docs/guide/inspection.md))
-  rejects a waiting `host.idle()`; with none waiting it is thrown from the
+  goes to the host's `onHandlerError` when it has one, else rejects a
+  waiting `host.idle()`; with none waiting it is thrown from the
   host's turn as an uncaught exception, and a handler's promise that
   rejects is an unhandled rejection, as is a typed method's promise
   (`await host.actorState(...)`) that rejects with no `catch`. Either
@@ -599,62 +597,137 @@ TA_ERROR_INVALID - the host has no chart of that name
 - **`using host = new Host(...)` needs a runtime that parses `using`:**
   Bun 1.4 does, Node.js 22 does not. `Symbol.dispose` and
   `Symbol.asyncDispose` call `close()`, which works everywhere.
-- **A `<script>` that declares top-level names gives each session a
-  context of its own.** A chart whose scripts declare `var` or `function`,
-  or whose chart-level scripts declare `let`, `const` or `class`, at their
-  top level runs each of its sessions
-  in a `vm` context of its own (about 143 KB a session on Node.js, 60 KB
-  on Bun), so the script's functions close over its own variables. A
-  chart that declares nothing shares one context per host: declare the
-  function as a `<data>` and assign it in the script
-  (`<data id="price"/>`, `price = (sku) => ...`)
-  ([Writing charts](docs/guide/charts.md#scripts)).
-- **A chart whose chart-level scripts declare with `let`, `const` or
-  `class` keeps its sessions resident** (in a transition's script they
-  are the script's own, each run). Hibernation, migration and snapshots refuse its
-  sessions (`TA_ERROR_UNSUPPORTED`): a new context cannot be given those
-  bindings back. Declare with `var` and `function`, or hold the values in
-  `<data>`, for a chart whose sessions should hibernate.
+- **A script's top-level declarations are the session's or the
+  chart's, never a context of their own.** On the native datamodel every
+  session of a host is an object in the host's one `vm` context. A
+  chart-level `<script>`'s `function`s are the chart's helpers, made once
+  and seeing no session's variables by name (pass them what they read); a
+  top-level `var` is a variable of the session; a top-level `let`,
+  `const` or `class` is refused, the script's `error.execution`, and
+  `compileCharts` warns of each at its script's line, naming the
+  `<data id>` to declare instead
+  ([Writing charts](docs/guide/charts.md#scripts)). So every session can
+  be hibernated, migrated and snapshotted whatever its scripts declare.
 - **The charts of a host share the builtins of its shared context.** On
-  the native datamodel the charts that declare nothing run in one `vm`
-  context per host, so a chart that changes a builtin (`Math.random = ...`,
+  the native datamodel the charts run in one `vm` context per host, so a chart that changes a builtin (`Math.random = ...`,
   `Array.prototype.sum = ...`) changes it for the host's other charts
   there; its sessions' own variables stay apart. On quickjs the same holds,
   unless `quickjs: { realm: 'isolated' }` gives each session a context of
   its own ([the quickjs sandbox](docs/guide/quickjs.md#realms)).
 
+## Operating a host
+
+Everything above is the application's API: charts, a `Host` with its
+processors, store and handlers, `Actor`s. A host also answers the people
+who run it: how big it is, what it traces, which version of a chart its
+actors run. These calls are for an operator's tools, a deploy script or
+an admin endpoint; an application can do without them.
+
+| Calls | What they do | Guide |
+|---|---|---|
+| `host.hostStats()`, `host.hostConfig()`, `host.actorList()`, `host.actorGet()`; the `config` option's sizes, `host.quickjsHeapBytes` | the host's counters, its effective config, its actors page by page; sizing a host up front | [Inspecting a host](docs/guide/inspection.md), [Capacity and memory](docs/guide/capacity.md) |
+| the `telemetry` option, `host.metrics()`, `host.traceConfigure()`, `traceWatch()`, `traceUnwatch()`, `traceEnd()`, `traceSpansDecode()` | traces, logs and metrics as OpenTelemetry (OTLP), and what is traced | [Telemetry](docs/guide/telemetry.md) |
+| `host.sweep()`, `host.hibernate()`, `host.wake()` | hibernation by a policy of your own, in place of `resident` | [Hibernation](docs/guide/hibernation.md#a-policy-of-your-own) |
+| `host.addImage()`, `host.chart()`, `host.boot()`; `host.migrate()`, the `migrated` and `migrationDone` options | images and segments; moving running actors to a new version of their chart | [Migration](docs/guide/migration.md), [Writing charts](docs/guide/charts.md#a-system-that-starts-its-own-actors) |
+| `host.snapshot()`, `Host.restore()` | the whole host as one blob, and a host restored from it | [Snapshots](docs/guide/snapshots.md) |
+
+Each image the host is given makes a **segment**: the host's memory for
+that image's actors, numbered from 0 in the order of `new Host`'s charts
+(`host.addImage(image)` adds one later and returns its number). A host
+runs many segments as one; you need the number for `boot` and see it in
+the host's statistics. A new version of a chart is a new image, and
+`host.chart(name)` is its current version. Adding the image is the
+deploy: new actors start in the new version and running ones finish on
+theirs ([Updating through
+names](docs/guide/io-processors.md#updating-through-names)).
+
+## Wire format
+
+When values, events and addresses leave the process (into a database, a
+socket, another system), they take the forms below. An application that
+keeps to one host and its own store never handles them.
+
+| Calls | What they do | Guide |
+|---|---|---|
+| `encode(value)`, `decode(bytes)` | a value as CBOR bytes, and back | [docs/values.md](docs/values.md) |
+| `new Address(text)`, `Address.fromSession()`, `Address.fromName()`; `.system`, `.session`, `.name` | an address read into its parts, and made from them | [Other systems](docs/guide/other-systems.md#addresses) |
+| the `transport` option, `send.message`, `host.send(message)`, `host.fail(target, sendid)`, `host.sendMany(messages)` | a send to another system, as a message your transport carries, and its delivery on the other side | [Other systems](docs/guide/other-systems.md) |
+| `send.origin`, `send.answer(event, data, { origin, raw })`, `encodeHTTPPost()`, `parseHTTPRequest()` | SCXML's BasicHTTP: a reply location and the message as read, and the form posts its events travel as | [Other systems](docs/guide/other-systems.md#scxmls-basichttp) |
+| `decodeTraces(bytes)` | the spans of a telemetry export, read without a host | [Telemetry](docs/guide/telemetry.md) |
+
+`encode(value)` and `decode(bytes)` give the value table as CBOR bytes,
+the form a value takes when you store or send it:
+
+```js
+import { encode, decode } from '@tinyactors/node';
+
+const bytes = encode({ sku: 'tea', qty: 2, big: 2n ** 60n, gone: undefined });
+const value = decode(bytes);
+console.log(bytes.length, 'bytes');
+console.log(value.sku, value.qty, value.big, 'gone' in value, value.gone);
+```
+
+```output
+33 bytes
+tea 2 1152921504606846976n true undefined
+```
+
+`encode` also writes an `Address` as CBOR's tag 32, and `decode` reads one back as an
+`Address`: that is how a transport's message keeps its addresses
+([Other systems](docs/guide/other-systems.md)).
+
+
 ## Guides
 
 One per feature, each with complete examples that run as written. They
 are in the package too, under `docs/guide/` in
-`node_modules/@tinyactors/node`, so these links work after an install:
+`node_modules/@tinyactors/node`, so these links work after an install.
+
+Writing an application:
 
 - [Writing charts](docs/guide/charts.md): JavaScript in charts, scripts,
   XML data, several charts, `<invoke>` of a chart, systems and `boot`.
 - [I/O processors](docs/guide/io-processors.md): your code as a chart's
-  output: answering, failing, answering later.
+  output: answering, failing, answering later, spawning from a chart.
+- [When the actor is not there](docs/guide/missing-actors.md): a send to
+  an actor that is hibernated, never was, or ended, the three ways to
+  handle it, and names that need no encoding.
 - [Invoked services](docs/guide/services.md): long-running things a chart
   starts and stops, such as a connection or a subprocess.
+- [Hibernation](docs/guide/hibernation.md): millions of actors, most of
+  them in your store, with `store` and `resident`.
+- [Testing your charts](docs/guide/testing.md): a simulated clock,
+  `idle()`, and asserting on an actor's state.
+- [The quickjs sandbox](docs/guide/quickjs.md): charts you do not trust.
+- [In the browser](docs/guide/browser.md): `@tinyactors/wasm`, the same
+  API in a page or a Worker: loading, the CSP, IndexedDB as the store,
+  liveness, memory, and what differs.
+
+Operating a host:
+
 - [Inspecting a host](docs/guide/inspection.md): an actor's state and
   variables, listing actors, the host's counters.
+- [Capacity and memory](docs/guide/capacity.md): sizing a host, how it
+  grows, and what an actor costs.
 - [Telemetry](docs/guide/telemetry.md): traces, logs and metrics as
   OpenTelemetry, and trace context across your services.
-- [Hibernation](docs/guide/hibernation.md): millions of actors, most of
-  them in your database.
+- [Hibernation](docs/guide/hibernation.md#a-policy-of-your-own):
+  sweeping, hibernating and waking by a policy of your own.
 - [Migration](docs/guide/migration.md): moving running actors to a new
   version of their chart.
 - [Snapshots](docs/guide/snapshots.md): the whole host as one blob, and a
   host restored from it.
+
+Wire format:
+
 - [Other systems](docs/guide/other-systems.md): actors of two hosts
-  talking through your transport, and SCXML's BasicHTTP.
-- [The quickjs sandbox](docs/guide/quickjs.md): charts you do not trust.
-- [Capacity and memory](docs/guide/capacity.md): sizing a host, how it
-  grows, and what an actor costs.
-- [Testing your charts](docs/guide/testing.md): a simulated clock,
-  `idle()`, and asserting on an actor's state.
-- [In the browser](docs/guide/browser.md): `@tinyactors/wasm`, the same
-  API in a page or a Worker: loading, the CSP, IndexedDB as the store,
-  liveness, memory, and what differs.
+  talking through your transport, addresses, and SCXML's BasicHTTP.
+- [docs/values.md](docs/values.md): every value as it crosses, and as
+  CBOR.
+
+The example applications in the repository (`examples/`) put these
+together; the chat (`examples/chat-rooms/`) is the one the application
+API was designed against.
 
 The reference is the doc comment of each export in
 [index.d.ts](index.d.ts), which an editor shows on hover. In TypeScript

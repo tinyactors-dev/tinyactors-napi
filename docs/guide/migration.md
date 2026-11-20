@@ -1,5 +1,9 @@
 # Migration
 
+This guide is part of operating a host (the README's [Operating a
+host](../../README.md#operating-a-host)): images, segments and versions,
+and moving actors between them.
+
 Charts change. A long-lived actor (an order that waits a week for its
 delivery) is still running when you deploy the chart's next version, and
 stopping it would lose its state. A migration moves running actors to the
@@ -8,10 +12,16 @@ goes on working.
 
 ## Versions and segments
 
-Each `addImage` makes a new **segment** of the host. When an image holds a
+Each image makes a new **segment** of the host: those `new Host` was
+given, and each `host.addImage(image)` after. When an image holds a
 chart whose `name` is already in the host, that chart has a new version:
-`host.chart(name)` returns the newest, so the actors spawned from then on
+`host.spawn(name)` spawns the newest (`host.chart(name)` returns it), so the actors spawned from then on
 are of the new version, and the running ones stay on theirs.
+Adding the image is a deploy on its own: an actor that may finish on its
+version needs no migration, and one found by name is replaced when its
+owner spawns the new version under the name ([Updating through
+names](io-processors.md#updating-through-names)). Migrate the actors
+that must not wait for their end.
 
 `host.migrate()` moves the running actors to the newest version of their
 chart, during the next turns. A moved actor keeps its session, its active
@@ -55,16 +65,16 @@ const v2 = image('counter-v2.scxml', `
   </state>
 </scxml>`);
 
-const host = new Host({ systemID: 'demo' }, {
-  log: (host, entry) => console.log(entry.text),
-  migrated: (host, moved) => console.log(`session ${moved.session} moved to segment ${moved.segment}`),
-  migrationDone: (host, result) => console.log(`migration ${result.migration}: ${result.migrated} moved, ${result.failed.length} failed`),
+const host = new Host(v1, {
+  system: 'demo',
+  log: (entry) => console.log(entry.text),
+  migrated: (moved) => console.log(`session ${moved.session} moved to segment ${moved.segment}`),
+  migrationDone: (result) => console.log(`migration ${result.migration}: ${result.migrated} moved, ${result.failed.length} failed`),
 });
 
-host.addImage(v1);
-const counter = host.spawn(host.chart('counter'));
-host.send(counter, 'add');
-host.send(counter, 'add');
+const counter = host.spawn('counter');
+counter.send('add');
+counter.send('add');
 await host.idle();
 
 host.addImage(v2);                 // the deploy
@@ -72,7 +82,7 @@ const id = host.migrate({ chart: 'counter' });
 console.log(`started migration ${id}`);
 await host.idle();
 
-host.send(counter, 'add');
+counter.send('add');
 await host.idle();
 host.close();
 ```
@@ -145,18 +155,17 @@ const v2 = image('sub-v2.scxml', `
   </state>
 </scxml>`);
 
-const host = new Host({ systemID: 'demo' }, { clock: new SimulatedClock(), log: (host, entry) => console.log(entry.text) });
-host.addImage(v1);
-const late = host.spawn(host.chart('subscription'));
-const paused = host.spawn(host.chart('subscription'));
-host.send(late, 'miss');
-host.send(paused, 'pause');
+const host = new Host(v1, { system: 'demo', clock: new SimulatedClock(), log: (entry) => console.log(entry.text) });
+const late = host.spawn('subscription');
+const paused = host.spawn('subscription');
+late.send('miss');
+paused.send('pause');
 await host.idle();
 
 host.addImage(v2);
 host.migrate();
 await host.idle();
-for (const session of [late, paused]) console.log(session, JSON.stringify((await host.actorState({ session })).value));
+for (const actor of [late, paused]) console.log(actor.id, JSON.stringify((await actor.state()).value));
 console.log('next deadline', host.nextDeadline);
 host.close();
 ```
@@ -182,14 +191,14 @@ next deadline 7000
   means none. A `chart` the host does not have throws `TA_ERROR_INVALID`
   and a `session` that ended `TA_ERROR_STALE`: a migration that could
   move nothing is refused rather than reported done.
-- **`migrationDone: (host, result) => ...`**, in the host's options, gets
+- **`migrationDone: (result) => ...`**, in the host's options, gets
   the end of each migration: `{ migration, migrated, failed, pending }`,
   `failed` the actors it could not move, each `{ session, reason }`
   (`reason` core's status, below), and `pending` the sessions
   (`bigint`s) its timeout left behind. It is a
   handler of the host, so a migration started by a host that was later
   [restored](snapshots.md) reports to the restored host's handler.
-- **`migrated: (host, moved) => ...`** gets each actor moved, a view of
+- **`migrated: (moved) => ...`** gets each actor moved, a view of
   `session`, `segment`, `chart` (its name) and `migration`, valid while
   the handler runs.
 
@@ -199,13 +208,13 @@ A migration ends when every actor it looks at has moved, or at its
 `timeout`. An actor that is running an invocation (an invoked chart or
 a service) moves once the invocation ends: a migration with a `timeout`
 waits for that until the timeout, and one without fails the actor at
-once with `'TA_ERROR_STATE'`, since an invocation may never end. A hibernated actor moves once it is woken: with `wake:
-true` the migration asks for it through your `wake` handler, with the
-migration's id as the third argument, and asks again if it finds the
-actor hibernated after a wake. Without `wake`, a hibernated actor that
-nobody wakes holds the migration until its timeout, or forever without
-one, and `migrationDone` is never called: give such a migration a
-`timeout`. A migration still running when the host is closed never
+once with `'TA_ERROR_STATE'`, since an invocation may never end. A
+hibernated actor moves once it is woken: with `wake: true` the migration
+asks the host for it, and the host loads it from its
+[store](hibernation.md), and asks again if it finds the actor hibernated
+after a wake. Without `wake`, a hibernated actor that nothing wakes holds
+the migration until its timeout, or forever without one, and
+`migrationDone` is never called: give such a migration a `timeout`. A migration still running when the host is closed never
 reaches `migrationDone`.
 
 ## Actors that do not move
@@ -214,28 +223,25 @@ An actor that cannot be written out stays on its version and is in
 the result's `failed`, with its session and the reason,
 `'TA_ERROR_UNSUPPORTED'` for a state that cannot be written out (`host.hibernate`
 of the actor names the variable). On the native datamodel that is one whose variables hold a value
-outside the value table (a function, a `Map`, a `Date`, ...), or whose
-chart's scripts declare with `let`, `const` or `class`, the same actors
-[hibernation](hibernation.md) refuses.
+outside the value table (a function, a `Map`, a `Date`, ...), the same
+actors [hibernation](hibernation.md) refuses.
 
 On the native datamodel the upgrade event's data holds exactly the old
-version's variables. A chart whose scripts declare top-level names gets
-its new version's declarations (its scripts are instantiated, not run),
-and the old names the new version does not declare are gone.
+version's variables. The actor gets the new version's helpers, and the
+new version's `var`s are declared and `undefined` (a migration runs no
+script); the old names the new version does not declare are gone.
 
-## Most actors hibernated: wake a batch at a time
+## Most actors hibernated
 
-A migration with `wake: true` asks for every hibernated actor early. Wake
-them all at once and they are all in memory at once. Instead, queue the
-migration's requests and wake a batch per round: the migration takes each
-woken actor in its next runs. An event's request (`migration` is
-`undefined`) still wakes its actor at once, and the migration takes that
-one too. Put actors back to sleep once they have moved; one put back
-before it moved is asked for again, which costs work but does not stall
-the migration.
+A migration with `wake: true` asks for every hibernated actor early.
+Woken all at once, they would all be in memory at once. A host with a
+`resident` bound does not: it loads a migration's requests only while it
+holds fewer actors than the bound, and puts actors back to sleep after
+each turn, so the migration moves the population a few at a time. An
+event's request still loads its actor at once.
 
 ```js
-import { compileCharts, Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, MemoryStore } from '@tinyactors/node';
 
 const image = (version) => {
   const compiled = compileCharts([{ name: `v${version}.scxml`, text: `
@@ -249,64 +255,48 @@ const image = (version) => {
   return bytes;
 };
 
-const store = new Map();
-const asked = [];
+const store = new MemoryStore();
 /** @type {import('@tinyactors/node').MigrationResult | undefined} */
 let done;
-let mostResident = 0;
 
-const host = new Host({ systemID: 'demo' }, {
-  wake: (host, session, migration) => {
-    if (migration !== undefined) asked.push(session);  // the migration's: a batch at a time
-    else host.wake(session, store.get(session));       // an event's: now
-  },
-  migrationDone: (host, result) => (done = result),
+const host = new Host(image(1), {
+  system: 'demo',
+  store,
+  resident: 10,
+  migrationDone: (result) => (done = result),
 });
 
-function evict() {
-  for (const session of host.sweep(1 << 20, 1 << 20)) {
-    try {
-      store.set(session, host.hibernate(session));
-    } catch (error) {
-      if (!(error instanceof TinyactorsError)) throw error;
-    }
-  }
-}
-
-host.addImage(image(1));
-for (let i = 0; i < 100; i++) host.spawn(host.chart('counter'));
+for (let i = 0; i < 100; i++) host.spawn('counter');
 await host.idle();
-evict();
-evict();
-console.log(`${store.size} hibernated`);
+console.log(`${store.blobs.size} hibernated`);
 
 host.addImage(image(2));
 host.migrate({ wake: true });
+let mostResident = 0;
 while (done === undefined) {
-  for (const session of asked.splice(0, 10)) host.wake(session, store.get(session));
   await host.idle();
   const stats = await host.hostStats();
   mostResident = Math.max(mostResident, stats.host.actors - stats.host.hibernated);
-  evict();
-  evict();
 }
-console.log(`${done.migrated} moved, ${done.failed.length} failed, at most ${mostResident} in memory at once`);
+console.log(`${done.migrated} moved, ${done.failed.length} failed, at most ${mostResident} in memory between turns`);
 host.close();
 ```
 
 ```output
-100 hibernated
-100 moved, 0 failed, at most 10 in memory at once
+90 hibernated
+100 moved, 0 failed, at most 10 in memory between turns
 ```
 
 ## At scale
 
 `tools/migration.mjs` (`mise run migration` in the repository) is this
-pattern at scale: two million actors, at most 1000 resident, the rest in
-SQLite.
+pattern at scale: two million actors, `resident: 1000`, the rest in a
+store over SQLite.
 
 One run of it (2026-10-16, x86_64 Linux 6.18, Intel Xeon @ 2.10GHz, 4
-CPUs, 16 GiB; node 22.23.3, bun 1.4.1): two million actors of version 1
+CPUs, 16 GiB; node 22.23.3, bun 1.4.1; the tool then woke the
+migration's actors in batches of its own, which `resident` does now):
+two million actors of version 1
 of a counter, at most 1000 resident, 200,000 events before the migration
 and 200,000 more during it, every actor moved to version 2 with `wake:
 true` (2,218,265 wakes from the store in each run). The migration ended

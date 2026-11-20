@@ -41,7 +41,7 @@ export async function run({ customers = 200, trials = 40, seed = 1, maxResident 
   const slow = new Set();
   const gateway = new PaymentGateway({ clock, latencyMs: (customer) => (slow.has(customer) ? 3 * DAY : 0) });
   const billing = new Billing({
-    clock, gateway, datamodel,
+    clock, gateway, datamodel, maxResident,
     plan: { cycleMs: 30 * DAY, retryMs: 2 * DAY, maxRetries: 4, graceMs: 3 * DAY },
     trial: { trialMs: 30 * DAY },
   });
@@ -95,7 +95,6 @@ export async function run({ customers = 200, trials = 40, seed = 1, maxResident 
       while (signups.length > 0 && signups[0].at <= clock.now) sign(signups.shift());
       for (let i = 0; i < Math.max(1, names.length / 200); i++) business();
       await billing.advance(Math.min(HOUR, until - clock.now));
-      billing.evict(maxResident);
     }
   };
 
@@ -107,9 +106,9 @@ export async function run({ customers = 200, trials = 40, seed = 1, maxResident 
   const canary = names.find((customer) => billing.session(`sub-${customer}`) !== undefined && !coupons.has(customer));
   const report = await rollout(billing, {
     release: 2, charts: ['subscription', 'trial'], canary: `sub-${canary}`,
-    // six hours of ten-minute rounds: enough wakes a round to reach
-    // every hibernated actor before the timeout
-    timeoutMs: 6 * HOUR, batch: Math.max(20, Math.ceil(before.actors / 30)), stepMs: 10 * MINUTE, maxResident,
+    // six hours of ten-minute rounds: the host loads maxResident at a
+    // time, enough to reach every hibernated actor before the timeout
+    timeoutMs: 6 * HOUR, stepMs: 10 * MINUTE,
     during: business, log: (line) => log(`day ${day()}: ${line}`),
   });
 
@@ -129,7 +128,7 @@ export async function run({ customers = 200, trials = 40, seed = 1, maxResident 
     const old = await billing.inventory();
     const still = [...(old.subscription?.[1] ?? []), ...(old.trial?.[1] ?? [])];
     if (still.length === 0) break;
-    const results = await retry(billing, still, { stepMs: 10 * MINUTE, maxResident, during: business });
+    const results = await retry(billing, still, { stepMs: 10 * MINUTE, during: business });
     retried.push(...results);
     log(`day ${day()}: pass ${pass}: retried the ${still.length} still on release 1 (${atRollout} after the rollout): ` +
       `${results.filter((r) => r.migrated === 1).length} moved, ${results.filter((r) => r.failed === 1).length} failed`);
@@ -195,7 +194,7 @@ if (import.meta.main ?? process.argv[1] === new URL(import.meta.url).pathname) {
   console.log(`${result.invoices} invoices paid (${result.v2Invoices} by release 2), ${result.failedPayments} failed payments, ` +
     `${result.suspended} suspensions after a grace period, ${result.cancelled} cancelled, ${result.converted} trials converted`);
   console.log(`memory: ${before.resident} of ${before.actors} in memory before the rollout, ${after.resident} of ${after.actors} at the end; ` +
-    `${counts.hibernated} hibernations, ${counts.wokenForEvents} wakes for events, ${counts.wokenForMigrations} for migrations; ${store.size} blobs stored`);
+    `${counts.hibernated} hibernations, ${counts.woken} loaded from the store; ${store.size} blobs stored`);
   console.log(`segments: ${after.segments} live, ${after.retired} retired`);
   console.log(result.problems.length === 0 ? 'every charge invoiced once, every invoice numbered in order, nothing left on release 1'
     : `PROBLEMS:\n  ${result.problems.join('\n  ')}`);

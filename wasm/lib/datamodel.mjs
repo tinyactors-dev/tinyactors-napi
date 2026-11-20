@@ -6,40 +6,16 @@
 //
 // Rows are the host's tables in C (charts, sessions, payloads, loops); the
 // value of each is at its row's slot in an array of this file's: a
-// chart's record, a session's scope or declaring session, a payload's
-// value, a loop's items.
+// chart's record, a session's scope, a payload's value, a loop's items.
 //
-// Where a chart evaluates (decision M2):
-//
-//   - a chart whose scripts declare nothing at their top level (and whose
-//     scripts of executable content declare no var): a scope object per
-//     session, made by the chart's constructor in the host's realm, and
-//     each expression one function of the scope, compiled at its first
-//     evaluation, sloppy outside (`with (scope)`) and strict inside: the
-//     addon's code path;
-//   - a declaring chart: one session function per chart, made at attach
-//     from its chart-level scripts' text with the realm's Function (the
-//     engine compiles it; no parser of ours), a generator called once per
-//     session, whose bindings are the session's: its `var`, `function`,
-//     `let`, `const` and `class` declarations, the <data> ids, the names a
-//     <foreach> binds and the vars its scripts of executable content
-//     declare. It stops before each chart-level script and after the last
-//     one, and at each stop runs the session's evaluations as direct evals
-//     in its own scope, so closures and lexical bindings work as in the
-//     addon's context per session, at a few hundred bytes a session.
-//
-// Which kind a chart is, and the names it declares, is asked of the engine
-// at attach: a candidate name (an identifier of the script's text) is
-// declared when the script followed by `let <name>` does not parse, and
-// declared lexically when the script followed by `var <name>` does not
-// either. Where the session function cannot do what the addon's context
-// does, it refuses at attach or reports, never differs silently:
-// declaring `eval`, `arguments` or a `__tinyactors_` name, a chart-level
-// script with a 'use strict' directive, or a strict script of executable
-// content that declares a var, refuse the chart; a chart-level script that
-// throws stops the ones after it (the session's error.execution says so);
-// an undeclared assignment in a sloppy script lands on the host's realm,
-// and hibernation and snapshots refuse naming it.
+// Where a chart evaluates: a scope object per session, made by the chart's
+// constructor in the host's realm, and each expression one function of
+// the scope, compiled at its first evaluation, sloppy outside (`with
+// (scope)`) and strict inside: the addon's code path. What a chart's
+// scripts declare is asked of the engine by the kit (realm.js, `script`):
+// a chart-level script's functions are the chart's helpers, on its scopes'
+// prototype; a script's top-level vars are the session's variables; its
+// let, const and class are refused, the script's error.execution.
 import * as cbor from './cbor.mjs';
 import { TinyactorsError } from './errors.mjs';
 import { application, makeRealm } from './realms.mjs';
@@ -59,25 +35,14 @@ const FAILURE_NONE = 0, FAILURE_EXCEPTION = 1;
 const KIND = { CONDITION: 1, VALUE: 2, LOCATION: 3, SCRIPT: 4, STRING: 5, CONTENT: 6, ITEM: 7, GLOBAL_SCRIPT: 8 };
 const TYPES = ['platform', 'internal', 'external'];
 const EVENT_FIELDS = ['name', 'type', 'sendid', 'origin', 'origintype', 'invokeid', 'data', 'raw'];
-const PREFIX = '__tinyactors_';
-const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-// Candidate names of a script: what may be an identifier in its text.
-const CANDIDATES = /[\p{ID_Start}$_][\p{ID_Continue}$‌‍]*/gu;
 const SPACE = /[ \t\n\r]/;
 
 // The shapes an expression is compiled in (the addon's expressions.c).
 const SHARED_VALUE = ["(function(__s){with(__s){return (function(){'use strict';return (\n", "\n);})();}})"];
 const SHARED_SCRIPT = ["(function(__s){with(__s){(function(){'use strict';\n", '\n})();}})'];
 const SHARED_SETTER = ["(function(__s,__v){with(__s){(function(){'use strict';(\n", '\n) = __v;})();}})'];
-const OWN_VALUE = ["(function(){'use strict';return (\n", '\n);})'];
-const OWN_SETTER = ["(function(__tinyactors_v){'use strict';(\n", '\n) = __tinyactors_v;})'];
 
 const encoder = new TextEncoder();
-
-function strictDirective(source) {
-  const match = /^[ \t\n\r]*(['"])use strict\1/.exec(source);
-  return match !== null;
-}
 
 // A value's source without a trailing `;` (expr="new Foo();").
 function trimmed(source) {
@@ -99,54 +64,6 @@ class Refused extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
-  }
-}
-
-// ---- a declaring chart's session function ------------------------------------------------------
-
-// One stop of the session's generator: it runs each evaluation it is given
-// as a direct eval in the generator's own scope, until it is told to go on
-// to the next chart-level script.
-const STOP = 'for (;;) { __tinyactors_in = yield __tinyactors_out; if (__tinyactors_in === __tinyactors_session.next) break; ' +
-  'try { __tinyactors_out = [true, eval(__tinyactors_in)]; } catch (__tinyactors_e) { __tinyactors_out = [false, __tinyactors_e]; } }';
-
-// The factory of a declaring chart's sessions: called with a session's
-// scope (its system variables and _event, read through `with`), it answers
-// the session's generator function.
-function factorySource({ vars, names, scripts }) {
-  const cases = names.map((name) => `case ${JSON.stringify(name)}: `);
-  const get = names.map((name, i) => `${cases[i]}return ${name};`).join(' ');
-  const set = names.map((name, i) => `${cases[i]}${name} = __tinyactors_v; return true;`).join(' ');
-  const body = [
-    'let arguments;',
-    vars.length ? `var ${vars.join(', ')};` : '',
-    `function __tinyactors_get(__tinyactors_n) { switch (__tinyactors_n) { ${get} } return __tinyactors_session.none; }`,
-    `function __tinyactors_set(__tinyactors_n, __tinyactors_v) { switch (__tinyactors_n) { ${set} } return false; }`,
-    'function* __tinyactors_loop() { var __tinyactors_in = yield; for (;;) { var __tinyactors_out; ' +
-      'try { __tinyactors_out = [true, eval(__tinyactors_in)]; } catch (__tinyactors_e) { __tinyactors_out = [false, __tinyactors_e]; } ' +
-      '__tinyactors_in = yield __tinyactors_out; } }',
-    '__tinyactors_session.get = __tinyactors_get; __tinyactors_session.set = __tinyactors_set;',
-    '__tinyactors_session.loop = __tinyactors_loop(); __tinyactors_session.loop.next();',
-    'var __tinyactors_in, __tinyactors_out;',
-    STOP,
-  ];
-  for (const script of scripts) body.push(script, STOP);
-  return `with (__tinyactors_system) return function* (__tinyactors_session) {\n${body.join('\n')}\n};`;
-}
-
-// A declaring session: its scope (the system variables and _event, read
-// through `with`), its generator, and the handle the generator fills (get,
-// set, and the loop it runs on after a chart-level script threw).
-class Declaring {
-  constructor(scope, handle, generator) {
-    this.scope = scope;
-    this.handle = handle;
-    this.generator = generator;
-    this.stop = 0;
-    this.dead = false;
-    this.getters = undefined;
-    this.setters = undefined;
-    this.odd = undefined;
   }
 }
 
@@ -380,7 +297,7 @@ export class NativeDatamodel {
     const realm = this.ensureRealm();
     const chart = {
       slot, index, segment, binding, expressions: [], getters: [], setters: [], names: [], invokeids: [], origins: [],
-      leading: [], declaring: null, Scope: undefined, data: [],
+      leading: [], scripts: [], Scope: undefined, data: [],
     };
     const pointer = this.pointer;
     const dataCount = this.fn.ta_web_chart_data_count(pointer, slot);
@@ -400,104 +317,29 @@ export class NativeDatamodel {
         if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(item) && !names.includes(item)) names.push(item);
       } else if (info.kind === KIND.SCRIPT || info.kind === KIND.GLOBAL_SCRIPT) scripts.push([e, info]);
     }
-    chart.declaring = this.declares(chart, scripts, names);
-    if (chart.declaring === null) chart.Scope = realm.kit.shape(names);
-    chart.scopeNames = names;
+    // the scripts, as the kit runs them: the vars they declare are the
+    // session's, a chart-level script's functions the chart's helpers
+    const helpers = [];
+    for (const [e, info] of scripts) {
+      const found = realm.kit.script(info.source);
+      if (found === null) continue; // it does not parse: its evaluation's SyntaxError
+      const [functions, vars, refusal, head, tail] = found;
+      if (refusal !== undefined) {
+        chart.scripts[e] = refusal;
+        continue;
+      }
+      chart.scripts[e] = [head, tail];
+      names.push(...vars);
+      if (info.kind === KIND.GLOBAL_SCRIPT && functions.length) helpers.push([info.source, functions]);
+    }
+    chart.Scope = realm.kit.shape(names, helpers);
     this.charts[slot] = chart;
     return TA_OK;
   }
 
-  // Whether `source` parses as a function body of the realm, nothing run.
-  parses(source) {
-    try {
-      new this.realm.Function(source); // eslint-disable-line no-new
-      return true;
-    } catch (error) {
-      if (error instanceof this.realm.global.SyntaxError) return false;
-      throw error;
-    }
-  }
-
-  // A declaring chart's session function and what it declares, or null for
-  // a chart that declares nothing (the shared path). Throws a Refused for
-  // a chart it cannot run as the addon does.
-  declares(chart, scripts, names) {
-    const global = []; // [e, source] of the chart-level scripts that parse
-    const lexical = new Set(), declared = new Set(), execVars = new Set();
-    let refused = null;
-    const refuse = (message) => {
-      if (refused === null) refused = message;
-    };
-    for (const [e, info] of scripts) {
-      const source = info.source;
-      const top = info.kind === KIND.GLOBAL_SCRIPT;
-      const strict = strictDirective(source);
-      const run = top ? `\n${source}` : `${strict ? '\'use strict\';' : ''}{\n${source}\n}`;
-      if (!this.parses(run)) continue; // a syntax error: that evaluation's error.execution
-      const candidates = new Set(source.match(CANDIDATES) ?? []);
-      for (const name of candidates) {
-        if (!this.parses(`let ${name};`) && name !== 'eval' && name !== 'arguments') continue; // not a binding name
-        if (this.parses(`${run}\n;let ${name};`)) continue; // not declared at the function's level
-        if (name === 'eval' || name === 'arguments' || name.startsWith(PREFIX)) {
-          refuse(`the chart's scripts declare ${name}, which @tinyactors/wasm's native datamodel cannot give a session ` +
-            '(it runs each session\'s evaluations through a direct eval): rename it');
-          continue;
-        }
-        if (top) {
-          declared.add(name);
-          if (!this.parses(`${run}\n;var ${name};`)) lexical.add(name);
-        } else if (strict) {
-          refuse(`a script of executable content that starts with 'use strict' declares var ${name}, which ` +
-            '@tinyactors/wasm\'s native datamodel cannot keep between its runs: declare it in a <data> or a chart-level script');
-        } else execVars.add(name);
-      }
-      if (top) {
-        if (strict && candidates.size > 0) {
-          refuse('a chart-level script starts with \'use strict\', which @tinyactors/wasm\'s native datamodel cannot keep ' +
-            'for it alone (its chart-level scripts are one function\'s body): leave the directive out');
-        }
-        global.push([e, source]);
-      }
-    }
-    if (refused === null && declared.size === 0 && execVars.size === 0) return null;
-    if (refused !== null) throw new Refused(TA_ERROR_INVALID, refused);
-    const valid = (name) => IDENTIFIER.test(name) || /^[\p{ID_Start}$_][\p{ID_Continue}$‌‍]*$/u.test(name);
-    const vars = [...new Set([...names.filter(valid), ...execVars])].filter((name) => !lexical.has(name));
-    for (const name of vars) {
-      if (name === 'eval' || name === 'arguments' || name.startsWith(PREFIX)) {
-        throw new Refused(TA_ERROR_INVALID, `the chart declares ${name} (a <data> or a <foreach>), which @tinyactors/wasm's ` +
-          'native datamodel cannot give a session: rename it');
-      }
-    }
-    const all = [...new Set([...vars, ...declared])];
-    let factory;
-    try {
-      factory = this.realm.Function('__tinyactors_system', factorySource({ vars, names: all, scripts: global.map(([, s]) => s) }));
-    } catch (error) {
-      throw new Refused(TA_ERROR_INVALID, `the chart's scripts cannot be one session function: ${error}`);
-    }
-    const stops = new Map(global.map(([e], k) => [e, k + 1]));
-    const record = {
-      factory, stops, lexical: lexical.size > 0, declared: new Set([...all, ...names]), stored: all,
-      remade: new Set(), odd: names.filter((name) => !valid(name)),
-    };
-    // the names a fresh session holds a function in: its function declarations, made again at a wake
-    const probe = this.startDeclaring(record, this.ensureRealm().kit.system('', '', []));
-    for (const name of all) {
-      let value;
-      try {
-        value = probe.handle.get(name);
-      } catch {
-        continue; // in its TDZ: a lexical binding
-      }
-      if (typeof value === 'function') record.remade.add(name);
-    }
-    return record;
-  }
-
   // ---- sessions ----
 
-  // The session at `slot` (its scope, or its declaring record), with the
+  // The session at `slot` (its scope), with the
   // evaluating chart set for In() and, with `charge`, a fuel unit charged.
   session(slot, charge) {
     const session = this.sessions[slot];
@@ -539,33 +381,9 @@ export class NativeDatamodel {
     return [sessionid, name, processors];
   }
 
-  // A declaring session: its scope (the system variables and _event), its
-  // generator at its first stop, and the handle the generator fills (get,
-  // set, the loop after a chart-level script threw).
-  startDeclaring(record, link) {
-    const kit = this.realm.kit;
-    const scope = new (record.Shape ??= kit.shape([]))(link);
-    const handle = { next: record.next ??= Object.freeze({}), none: undefined, value: undefined, get: null, set: null, loop: null };
-    const generator = record.factory(scope)(handle);
-    generator.next();
-    return new Declaring(scope, handle, generator);
-  }
-
-  // Runs `code` as a direct eval in the declaring session's scope: its value.
-  run(session, code) {
-    const answer = session.dead ? session.handle.loop.next(code).value : session.generator.next(code).value;
-    if (!answer[0]) throw answer[1];
-    return answer[1];
-  }
-
   make(slot, chart, link, init) {
-    if (chart.declaring === null) {
-      link.init = init;
-      return new chart.Scope(link);
-    }
-    if (init !== undefined) init = this.realm.kit.copy(init);
     link.init = init;
-    return this.startDeclaring(chart.declaring, link);
+    return new chart.Scope(link);
   }
 
   create(slot) {
@@ -585,10 +403,7 @@ export class NativeDatamodel {
     return TA_OK;
   }
 
-  // The scope a session's _event and link are on.
-  scopeOf(session) { return session instanceof Declaring ? session.scope : session; }
-
-  linkOf(session) { return this.scopeOf(session)[this.realm.kit.LINK]; }
+  linkOf(session) { return session[this.realm.kit.LINK]; }
 
   initData(slot) {
     const declaration = this.module.word(0);
@@ -600,22 +415,8 @@ export class NativeDatamodel {
     let value;
     if (init !== null && typeof init === 'object' && Object.hasOwn(init, data.id)) value = init[data.id];
     else if (data.expression !== NIL) value = this.evaluate(session, data.expression);
-    this.setVariable(session, data.id, value);
+    session[data.id] = value;
     return TA_OK;
-  }
-
-  setVariable(session, name, value) {
-    if (!(session instanceof Declaring)) {
-      session[name] = value;
-      return;
-    }
-    if (!session.handle.set(name, value)) (session.odd ??= {})[name] = value;
-  }
-
-  getVariable(session, name) {
-    if (!(session instanceof Declaring)) return session[name];
-    if (session.odd !== undefined && Object.hasOwn(session.odd, name)) return session.odd[name];
-    return session.handle.get(name);
   }
 
   // ---- _event ----
@@ -648,9 +449,8 @@ export class NativeDatamodel {
       optional(16),
     ];
     const event = this.realm.kit.event(fields);
-    const scope = this.scopeOf(session);
-    Object.defineProperty(scope, '_event', { value: event, enumerable: true, configurable: true, writable: false });
-    scope[this.realm.kit.LINK].init = undefined; // an event has come: the params were read by init_data
+    Object.defineProperty(session, '_event', { value: event, enumerable: true, configurable: true, writable: false });
+    session[this.realm.kit.LINK].init = undefined; // an event has come: the params were read by init_data
     this.meta[4 * slot + 1] = w[1];
     this.meta[4 * slot + 2] = w[2];
     this.meta[4 * slot + 3] = w[3];
@@ -664,31 +464,21 @@ export class NativeDatamodel {
     const info = this.expressionOf(chart, e);
     if (info === null) throw new Error('no such expression');
     if (info.kind === KIND.CONTENT) return this.content(info.source);
-    const script = info.kind === KIND.SCRIPT || info.kind === KIND.GLOBAL_SCRIPT;
-    if (chart.declaring === null) {
-      const shape = script ? SHARED_SCRIPT : SHARED_VALUE;
-      const fn = this.compiled(chart.getters, e, () => shape[0] + (script ? info.source : trimmed(info.source)) + shape[1]);
-      return fn(session);
+    if (info.kind === KIND.SCRIPT || info.kind === KIND.GLOBAL_SCRIPT) {
+      if (chart.getters[e] === undefined && typeof chart.scripts[e] === 'string') chart.getters[e] = chart.scripts[e];
+      const [head, tail] = Array.isArray(chart.scripts[e]) ? chart.scripts[e] : SHARED_SCRIPT;
+      return this.compiled(chart.getters, e, () => head + info.source + tail)(session);
     }
-    if (info.kind === KIND.GLOBAL_SCRIPT) return this.chartScript(session, chart, e, info);
-    if (info.kind === KIND.SCRIPT) {
-      const source = info.source;
-      return this.run(session, strictDirective(source) ? `'use strict';{\n${source}\n}` : `{\n${source}\n}`);
-    }
-    const getters = session.getters ??= [];
-    let fn = getters[e];
-    if (fn === undefined) {
-      fn = this.run(session, OWN_VALUE[0] + trimmed(info.source) + OWN_VALUE[1]);
-      getters[e] = fn;
-    }
-    return fn();
+    return this.compiled(chart.getters, e, () => SHARED_VALUE[0] + trimmed(info.source) + SHARED_VALUE[1])(session);
   }
 
   // The compiled function of `e` in `cache`, compiled in the realm at its
-  // first use; null kept when it did not compile, so it is not compiled again.
+  // first use; null kept when it did not compile, so it is not compiled
+  // again; a string is a refusal, thrown at each evaluation.
   compiled(cache, e, source) {
     const kept = cache[e];
     if (kept === null) throw new this.realm.global.Error('the expression did not compile');
+    if (typeof kept === 'string') throw new this.realm.global.Error(kept);
     if (kept !== undefined) return kept;
     let made;
     try {
@@ -701,59 +491,15 @@ export class NativeDatamodel {
     return made;
   }
 
-  // A declaring session's chart-level script `e`: the generator goes on to
-  // the stop after it. One that does not parse is its own error.execution;
-  // one that throws ends the session function, so the scripts after it do
-  // not run (the addon runs them in its context per session): its error
-  // says so, and the session goes on through its loop.
-  chartScript(session, chart, e, info) {
-    const stop = chart.declaring.stops.get(e);
-    if (stop === undefined) {
-      new this.realm.Function(`\n${info.source}`); // eslint-disable-line no-new
-      return undefined;
-    }
-    if (session.dead || session.stop >= stop) return undefined; // run already (a restored session: never)
-    while (session.stop < stop) {
-      session.stop++;
-      try {
-        session.generator.next(session.handle.next);
-      } catch (error) {
-        session.dead = true;
-        const later = chart.declaring.stops.size > stop;
-        if (later && error !== null && typeof error === 'object') {
-          try {
-            error.message = `${error.message} (the chart-level scripts after this one did not run: in ` +
-              '@tinyactors/wasm a chart\'s chart-level scripts are one function\'s body)';
-          } catch {
-            // a frozen error keeps its message
-          }
-        }
-        throw error;
-      }
-    }
-    return undefined;
-  }
-
   assign(session, location, value) {
     const chart = this.chartOf(this.current);
     const info = this.expressionOf(chart, location);
     if (info === null) throw new Error('no such location');
     let name = chart.leading[location];
     if (name === undefined) chart.leading[location] = name = leadingName(info.source);
-    const own = chart.declaring === null ? name !== '' && Object.hasOwn(session, name) : chart.declaring.declared.has(name);
-    if (!own) throw new this.realm.global.Error('an assignment to a location the session does not declare');
-    if (chart.declaring === null) {
-      const fn = this.compiled(chart.setters, location, () => SHARED_SETTER[0] + trimmed(info.source) + SHARED_SETTER[1]);
-      fn(session, value);
-      return;
-    }
-    const setters = session.setters ??= [];
-    let fn = setters[location];
-    if (fn === undefined) {
-      fn = this.run(session, OWN_SETTER[0] + trimmed(info.source) + OWN_SETTER[1]);
-      setters[location] = fn;
-    }
-    fn(value);
+    if (name === '' || !Object.hasOwn(session, name)) throw new this.realm.global.Error('an assignment to a location the session does not declare');
+    const fn = this.compiled(chart.setters, location, () => SHARED_SETTER[0] + trimmed(info.source) + SHARED_SETTER[1]);
+    fn(session, value);
   }
 
   log(slot) {
@@ -933,7 +679,7 @@ export class NativeDatamodel {
     const s = this.session(session, false);
     const chart = this.chartOf(session);
     if (!chart.data.some((d) => d.id === name)) throw new Refused(TA_ERROR_INVALID, 'no such variable');
-    const value = this.getVariable(s, name);
+    const value = s[name];
     this.module.setWord(0, value === undefined ? 0 : 1);
     if (value !== undefined) this.values[slot] = value;
     return TA_OK;
@@ -968,59 +714,12 @@ export class NativeDatamodel {
   // ---- hibernation ----
 
   // A session's variables as hibernation writes them: [names, values].
-  stored(session, chart) {
-    if (chart.declaring === null) {
-      const names = [], values = [];
-      for (const name of Object.keys(session)) {
-        if (name === '_event') continue;
-        names.push(name);
-        values.push(session[name]);
-      }
-      return [names, values];
-    }
-    const record = chart.declaring;
-    const names = [], values = [];
-    for (const name of record.stored) {
-      let value;
-      try {
-        value = session.handle.get(name);
-      } catch {
-        continue; // in its TDZ
-      }
-      if (typeof value === 'function' && record.remade.has(name)) continue;
-      names.push(name);
-      values.push(value);
-    }
-    if (session.odd !== undefined) for (const name of Object.keys(session.odd)) {
-      names.push(name);
-      values.push(session.odd[name]);
-    }
-    return [names, values];
-  }
-
-  // Why a declaring session cannot be written out, or undefined: a chart
-  // that declares with let, const or class, or names an undeclared
-  // assignment put on the host's shared realm.
-  unstorable(chart, snapshot) {
-    if (chart.declaring === null) return undefined;
-    if (chart.declaring.lexical) {
-      return snapshot
-        ? 'a session of a chart whose scripts declare with let, const or class at their top level: a new context cannot be given those bindings again'
-        : 'the chart\'s scripts declare with let, const or class at their top level: a new context cannot be given those bindings again, so its sessions stay resident';
-    }
-    const leaked = this.realm.kit.globals();
-    if (leaked.length > 0) {
-      return `an undeclared assignment in a chart's script put ${leaked.map((n) => `'${n}'`).join(', ')} on the host's realm, ` +
-        'not on a session (in @tinyactors/wasm the host\'s charts share one realm), so it cannot be stored: declare it ' +
-        '(a <data>, or var in a chart-level script)';
-    }
-    return undefined;
-  }
+  stored(session) { return this.realm.kit.stored(session); }
 
   // _event as a blob holds it: its eight fields, then core's ids; null
   // when no event came yet.
   eventOut(session, slot) {
-    const event = this.scopeOf(session)._event;
+    const event = session._event;
     if (event === null || typeof event !== 'object') return null;
     const fields = EVENT_FIELDS.map((field) => event[field]);
     fields.push(this.meta[4 * slot + 1], this.meta[4 * slot + 2], this.meta[4 * slot + 3]);
@@ -1051,14 +750,7 @@ export class NativeDatamodel {
   serialize(slot) {
     this.state.reason = '';
     const session = this.session(slot, false);
-    const chart = this.chartOf(slot);
-    const why = this.unstorable(chart, false);
-    if (why !== undefined) {
-      const refused = new Refused(TA_ERROR_UNSUPPORTED, why);
-      refused.reason = why;
-      throw refused;
-    }
-    const [names, values] = this.stored(session, chart);
+    const [names, values] = this.stored(session);
     const vars = {};
     for (let i = 0; i < names.length; i++) {
       Object.defineProperty(vars, names[i], { value: values[i], enumerable: true, writable: true, configurable: true });
@@ -1106,33 +798,13 @@ export class NativeDatamodel {
     return TA_OK;
   }
 
-  // A session made again (a wake, a restore): its variables set, the names
-  // its chart does not declare kept for migrate.
-  revive(slot, { chart, link, vars, init, added, relink = false }) {
+  // A session made again (a wake, a restore): its variables set, the blob's
+  // all kept in its link's init for migrate.
+  revive(slot, { chart, link, vars, init }) {
     const session = this.make(slot, chart, link, init);
     this.grow(slot);
     this.meta.set([chart.slot, NIL, NIL, NIL], 4 * slot);
-    if (chart.declaring === null) this.realm.kit.restore(session, vars);
-    else {
-      const kit = this.realm.kit;
-      const extra = [];
-      for (const name of Object.keys(vars)) {
-        const value = kit.copy(vars[name]);
-        if (chart.declaring.declared.has(name) && session.handle.set(name, value)) continue;
-        if (chart.declaring.odd.includes(name)) {
-          (session.odd ??= {})[name] = value;
-          continue;
-        }
-        if (!IDENTIFIER.test(name) || name.startsWith(PREFIX)) continue;
-        session.handle.value = value;
-        this.run(session, `var ${name} = __tinyactors_session.value;`);
-        session.handle.value = undefined;
-        extra.push(name);
-      }
-      if (extra.length) link.added = extra;
-      session.stop = chart.declaring.stops.size; // its chart-level scripts ran before it was written out
-    }
-    if (relink) link.added = Array.isArray(added) ? added.slice() : undefined;
+    this.realm.kit.restore(session, vars);
     this.sessions[slot] = session;
     return session;
   }
@@ -1154,25 +826,17 @@ export class NativeDatamodel {
     made[5] = keep(chart.invokeids, invoke, made[5]);
     if (made[6] !== undefined) made[6] = this.realm.kit.copy(made[6]);
     const event = this.realm.kit.event(made);
-    Object.defineProperty(this.scopeOf(session), '_event', { value: event, enumerable: true, configurable: true, writable: false });
+    Object.defineProperty(session, '_event', { value: event, enumerable: true, configurable: true, writable: false });
     this.meta[4 * slot + 1] = nameID;
     this.meta[4 * slot + 2] = invoke;
     this.meta[4 * slot + 3] = origintype;
   }
 
   // After deserialize, for a blob of an older version of the chart: the
-  // old bindings (exactly the old chart's variables) as one payload; the
-  // names the blob added that the new chart does not declare go.
+  // old bindings (exactly the old chart's variables) as one payload.
   migrate(slot) {
-    const sessionSlot = this.module.word(0);
-    const session = this.session(sessionSlot, true);
-    const link = this.linkOf(session);
-    const old = link.init;
-    link.init = undefined;
-    if (session instanceof Declaring && link.added !== undefined) {
-      for (const name of link.added) this.run(session, `delete ${name};`);
-      link.added = undefined;
-    } else if (!(session instanceof Declaring)) this.realm.kit.upgrade(session);
+    const session = this.session(this.module.word(0), true);
+    const old = this.realm.kit.upgrade(session);
     if (old !== null && typeof old === 'object') {
       this.values[slot] = this.realm.kit.copy(old);
       this.module.setWord(0, 1);
@@ -1230,15 +894,13 @@ export class NativeDatamodel {
 
   // One session row: [handle, segment, chart index, {name: bytes}, _event
   // as bytes, the link's [sessionid, name, processors] as bytes, its init
-  // as bytes or null, the names a wake added as bytes].
+  // as bytes or null].
   snapshotSession(handle, bytes) {
     const slot = Number(handle & 0xFFFFFFFFn) - 1;
     const session = this.sessions[slot];
     const chart = this.chartOf(slot);
     if (session === undefined || chart === undefined) throw new TinyactorsError('a session without its chart', { status: 'TA_ERROR_INVALID' });
-    const why = this.unstorable(chart, true);
-    if (why !== undefined) throw new TinyactorsError(why, { status: 'TA_ERROR_UNSUPPORTED' });
-    const [names, values] = this.stored(session, chart);
+    const [names, values] = this.stored(session);
     const vars = {};
     for (let i = 0; i < names.length; i++) {
       Object.defineProperty(vars, names[i], { value: bytes(values[i], 'variable \'', names[i]), enumerable: true, writable: true, configurable: true });
@@ -1249,12 +911,11 @@ export class NativeDatamodel {
     } catch (error) {
       throw new TinyactorsError(this.reason('_event', undefined, error), { status: 'TA_ERROR_UNSUPPORTED' });
     }
-    const linked = this.realm.kit.linked(this.scopeOf(session));
+    const linked = this.realm.kit.linked(session);
     return [
       handle, chart.segment, chart.index, vars, bytes(event, '_event'),
       bytes([linked[0], linked[1], linked[2]], 'the system variables'),
       linked[3] === undefined ? null : bytes(linked[3], 'the params'),
-      bytes(linked[4], 'the session'),
     ];
   }
 
@@ -1301,7 +962,7 @@ export class NativeDatamodel {
     this.ensureRealm();
     const kit = this.realm.kit;
     for (const row of rows) {
-      if (!Array.isArray(row) || row.length !== 8) throw invalid('not a session of a snapshot');
+      if (!Array.isArray(row) || row.length !== 7) throw invalid('not a session of a snapshot');
       const handle = handleOf(row[0]);
       const chart = this.charts.find((c) => c !== undefined && c.segment === row[1] && c.index === row[2]);
       if (chart === undefined) throw invalid('a session whose chart the restored host does not have');
@@ -1316,7 +977,7 @@ export class NativeDatamodel {
       for (const name of Object.keys(row[3])) {
         Object.defineProperty(vars, name, { value: valueOf(row[3][name]), enumerable: true, writable: true, configurable: true });
       }
-      const session = this.revive(slot, { chart, link: kit.system(system[0], system[1], system[2]), vars, init, added: valueOf(row[7]), relink: true });
+      const session = this.revive(slot, { chart, link: kit.system(system[0], system[1], system[2]), vars, init });
       this.eventIn(session, slot, chart, valueOf(row[4]));
     }
     for (const row of values) {

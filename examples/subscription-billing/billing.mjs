@@ -2,10 +2,12 @@
 // are actors of charts/subscription-v*.scxml and charts/trial-v*.scxml.
 // The charts decide when to renew, how to dun, what a pause or a coupon
 // does; this file does their I/O (the payment service they invoke, the
-// notifications they send), keeps most subscriptions hibernated in a
-// BlobStore, and deploys and migrates chart versions while all of it runs.
+// notifications they send), keeps at most `maxResident` subscriptions in
+// memory and the rest hibernated in a BlobStore (the host's store and
+// resident bound), and deploys and migrates chart versions while all of it
+// runs.
 import { readFileSync } from 'node:fs';
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, StaleError, TinyactorsError } from '@tinyactors/node';
 import { BlobStore } from './world.mjs';
 
 const chart = (file) => readFileSync(new URL(`./charts/${file}`, import.meta.url), 'utf8');
@@ -29,7 +31,7 @@ export class Billing {
    *   every new subscription: cycleMs, retryMs, maxRetries, graceMs
    * @param {object} [options.trial] the trial chart's: trialMs
    */
-  constructor({ clock, gateway, datamodel, plan = {}, trial = {} }) {
+  constructor({ clock, gateway, datamodel, plan = {}, trial = {}, maxResident }) {
     this.clock = clock;
     this.gateway = gateway;
     this.planSettings = plan;
@@ -39,36 +41,46 @@ export class Billing {
     this.outbox = [];
     /** segment -> release, as deploy() added them */
     this.releases = new Map();
-    /** sessions in memory, as far as this application knows */
-    this.resident = new Set();
-    /** wakes a migration asked for, oldest first: { session, migration } */
-    this.migrationWakes = [];
     /** session -> the event a migration's move releases (applyCoupon) */
     this.deferred = new Map();
     /** migration id -> { id, options, moved, result, done } */
     this.migrations = new Map();
     /** bumped by everything that reaches the application, for settle() */
     this.activity = 0;
-    this.counts = { hibernated: 0, wokenForEvents: 0, wokenForMigrations: 0, notAtRest: 0 };
+    this.counts = { hibernated: 0, woken: 0 };
     this.failure = undefined;
 
-    this.host = new Host(
-      {
-        systemID: 'billing',
-        ioProcessors: [{ type: 'urn:billing:notify' }],
+    // The host keeps at most maxResident actors in memory: after a turn it
+    // hibernates the coldest past the bound into the store, and loads an
+    // actor back when an event, a due renewal or a migration comes for it
+    // (a migration's, as room allows: so a rollout moves a hibernated
+    // population maxResident at a time).
+    const store = {
+      save: (session, blob) => {
+        this.activity++;
+        this.counts.hibernated++;
+        this.store.put(session, blob);
       },
-      {
-        clock,
-        datamodel,
-        services: { 'urn:billing:payments': (host, invocation) => this.payment(invocation) },
-        ioProcessors: {
-          'urn:billing:notify': (host, send) => this.notify(send.session, send.event, send.data),
-        },
-        wake: (host, session, migration) => this.wake(session, migration),
-        migrated: (host, moved) => this.moved(moved),
-        migrationDone: (host, result) => this.finished(result),
+      load: (session) => {
+        this.activity++;
+        this.counts.woken++;
+        return this.store.take(session);
       },
-    );
+      delete: () => {}, // take() removed it
+    };
+    this.host = new Host([], {
+      system: 'billing',
+      clock,
+      datamodel,
+      store,
+      ...(maxResident !== undefined && maxResident !== Infinity && { resident: maxResident }),
+      services: { 'urn:billing:payments': (invocation) => this.payment(invocation) },
+      ioProcessors: {
+        'urn:billing:notify': { receive: (send) => this.notify(send.session, send.event, send.data) },
+      },
+      migrated: (moved) => this.moved(moved),
+      migrationDone: (result) => this.finished(result),
+    });
   }
 
   // --- deploys and migrations ------------------------------------------
@@ -77,7 +89,9 @@ export class Billing {
    * of it from now on, running ones stay on theirs until a migration.
    * Returns the segment. */
   deploy(release) {
-    const segment = this.host.addCharts(RELEASES[release]);
+    const compiled = compileCharts(Object.entries(RELEASES[release]).map(([name, text]) => ({ name, text })));
+    const segment = this.host.addImage(compiled.image);
+    compiled.close();
     this.releases.set(segment, release);
     return segment;
   }
@@ -108,23 +122,7 @@ export class Billing {
   finished(result) {
     const record = this.migrations.get(result.migration);
     record.result = { migration: result.migration, migrated: result.migrated, failed: result.failed.length, pending: [...result.pending] };
-    // the wakes it asked for and nobody did are no longer needed
-    this.migrationWakes = this.migrationWakes.filter((wake) => wake.migration !== result.migration);
     record.resolve(record.result);
-  }
-
-  /** Wakes up to `count` of the actors migrations asked for, oldest
-   * first: a migration takes each in its next runs. Answers how many. */
-  wakeForMigrations(count) {
-    let woken = 0;
-    while (woken < count && this.migrationWakes.length > 0) {
-      const { session } = this.migrationWakes.shift();
-      if (this.wakeFromStore(session)) {
-        woken++;
-        this.counts.wokenForMigrations++;
-      }
-    }
-    return woken;
   }
 
   /** The release `session` runs on, read from the host: 1, 2, or
@@ -160,21 +158,17 @@ export class Billing {
 
   /** A new subscription, named `sub-<customer>`, of the newest release. */
   subscribe(customer, { plan = 'basic', price = 900 } = {}) {
-    const session = this.host.spawnChart('subscription', {
+    return this.host.spawn('subscription', {
       name: `sub-${customer}`, params: { customer, plan, price, ...this.planSettings },
-    });
-    this.resident.add(session);
-    return session;
+    }).id;
   }
 
   /** A free trial, named `trial-<customer>`; it becomes a subscription
    * when it ends. */
   startTrial(customer, { plan = 'basic', price = 900 } = {}) {
-    const session = this.host.spawnChart('trial', {
+    return this.host.spawn('trial', {
       name: `trial-${customer}`, params: { customer, plan, price, ...this.trialSettings },
-    });
-    this.resident.add(session);
-    return session;
+    }).id;
   }
 
   changePlan(customer, plan, price) { this.input(`sub-${customer}`, 'change', { plan, price }); }
@@ -229,21 +223,23 @@ export class Billing {
   /** The session of a customer's subscription (or `trial-` actor), or
    * undefined once it ended. */
   session(name) {
-    return this.host.actorByName(name);
+    try {
+      return this.host.actor(name).id;
+    } catch (error) {
+      if (error instanceof StaleError) return undefined;
+      throw error;
+    }
   }
 
   /** An event for a named actor, which may be hibernated: the host keeps
-   * it in the actor's queue and asks the wake handler for the actor. */
+   * it in the actor's queue and loads the actor from the store. */
   input(name, event, data) {
-    const session = this.host.actorByName(name);
-    if (session === undefined) throw new Error(`no such actor: ${name}`);
-    this.host.send(session, event, data);
+    this.host.actor(name).send(event, data); // a StaleError for no such actor
   }
 
   notify(session, event, data) {
     this.activity++;
     this.outbox.push({ session, event, ...data });
-    if (FINAL.has(event)) this.resident.delete(session);
     // a trial that ends converts: a subscription of the newest release
     if (event === 'trial.converted') this.subscribe(data.customer, { plan: data.plan, price: data.price });
   }
@@ -259,61 +255,6 @@ export class Billing {
       else invocation.sendBack('payment.declined', { reason: result.reason });
     }));
     return {};
-  }
-
-  // --- hibernation -----------------------------------------------------
-
-  /** The host's wake handler. An event or a due timer (`migration`
-   * undefined) wakes the actor at once; a migration's request waits in
-   * migrationWakes for wakeForMigrations(), a batch at a time. */
-  wake(session, migration) {
-    this.activity++;
-    if (migration !== undefined) {
-      this.migrationWakes.push({ session, migration });
-      return;
-    }
-    if (this.wakeFromStore(session)) this.counts.wokenForEvents++;
-  }
-
-  wakeFromStore(session) {
-    if (!this.store.has(session)) return false; // awake already
-    this.host.wake(session, this.store.take(session));
-    this.resident.add(session);
-    return true;
-  }
-
-  /** Hibernates `session` into the store; answers whether it went. An
-   * actor not at rest, or holding what its datamodel cannot write out
-   * (version 1's coupon stamp on the native datamodel), stays. */
-  hibernate(session) {
-    let blob;
-    try {
-      blob = this.host.hibernate(session);
-    } catch (error) {
-      if (error instanceof TinyactorsError && (error.status === 'TA_ERROR_STATE' || error.status === 'TA_ERROR_UNSUPPORTED')) {
-        this.counts.notAtRest++;
-        return false;
-      }
-      throw error;
-    }
-    this.store.put(session, blob);
-    this.resident.delete(session);
-    this.counts.hibernated++;
-    return true;
-  }
-
-  /** Brings the actors in memory down to `maxResident`: those the sweep
-   * finds cold first, then any. Answers how many went. */
-  evict(maxResident) {
-    let went = 0;
-    const over = this.resident.size - maxResident;
-    if (over <= 0) return 0;
-    for (const session of this.host.sweep(1 << 20, over)) went += this.hibernate(session) ? 1 : 0;
-    for (const session of [...this.resident]) {
-      if (this.resident.size <= maxResident) break;
-      went += this.hibernate(session) ? 1 : 0;
-    }
-    return went;
   }
 
   // --- time ------------------------------------------------------------

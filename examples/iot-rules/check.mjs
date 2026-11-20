@@ -7,6 +7,7 @@
 // A template rule's `when` and `message` are checked here first, with the
 // application's own engine (`new Function` parses a body and runs none of
 // it), so that the customer reads an error about the field they wrote.
+import { compileCharts } from '@tinyactors/node';
 
 /** Escapes text for an XML attribute value or element content. */
 export function escapeXML(text) {
@@ -48,3 +49,14 @@ export function fillTemplate(template, { id, when, message }) {
 /** A diagnostic as the compiler prints one. */
 export const formatDiagnostic = ({ file, line, column, severity = 'error', message }) =>
   `${file}:${line}:${column}: ${severity}: ${message}`;
+
+/** The image of `charts` (`{ [file name]: text }`), compiled and copied out
+ * of its compile result, which is closed: what `new Host(charts)` takes. */
+export function image(charts) {
+  const compiled = compileCharts(Object.entries(charts).map(([name, text]) => ({ name, text })));
+  try {
+    return compiled.image;
+  } finally {
+    compiled.close();
+  }
+}

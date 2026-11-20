@@ -5,7 +5,7 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { Host, SimulatedClock } from '@tinyactors/node';
-import { fillTemplate } from './check.mjs';
+import { fillTemplate, image } from './check.mjs';
 import { Platform } from './platform.mjs';
 
 const TEMPLATE = readFileSync(new URL('./charts/rule-template.scxml', import.meta.url), 'utf8');
@@ -17,11 +17,11 @@ const upload = (name) => readFileSync(new URL(`./uploads/${name}`, import.meta.u
  * thread every host of the process shares. `sandbox` is the quickjs
  * options; `{}` is the engine's default. */
 export async function holdTimes(sandbox, runs = 3, { loop = 'spin' } = {}) {
-  const host = new Host({ systemID: 'hold' }, { datamodel: 'quickjs', quickjs: sandbox });
   // spin.scxml's loop reads a property in each round; 'empty' is the
   // quickjs guide's `while (true) {}`
-  host.addCharts({ 'spin.scxml': loop === 'empty' ? upload('spin.scxml').replace('while (_event.data.value !== null) {}', 'while (true) {}') : upload('spin.scxml') });
-  const session = host.spawnChart('spin');
+  const spin = loop === 'empty' ? upload('spin.scxml').replace('while (_event.data.value !== null) {}', 'while (true) {}') : upload('spin.scxml');
+  const host = new Host(image({ 'spin.scxml': spin }), { system: 'hold', datamodel: 'quickjs', quickjs: sandbox });
+  const session = host.spawn('spin');
   await host.idle();
   const times = [];
   for (let run = 0; run < runs; run++) {
@@ -68,25 +68,23 @@ export async function neighbourDelay(sandbox) {
  * (`host.quickjsHeapBytes` does). */
 export async function costPerDevice(datamodel, devices = 1000, { declaring = false } = {}) {
   const clock = new SimulatedClock();
-  const ruleHost = (maxActors) => new Host({ systemID: 'cost', ioProcessors: [{ type: 'urn:iot:alert' }], system: { maxActors } }, {
-    clock, datamodel, ...(datamodel === 'quickjs' ? { quickjs: { maxOps: 200, memoryLimit: 1 << 30 } } : {}),
-    ioProcessors: { 'urn:iot:alert': () => {} },
-  });
   let text = fillTemplate(TEMPLATE, { id: 'overheat', when: "reading.metric === 'temp' && reading.value > 80", message: "'hot: ' + reading.value" });
   // a chart-level script that declares a name: a context per actor
   if (declaring) text = text.replace('</datamodel>', "</datamodel>\n  <script>var unit = 'C';</script>");
+  const ruleHost = (maxActors) => new Host(image({ 'overheat.scxml': text }), {
+    system: 'cost', config: { system: { maxActors } }, clock, datamodel, ...(datamodel === 'quickjs' ? { quickjs: { maxOps: 200, memoryLimit: 1 << 30 } } : {}),
+    ioProcessors: { 'urn:iot:alert': { receive: () => {} } },
+  });
   // the region of a host sized for one actor, against one sized for all
   const probe = ruleHost(1);
-  probe.addCharts({ 'overheat.scxml': text });
   const smallest = (await probe.hostStats()).host.regionBytes;
   probe.close();
   const host = ruleHost(devices + 1);
-  host.addCharts({ 'overheat.scxml': text });
   await host.idle();
   globalThis.gc?.();
   const before = { stats: await host.hostStats(), rss: process.memoryUsage().rss };
   for (let i = 0; i < devices; i++) {
-    const session = host.spawnChart('overheat', { name: `d${i}`, params: { device: `d${i}`, sustain: 2 } });
+    const session = host.spawn('overheat', { name: `d${i}`, params: { device: `d${i}`, sustain: 2 } });
     host.send(session, 'reading', { device: `d${i}`, metric: 'temp', value: 50 + (i % 60), seq: 1 });
   }
   await host.idle();
@@ -109,12 +107,12 @@ export async function costPerDevice(datamodel, devices = 1000, { declaring = fal
  * alert found. On native it reaches the process. */
 export async function nativeEscape() {
   const found = [];
-  const host = new Host({ systemID: 'native-nosy', ioProcessors: [{ type: 'urn:iot:alert' }] }, {
+  const host = new Host(image({ 'nosy.scxml': upload('nosy.scxml') }), {
+    system: 'native-nosy',
     datamodel: 'native',
-    ioProcessors: { 'urn:iot:alert': (host, send) => found.push({ ...send.data }) },
+    ioProcessors: { 'urn:iot:alert': { receive: (send) => found.push({ ...send.data }) } },
   });
-  host.addCharts({ 'nosy.scxml': upload('nosy.scxml') });
-  host.send(host.spawnChart('nosy'), 'reading', { device: 'd', metric: 'temp', value: 1, seq: 1 });
+  host.send(host.spawn('nosy'), 'reading', { device: 'd', metric: 'temp', value: 1, seq: 1 });
   await host.idle();
   host.close();
   return found[0];

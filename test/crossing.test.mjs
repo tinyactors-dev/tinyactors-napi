@@ -41,7 +41,7 @@ test('a snapshot of the other package is refused by its label, naming that packa
   equal(label, true, `the other package's pack holds its own label, not ${LABEL}`);
   let refused;
   try {
-    Host.restore(snapshot, CONFIG, { ...ENGINE, clock: new SimulatedClock() }).close();
+    Host.restore(snapshot, [], { ...CONFIG, ...ENGINE, clock: new SimulatedClock() }).close();
   } catch (error) {
     refused = error;
   }

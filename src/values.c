@@ -37,6 +37,7 @@
  * instance), TA_ERROR_INVALID for one the table cannot hold (a bigint past
  * 64 bits, a lone surrogate, nesting deeper than 64, which a cycle reaches). */
 #include "addon.h"
+#include "traces.h"
 
 #include <string.h>
 
@@ -650,6 +651,34 @@ napi_value ta_napi_value_read(napi_env env, ta_bytes cbor) {
     }
     if (value == NULL && !decoder.thrown) ta_napi_throw(env, &decoder.refusal);
     return value;
+}
+
+/* decodeTraces(bytes) -> spans: an OTLP ExportTraceServiceRequest's spans
+ * (traces.c, the same walk the wasm package's module compiles), written as
+ * CBOR into the environment's arena and read with the value table, a mark
+ * per call; no host. */
+napi_value ta_napi_decode_traces(napi_env env, napi_callback_info info) {
+    ta_napi_instance *instance = ta_napi_instance_of(env);
+    if (instance == NULL) return NULL;
+    size_t argc = 1;
+    napi_value argument = NULL, result = NULL;
+    if (napi_get_cb_info(env, info, &argc, &argument, NULL, NULL) != napi_ok) return NULL;
+    ta_napi_bytes bytes = {"decodeTraces takes a Uint8Array or an ArrayBuffer", {NULL, 0}};
+    if (!ta_napi_bytes_of(env, argc < 1 ? NULL : argument, &bytes)) return NULL;
+    ta_growable_arena_mark mark = ta_growable_arena_position(&instance->arena);
+    ta_allocator scratch = ta_growable_arena_allocator(&instance->arena);
+    ta_cbor_writer writer;
+    ta_cbor_writer_init(&writer, (ta_buffer){NULL, 0, 0}, &scratch);
+    ta_status status = ta_napi_traces_write(bytes.view, &writer);
+    ta_bytes cbor;
+    if (status == TA_OK) status = ta_cbor_writer_bytes(&writer, &cbor);
+    if (status == TA_OK) result = ta_napi_value_read(env, cbor);
+    else ta_napi_throw(env, &(ta_napi_refusal){status, status == TA_ERROR_INVALID
+                                                           ? "the bytes are not an ExportTraceServiceRequest"
+                                                           : "no memory for the spans"});
+    ta_cbor_writer_free(&writer);
+    ta_napi_arena_release(&instance->arena, mark, TA_NAPI_INSTANCE_ARENA_CAP);
+    return result;
 }
 
 /* decode(bytes) -> value: bytes a Uint8Array (a Buffer too) or an

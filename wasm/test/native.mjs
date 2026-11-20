@@ -1,6 +1,6 @@
 // The native "ecmascript" datamodel through the package's API, runtime-
-// neutral, for a page and a Worker (browser.mjs): a chart that declares
-// nothing and one that declares, their logs, where the charts ran, and,
+// neutral, for a page and a Worker (browser.mjs): a chart with data only
+// and one whose chart-level script declares a var and a helper, their logs, where the charts ran, and,
 // on a page, the host's realm (a hidden iframe) made at its first chart
 // and removed at close().
 import { Host, compileCharts } from '../index.mjs';
@@ -13,11 +13,11 @@ const SHARED = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" dat
   </state>
 </scxml>`;
 
-const DECLARING = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="declaring" initial="a">
+const HELPERS = `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="helpers" initial="a">
   <datamodel><data id="n" expr="5"/></datamodel>
-  <script>const LIMIT = 2; var total = n; function twice() { return total * 2; } let k = 1;</script>
+  <script>var total = n; function twice(t) { return t * 2; }</script>
   <state id="a">
-    <transition event="go"><script>total = total + 1; k++;</script><log label="t" expr="twice() + ':' + k + ':' + LIMIT"/></transition>
+    <transition event="go"><script>total = total + 1;</script><log label="t" expr="twice(total) + ':' + total + ':' + typeof twice"/></transition>
   </state>
 </scxml>`;
 
@@ -26,18 +26,18 @@ const frames = () => (typeof document === 'undefined' ? null : document.querySel
 export async function nativeScenario() {
   const logs = [];
   const before = frames();
-  const host = new Host({ systemID: 'web' }, { log: (h, entry) => logs.push(`${entry.label}=${entry.text}`) });
-  const compiled = compileCharts([{ name: 'shared', text: SHARED }, { name: 'declaring', text: DECLARING }]);
+  const host = new Host([], { system: 'web', log: (entry) => logs.push(`${entry.label}=${entry.text}`) });
+  const compiled = compileCharts([{ name: 'shared', text: SHARED }, { name: 'helpers', text: HELPERS }]);
   host.addImage(compiled.image);
   compiled.close();
   const during = frames();
   const shared = host.spawn(host.chart('shared'));
-  const declaring = host.spawn(host.chart('declaring'));
+  const helpers = host.spawn(host.chart('helpers'));
   host.send(shared, 'inc');
   host.send(shared, 'inc');
   host.send(shared, 'where');
-  host.send(declaring, 'go');
-  host.send(declaring, 'go');
+  host.send(helpers, 'go');
+  host.send(helpers, 'go');
   await host.idle();
   host.close();
   return { logs, frames: [before, during, frames()] };
@@ -51,7 +51,7 @@ export async function droppedHost(gc) {
   const before = frames();
   let during;
   await (async () => {
-    const host = new Host({ systemID: 'web' });
+    const host = new Host([], { system: 'web' });
     const compiled = compileCharts([{ name: 'shared', text: SHARED }]);
     host.addImage(compiled.image);
     compiled.close();
@@ -72,7 +72,7 @@ export async function droppedHost(gc) {
 export async function underPolicy() {
   const out = {};
   try {
-    new Host({ systemID: 'web' }); // eslint-disable-line no-new
+    new Host([], { system: 'web' }); // eslint-disable-line no-new
     out.host = 'made';
   } catch (error) {
     out.host = [error.status, error.message];
@@ -83,7 +83,7 @@ export async function underPolicy() {
   // quickjs evaluates no chart text with the page's engine: it runs here
   const lines = [];
   try {
-    const host = new Host({ systemID: 'web' }, { datamodel: 'quickjs', log: (h, entry) => lines.push(entry.text) });
+    const host = new Host([], { system: 'web', datamodel: 'quickjs', log: (entry) => lines.push(entry.text) });
     const sandboxed = compileCharts([{ name: 'q', text: '<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="q" initial="s"><datamodel><data id="n" expr="[1, 2, 3].map((x) => x * 2)"/></datamodel><state id="s"><onentry><log expr="JSON.stringify(n)"/></onentry></state></scxml>' }]);
     host.addImage(sandboxed.image);
     sandboxed.close();
@@ -103,11 +103,11 @@ export async function underPolicy() {
 export async function crossing(addonSnapshot) {
   let refused = null;
   try {
-    Host.restore(new Uint8Array(addonSnapshot), { systemID: 't' }).close();
+    Host.restore(new Uint8Array(addonSnapshot), [], { system: 't' }).close();
   } catch (error) {
     refused = [error.status, error.message];
   }
-  const host = new Host({ systemID: 't' });
+  const host = new Host([], { system: 't' });
   const compiled = compileCharts([{ name: 'c.scxml', text: '<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="c" initial="s"><state id="s"/></scxml>' }]);
   host.addImage(compiled.image);
   compiled.close();

@@ -1,94 +1,71 @@
-// The blob store: one file per hibernated session in a directory, written
-// with node:fs/promises.
+// The host's store: one file per hibernated actor in a directory, through
+// node:fs/promises. The host calls save when it hibernates an actor past
+// its resident bound, load when an event comes for a hibernated one, and
+// delete once the actor is back in memory or has ended; each returns a
+// promise, which the host follows (and host.idle() waits for).
 //
-// A write takes time, and an event can come for a session while its blob is
-// still on the way to the disk. So a blob is kept in memory, in `pending`,
-// from `put` until its file is written, and `take` answers from there first:
-// a wake never reads a file that is not written yet. Writes of one session
-// are chained, so an older blob never lands over a newer one, and each goes
-// to a temporary file renamed into place, so a crash leaves the old file or
-// the new one, never half of one.
-//
-// A write that fails tells the caller whether the blob was taken meanwhile:
-// if not, the caller still holds the only copy and must put the actor back
-// (chat.mjs wakes it from that blob); if so, the actor is awake already.
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+// The host waits for an actor's pending save before it loads it, but a
+// delete (after a wake) and the next save of the same actor may overlap,
+// so this store runs one session's operations one after another: a delete
+// never removes the file of a later save. A save writes a temporary file
+// and renames it into place, so a crash leaves the old file or the new
+// one, never half of one.
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { StaleError } from '@tinyactors/node';
 
 export class FileStore {
-  /**
-   * @param {string} dir the directory of the blobs, made if missing
-   * @param {object} [hooks] for tests, each called with the session's key
-   *   (its decimal text): `beforeWrite(key)` may throw or reject, which
-   *   fails that write; `beforeRead(key)` may delay a read
-   */
-  constructor(dir, { beforeWrite, beforeRead } = {}) {
+  /** @param {string} dir the directory of the blobs, made if missing */
+  constructor(dir) {
     this.dir = dir;
-    this.beforeWrite = beforeWrite;
-    this.beforeRead = beforeRead;
-    /** key -> { blob }: blobs whose file is not written yet */
-    this.pending = new Map();
-    /** key -> the promise of its last write */
-    this.chains = new Map();
     this.ready = mkdir(dir, { recursive: true });
-    /** the keys written and read, in order (for tests and the demo's counts) */
-    this.written = [];
-    this.read = [];
+    /** session (as a string) -> the promise of its last operation */
+    this.chains = new Map();
+    /** what was done, for the demo's counts */
+    this.counts = { saved: 0, loaded: 0, deleted: 0 };
   }
 
-  path(key) {
-    return join(this.dir, `${key}.blob`);
+  path(session) {
+    return join(this.dir, `${session}.blob`);
   }
 
-  /** Stores `blob` for `session`. Resolves `{ written: true }`, or
-   * `{ written: false, taken, error }` when the write failed: `taken` says
-   * whether a `take` got the blob from memory meanwhile. Never rejects. */
-  put(session, blob) {
+  /** Runs `operation` after the session's earlier ones, failed or not. */
+  chained(session, operation) {
     const key = String(session);
-    const entry = { blob, taken: false };
-    this.pending.set(key, entry);
-    const previous = this.chains.get(key) ?? Promise.resolve();
-    const write = previous.then(async () => {
-      await this.ready;
-      await this.beforeWrite?.(key);
-      const temporary = `${this.path(key)}.${process.pid}.tmp`;
+    const previous = this.chains.get(key) ?? this.ready;
+    const result = previous.then(operation, operation);
+    const tail = result.then(() => {}, () => {});
+    this.chains.set(key, tail);
+    tail.then(() => { if (this.chains.get(key) === tail) this.chains.delete(key); });
+    return result;
+  }
+
+  save(session, blob) {
+    return this.chained(session, async () => {
+      const temporary = `${this.path(session)}.tmp`;
       await writeFile(temporary, blob);
-      await rename(temporary, this.path(key));
-      this.written.push(key);
-    });
-    const done = write.then(
-      () => ({ written: true }),
-      (error) => ({ written: false, taken: entry.taken, error }),
-    );
-    // the next write of this session waits for this one, failed or not
-    this.chains.set(key, done);
-    return done.then((result) => {
-      if (this.pending.get(key) === entry) this.pending.delete(key);
-      if (this.chains.get(key) === done) this.chains.delete(key);
-      return result;
+      await rename(temporary, this.path(session));
+      this.counts.saved++;
     });
   }
 
-  /** The blob of `session`: from memory while its write is on the way (at
-   * once), else from its file (a promise). */
-  take(session) {
-    const key = String(session);
-    const entry = this.pending.get(key);
-    if (entry) {
-      entry.taken = true;
-      this.pending.delete(key);
-      return entry.blob;
-    }
-    return (async () => {
-      await this.beforeRead?.(key);
-      const blob = await readFile(this.path(key));
-      this.read.push(key);
-      return blob;
-    })();
+  load(session) {
+    return this.chained(session, async () => {
+      try {
+        const blob = await readFile(this.path(session));
+        this.counts.loaded++;
+        return blob;
+      } catch (error) {
+        if (error.code === 'ENOENT') throw new StaleError(`no blob of actor ${session}`);
+        throw error;
+      }
+    });
   }
 
-  /** Resolves when every write started so far has ended. */
-  async flush() {
-    while (this.chains.size) await Promise.all(this.chains.values());
+  delete(session) {
+    return this.chained(session, async () => {
+      await rm(this.path(session), { force: true });
+      this.counts.deleted++;
+    });
   }
 }

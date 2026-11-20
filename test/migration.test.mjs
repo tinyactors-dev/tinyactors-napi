@@ -5,7 +5,7 @@
 // upgrade's data), keeps its delayed sends and their data, a hibernated
 // one is asked for with the migration's id, and the result names the
 // sessions a timeout left behind.
-import { SimulatedClock } from '@tinyactors/node';
+import { MemoryStore, SimulatedClock } from '@tinyactors/node';
 import { DATAMODEL, equal, hostWith, image, scxml, status, throws, typeError } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
@@ -48,7 +48,7 @@ const OTHER = scxml('other', '<state id="s"/>');
 class Logs {
   constructor() {
     this.lines = [];
-    this.handler = (host, entry) => this.lines.push([entry.label, entry.text]);
+    this.handler = (entry) => this.lines.push([entry.label, entry.text]);
   }
   labelled(label) {
     return this.lines.filter(([l]) => l === label).map(([, text]) => text);
@@ -62,8 +62,8 @@ test('an actor moves with its bindings: one MIGRATED, then migrationDone', async
   const logs = new Logs();
   const moved = [];
   const done = [];
-  const migrated = (host, entry) => moved.push([entry.session, entry.segment, entry.chart, entry.migration]);
-  const host = hostWith({ counter: V1 }, { log: logs.handler, migrated, migrationDone: (host, result) => done.push(result) });
+  const migrated = (entry) => moved.push([entry.session, entry.segment, entry.chart, entry.migration]);
+  const host = hostWith({ counter: V1 }, { log: logs.handler, migrated, migrationDone: (result) => done.push(result) });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'inc');
   host.send(session, 'inc');
@@ -77,7 +77,7 @@ test('an actor moves with its bindings: one MIGRATED, then migrationDone', async
   await host.idle();
   host.close();
   equal(json(done), json([{ migration, migrated: 1, failed: [], pending: [] }]), 'the result');
-  equal(json(moved), json([[session, segment, 'counter', migration]]), 'the moved actor');
+  equal(json(moved), json([[session.id, segment, 'counter', migration]]), 'the moved actor');
   equal(logs.labelled('n').join('|'), '3 2 ["n","other"]', 'the old bindings, exactly version 1\'s');
 });
 
@@ -100,51 +100,50 @@ test('a delayed send survives the move with its data', async () => {
 
 test('a hibernated actor is asked for with its migration', async () => {
   const logs = new Logs();
-  const blobs = new Map();
+  const store = new MemoryStore();
   const asked = [];
+  const load = store.load.bind(store);
+  store.load = (session) => (asked.push(session), load(session));
   const done = [];
-  const wake = (host, session, migration) => {
-    asked.push([session, migration]);
-    host.wake(session, blobs.get(session));
-    blobs.delete(session);
-  };
-  const host = hostWith({ counter: V1 }, { log: logs.handler, wake, migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1 }, { log: logs.handler, store, migrationDone: (result) => done.push(result) });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'inc');
   await host.idle();
-  blobs.set(session, host.hibernate(session));
+  store.save(session.id, host.hibernate(session));
   add(host, V2);
   const migration = host.migrate({ wake: true });
   await host.idle();
   host.send(session, 'report');
   await host.idle();
   host.close();
-  equal(json(asked), json([[session, migration]]), 'one WAKE naming the migration');
+  equal(json(asked), json([session.id]), 'one WAKE, its blob loaded');
+  equal(store.blobs.size, 0, 'and deleted');
   equal(done[0].migrated, 1, 'migrated');
   equal(logs.labelled('n').join('|'), '1 2 ["n","other"]', 'its bindings came with the blob');
 });
 
-test('an event\'s WAKE names no migration', async () => {
-  const blobs = new Map();
-  const asked = [];
-  const wake = (host, session, migration) => {
-    asked.push(migration);
-    host.wake(session, blobs.get(session));
-  };
-  const host = hostWith({ counter: V1 }, { wake });
-  const session = host.spawn(host.chart('counter'));
+test('a migration\'s WAKEs wait while the resident bound is reached, and load as room is made', async () => {
+  const store = new MemoryStore();
+  const done = [];
+  const host = hostWith({ counter: V1 }, { store, resident: 2, migrationDone: (result) => done.push(result) });
+  const sessions = Array.from({ length: 6 }, () => host.spawn(host.chart('counter')));
   await host.idle();
-  blobs.set(session, host.hibernate(session));
-  host.send(session, 'inc');
+  equal(store.blobs.size, 4, 'two resident, four in the store');
+  add(host, V2);
+  host.migrate({ wake: true });
+  await host.idle();
+  equal(done.length, 1, 'the migration ended');
+  equal(done[0].migrated, 6, 'every actor moved, the hibernated ones loaded as room allowed');
+  equal(store.blobs.size, 4, 'and the surplus hibernated again');
+  for (const session of sessions) session.send('report');
   await host.idle();
   host.close();
-  equal(json(asked), json([undefined]), 'migration undefined');
 });
 
 test('without wake or timeout a hibernated actor holds the migration', async () => {
   const done = [];
   const clock = new SimulatedClock();
-  const host = hostWith({ counter: V1 }, { clock, migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1 }, { clock, migrationDone: (result) => done.push(result) });
   const asleep = host.spawn(host.chart('counter'));
   await host.idle();
   host.hibernate(asleep);
@@ -160,7 +159,7 @@ test('without wake or timeout a hibernated actor holds the migration', async () 
 test('without wake a hibernated actor is left at the timeout, in pending', async () => {
   const done = [];
   const clock = new SimulatedClock();
-  const host = hostWith({ counter: V1 }, { clock, migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1 }, { clock, migrationDone: (result) => done.push(result) });
   const asleep = host.spawn(host.chart('counter'));
   const awake = host.spawn(host.chart('counter'));
   await host.idle();
@@ -175,16 +174,16 @@ test('without wake a hibernated actor is left at the timeout, in pending', async
   clock.increment(1);
   await host.idle();
   host.close();
-  equal(json(done), json([{ migration, migrated: 1, failed: [], pending: [asleep] }]), 'the result');
-  if (done[0].pending.includes(awake)) throw new Error('the awake actor is pending');
+  equal(json(done), json([{ migration, migrated: 1, failed: [], pending: [asleep.id] }]), 'the result');
+  if (done[0].pending.includes(awake.id)) throw new Error('the awake actor is pending');
   if (!Object.isFrozen(done[0].pending)) throw new Error('pending is not frozen');
 });
 
 test('a timeout is rounded up to the next tick', async () => {
   const done = [];
   const clock = new SimulatedClock();
-  const config = { systemID: 't', system: { ticksPerSecond: 10 } }; // a tick is 100 ms
-  const host = hostWith({ counter: V1 }, { config, clock, migrationDone: (host, result) => done.push(result) });
+  const config = { system: { ticksPerSecond: 10 } }; // a tick is 100 ms
+  const host = hostWith({ counter: V1 }, { config, clock, migrationDone: (result) => done.push(result) });
   const asleep = host.spawn(host.chart('counter'));
   await host.idle();
   host.hibernate(asleep);
@@ -201,7 +200,7 @@ test('a timeout is rounded up to the next tick', async () => {
 
 test('one session or one chart', async () => {
   const done = [];
-  const host = hostWith({ counter: V1, other: OTHER }, { migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1, other: OTHER }, { migrationDone: (result) => done.push(result) });
   const a = host.spawn(host.chart('counter'));
   host.spawn(host.chart('counter'));
   await host.idle();
@@ -218,7 +217,7 @@ test('one session or one chart', async () => {
 
 test('a chart the host does not have, or a session that ended, is refused', async () => {
   const done = [];
-  const host = hostWith({ counter: V1 }, { migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1 }, { migrationDone: (result) => done.push(result) });
   throws(() => host.migrate({ chart: 'counters' }), status('TA_ERROR_INVALID'), 'a typo of the chart');
   const session = host.spawn(host.chart('counter'));
   await host.idle();
@@ -234,7 +233,7 @@ test('an actor with a value outside the table fails and stays on version 1', asy
   const logs = new Logs();
   const done = [];
   const v1 = V1.replace('</state>', '<transition event="report"><log label="n" expr="\'v1 \' + n"/></transition></state>');
-  const host = hostWith({ counter: v1 }, { log: logs.handler, migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: v1 }, { log: logs.handler, migrationDone: (result) => done.push(result) });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'odd');
   await host.idle();
@@ -246,11 +245,11 @@ test('an actor with a value outside the table fails and stays on version 1', asy
   await host.idle();
   host.close();
   equal(done[0].migrated, 0, 'none migrated');
-  equal(json(done[0].failed), json([{ session, reason: 'TA_ERROR_UNSUPPORTED' }]), 'the failed one, named, and why');
+  equal(json(done[0].failed), json([{ session: session.id, reason: 'TA_ERROR_UNSUPPORTED' }]), 'the failed one, named, and why');
   equal(logs.labelled('n').join('|'), 'v1 1', 'still version 1');
 });
 
-test('native: a declaring chart migrates: its old names go, the new scripts\' are declared', async () => {
+test('native: a chart with a var and a helper migrates: its old names go, the new chart\'s var is declared', async () => {
   if (DATAMODEL !== 'native') return; // quickjs keeps its own globals
   const logs = new Logs();
   const v1 = scxml('counter', `
@@ -277,13 +276,13 @@ test('native: a declaring chart migrates: its old names go, the new scripts\' ar
   await host.idle();
   host.close();
   // fresh is declared (a bare read of it does not throw) and undefined: a
-  // migrated actor's new scripts are instantiated, not run
+  // migrated actor's chart-level scripts do not run again; twice was v1's helper
   equal(logs.labelled('n').join('|'), '9 undefined undefined undefined', 'the old bindings in the data, the old names gone');
 });
 
 test('the Migrated view: fields on first read, stale after the ack', async () => {
   const kept = [];
-  const migrated = (host, entry) => {
+  const migrated = (entry) => {
     kept.push(entry);
     equal(entry.chart, 'counter', 'its chart, read in the handler');
   };
@@ -316,7 +315,7 @@ test('a migrationDone handler that throws: its error rejects idle()', async () =
 
 test('a migration unfinished at close never reaches its handler', async () => {
   const done = [];
-  const host = hostWith({ counter: V1 }, { migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: V1 }, { migrationDone: (result) => done.push(result) });
   const asleep = host.spawn(host.chart('counter'));
   await host.idle();
   host.hibernate(asleep);
@@ -364,7 +363,7 @@ test('an actor running an invocation fails a migration without a timeout, and ke
   const done = [];
   const stopped = [];
   const services = { thing: () => ({ stop: () => stopped.push('stop') }) };
-  const host = hostWith({ counter: INVOKING }, { log: logs.handler, services, migrationDone: (host, result) => done.push(result) });
+  const host = hostWith({ counter: INVOKING }, { log: logs.handler, services, migrationDone: (result) => done.push(result) });
   const session = host.spawn(host.chart('counter'));
   await host.idle();
   add(host, V2);
@@ -373,7 +372,7 @@ test('an actor running an invocation fails a migration without a timeout, and ke
   host.send(session, 'report');
   await host.idle();
   host.close();
-  equal(json(done), json([{ migration, migrated: 0, failed: [{ session, reason: 'TA_ERROR_STATE' }], pending: [] }]),
+  equal(json(done), json([{ migration, migrated: 0, failed: [{ session: session.id, reason: 'TA_ERROR_STATE' }], pending: [] }]),
     'it ends at once, the actor failed, and why');
   equal(stopped.length, 0, 'the service was not stopped');
   equal(logs.labelled('n').join('|'), 'v1', 'still version 1');
@@ -383,8 +382,8 @@ test('with a timeout, an actor running an invocation moves once it ends, or is p
   const done = [];
   const invocations = [];
   const clock = new SimulatedClock();
-  const services = { thing: (host, invocation) => { invocations.push(invocation); return {}; } };
-  const host = hostWith({ counter: INVOKING }, { clock, services, migrationDone: (host, result) => done.push(result) });
+  const services = { thing: (invocation) => { invocations.push(invocation); return {}; } };
+  const host = hostWith({ counter: INVOKING }, { clock, services, migrationDone: (result) => done.push(result) });
   const ends = host.spawn(host.chart('counter'));
   const runs = host.spawn(host.chart('counter'));
   await host.idle();
@@ -392,12 +391,12 @@ test('with a timeout, an actor running an invocation moves once it ends, or is p
   const migration = host.migrate({ timeout: 500 });
   await host.idle();
   equal(done.length, 0, 'waiting for the invocations');
-  invocations.find((invocation) => invocation.session === ends).done();
+  invocations.find((invocation) => invocation.session === ends.id).done();
   await host.idle();
   clock.increment(500);
   await host.idle();
   host.close();
-  equal(json(done), json([{ migration, migrated: 1, failed: [], pending: [runs] }]),
+  equal(json(done), json([{ migration, migrated: 1, failed: [], pending: [runs.id] }]),
     'the one whose invocation ended moved, the other is pending');
 });
 

@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 export const REPOSITORY = fileURLToPath(new URL('../../../', import.meta.url));
 const SERVED = ['tinyactors-napi', 'tinyactors-test/suites/protocol'].map((dir) => join(REPOSITORY, dir) + sep);
-const TYPES = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.html': 'text/html', '.txt': 'text/plain' };
+const TYPES = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.html': 'text/html', '.txt': 'text/plain' };
 
 // The URL path of a file of tinyactors-napi/.
 export const napi = (path) => `/tinyactors-napi/${path}`;

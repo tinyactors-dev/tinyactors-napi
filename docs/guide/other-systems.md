@@ -1,8 +1,13 @@
 # Other systems
 
-A host is one **system**, named by its `systemID`. An actor of one system
-can send to an actor of another (another host, in this process or on
-another machine) by its address, `tinyactors://<systemID>/...`. The host
+This guide is the wire format's (the README's [Wire
+format](../../README.md#wire-format)): a send as a message your transport
+carries, addresses read into their parts, and SCXML's BasicHTTP. An
+application of one host needs none of it.
+
+A host is one **system**, named by its `system` option. An actor of one
+system can send to an actor of another (another host, in this process or
+on another machine) by its address, `tinyactors://<system>/...`. The host
 decides whether an address is its own. A send to another system goes to
 your **transport**, a handler that carries it there; the other side
 gives it to its host with `host.send`. The transport and the wire are
@@ -63,14 +68,13 @@ const wire = (message) => {
   });
 };
 
-const log = (host, entry) => console.log(entry.text);
-hosts.shop = new Host({ systemID: 'shop' }, { log, transport: (host, send) => wire(send.message) });
-hosts.bank = new Host({ systemID: 'bank' }, { log, transport: (host, send) => wire(send.message) });
-hosts.shop.addImage(image('checkout.scxml', shopChart));
-hosts.bank.addImage(image('teller.scxml', bankChart));
+const log = (entry) => console.log(entry.text);
+const transport = (send) => wire(send.message);
+hosts.shop = new Host(image('checkout.scxml', shopChart), { system: 'shop', log, transport });
+hosts.bank = new Host(image('teller.scxml', bankChart), { system: 'bank', log, transport });
 
-hosts.bank.spawn(hosts.bank.chart('teller'), { name: 'teller' });
-hosts.shop.spawn(hosts.shop.chart('checkout'));
+hosts.bank.spawn('teller', { name: 'teller' });
+hosts.shop.spawn('checkout');
 await new Promise((resolve) => setTimeout(resolve, 50));
 await Promise.all([hosts.shop.idle(), hosts.bank.idle()]);
 hosts.shop.close();
@@ -93,8 +97,11 @@ the handler runs, `send.fail()` does it. Later, on the sending host,
 Delivery that worked needs no answer. Without a `transport` handler, each
 send to another system is failed.
 
-**An input's target may be an address.** `host.send` takes a session, an
-address string or an `Address`; a local address (`tinyactors://shop/@teller`
+The address of an actor is `actor.address`, and `host.actor(address)`
+finds the actor of a local one.
+
+**An input's target may be an address.** `host.send` takes an `Actor`, a
+session, an address string or an `Address`; a local address (`tinyactors://shop/@teller`
 on the host named `shop`) is resolved by the host to its actor. A message's
 `origin` is the sender's address as the other side gave it, and becomes
 the event's `_event.origin`.
@@ -111,7 +118,7 @@ four bytes of length and the message's CBOR:
 
 ```js
 import { connect, createServer } from 'node:net';
-import { decode, encode, Host } from '@tinyactors/node';
+import { compileCharts, decode, encode, Host } from '@tinyactors/node';
 
 /** Calls `receive` with each message the frames on `socket` hold. */
 function frames(socket, receive) {
@@ -134,19 +141,22 @@ const frame = (message) => {
 
 let toBank;
 let toShop;
-const log = (host, entry) => console.log(entry.text);
-const shop = new Host({ systemID: 'shop' }, { log, transport: (host, send) => toBank.write(frame(send.message)) });
-const bank = new Host({ systemID: 'bank' }, { log, transport: (host, send) => toShop.write(frame(send.message)) });
-shop.addCharts({ 'checkout.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="checkout">
+const log = (entry) => console.log(entry.text);
+const compiled = compileCharts([
+  { name: 'checkout.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="checkout">
   <state id="paying">
     <onentry><send event="charge" target="tinyactors://bank/@teller"/></onentry>
     <transition event="approved" target="done"><log expr="'approved'"/></transition>
   </state>
   <final id="done"/>
-</scxml>` });
-bank.addCharts({ 'teller.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="teller">
+</scxml>` },
+  { name: 'teller.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="teller">
   <state id="s"><transition event="charge"><log expr="'charging ' + _event.origin"/><send event="approved" targetexpr="_event.origin"/></transition></state>
-</scxml>` });
+</scxml>` },
+]);
+const shop = new Host(compiled, { system: 'shop', log, transport: (send) => toBank.write(frame(send.message)) });
+const bank = new Host(compiled, { system: 'bank', log, transport: (send) => toShop.write(frame(send.message)) });
+compiled.close();
 
 // The bank listens on a port of the system's choosing; the shop connects.
 const server = createServer((socket) => {
@@ -161,10 +171,10 @@ frames(toBank, (message) => shop.send(message));
 await new Promise((resolve) => toBank.once('connect', resolve));
 await new Promise((resolve) => setImmediate(resolve)); // the server's side of the connection
 
-bank.spawnChart('teller', { name: 'teller' });
-const order = shop.spawnChart('checkout', { name: 'order' });
-while (shop.actorByName('order') !== undefined) await new Promise((resolve) => setTimeout(resolve, 5));
-console.log('order', order, 'ended');
+bank.spawn('teller', { name: 'teller' });
+const order = shop.spawn('checkout');
+await order.done;
+console.log('order', order.id, 'ended');
 toBank.end();
 server.close();
 shop.close();
@@ -209,19 +219,22 @@ undefined
 through JSON and into the other side's `host.send` as it is:
 
 ```js
-import { Address, Host } from '@tinyactors/node';
+import { Address, compileCharts, Host } from '@tinyactors/node';
 
 let wire;
-const shop = new Host({ systemID: 'shop' }, { transport: (host, send) => { wire = JSON.stringify(send.message); } });
-const bank = new Host({ systemID: 'bank' }, { log: (host, entry) => console.log(entry.text) });
-shop.addCharts({ 'checkout.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="checkout">
+const compiled = compileCharts([
+  { name: 'checkout.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="checkout">
   <state id="s"><onentry><send event="charge" target="tinyactors://bank/@teller"><param name="amount" expr="12"/></send></onentry></state>
-</scxml>` });
-bank.addCharts({ 'teller.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="teller">
+</scxml>` },
+  { name: 'teller.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="teller">
   <state id="s"><transition event="charge"><log expr="'charge ' + _event.data.amount + ' from ' + _event.origin"/></transition></state>
-</scxml>` });
-bank.spawnChart('teller', { name: 'teller' });
-shop.spawnChart('checkout');
+</scxml>` },
+]);
+const shop = new Host(compiled, { system: 'shop', transport: (send) => { wire = JSON.stringify(send.message); } });
+const bank = new Host(compiled, { system: 'bank', log: (entry) => console.log(entry.text) });
+compiled.close();
+bank.spawn('teller', { name: 'teller' });
+shop.spawn('checkout');
 await shop.idle();
 
 const message = JSON.parse(wire); // its addresses are strings

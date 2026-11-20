@@ -32,7 +32,7 @@ const FIELD = {
   TARGET: 32, EVENT: 33, SENDID: 34, AUXILIARY: 35, TRACEPARENT: 36, ORIGIN: 37, WIRE: 64,
 };
 const EFFECT = {
-  SEND: 1, INVOKE: 3, UNINVOKE: 4, LOG: 5, WAKE: 8,
+  SEND: 1, INVOKE: 3, UNINVOKE: 4, LOG: 5, DONE: 6, ERROR: 7, WAKE: 8,
   MIGRATED: 16, MIGRATION_DONE: 17, REPLY: 23,
 };
 const FLAG_RESTORED = 2;
@@ -65,8 +65,9 @@ const POOLS = [
 ];
 
 const KNOWN_OPTIONS = ['ioProcessors', 'transport', 'log', 'clock', 'telemetry', 'wake', 'migrated', 'migrationDone',
-  'services', 'datamodel', 'quickjs'];
-const HANDLER_FUNCTIONS = ['log', 'transport', 'telemetry', 'wake', 'migrated', 'migrationDone'];
+  'services', 'datamodel', 'quickjs', 'done', 'error', 'handlerError', 'idle'];
+const HANDLER_FUNCTIONS = ['log', 'transport', 'telemetry', 'wake', 'migrated', 'migrationDone', 'done', 'error', 'handlerError',
+  'idle'];
 const HANDLER_MAPS = ['ioProcessors', 'services'];
 
 // The handlers' key on a Host: not enumerable, not configurable; writable,
@@ -74,6 +75,8 @@ const HANDLER_MAPS = ['ioProcessors', 'services'];
 const HANDLERS = Symbol('tinyactors.handlers');
 // What only the layer passes the constructors of views and records.
 const MAKING = Symbol('making');
+// The mark of an ask's row among the pending typed methods' handlers.
+const ASK = Symbol('tinyactors.ask');
 
 // ---- the event loop's macrotasks ---------------------------------------------------------
 
@@ -159,8 +162,31 @@ class HostState {
 
   // ---- errors ----
 
-  keep(error) {
+  // The first error kept for the turn.
+  stash(error) {
     if (this.error === null) this.error = [error];
+  }
+
+  // An error for the turn: the handlerError hook's when there is one.
+  keep(error) {
+    this.failed(error, undefined);
+  }
+
+  // A handler's error: the handlerError hook's (the application's
+  // onHandlerError), called with (error, effect), or else kept for the
+  // turn; the hook's own throw is kept. Answers whether a hook took it.
+  failed(error, effect) {
+    const hook = this.handlers()?.handlerError;
+    if (typeof hook !== 'function') {
+      this.stash(error);
+      return false;
+    }
+    try {
+      hook(error, effect);
+    } catch (thrown) {
+      this.stash(thrown);
+    }
+    return true;
   }
 
   takeKept() {
@@ -213,6 +239,8 @@ class HostState {
     case EFFECT.INVOKE: this.dispatchInvoke(index); break;
     case EFFECT.UNINVOKE: this.dispatchUninvoke(index); break;
     case EFFECT.REPLY: this.dispatchReply(index, extra); break;
+    case EFFECT.DONE:
+    case EFFECT.ERROR: this.dispatchEnd(index); break;
     default: break;
     }
     return TA_OK;
@@ -304,7 +332,8 @@ class HostState {
       if (typeof then !== 'function') return;
       then.call(result, () => this.settled(), (reason) => {
         this.settled();
-        throw reason;
+        if (typeof this.handlers()?.handlerError === 'function') this.failed(reason, undefined); // the hook's
+        else throw reason;
       });
     } catch {
       return; // not followed: idle() does not wait for it
@@ -371,8 +400,9 @@ class HostState {
       next = this.turn();
     } catch (thrown) {
       next = NEXT.FAULT;
-      this.keep(thrown); // the module stopped (a trap): its error
+      this.stash(thrown); // the module stopped (a trap): its error
     }
+    if (next === NEXT.IDLE && !this.closing && this.open) this.idleHook();
     error = this.turnError(next);
     let settle = false;
     if (next === NEXT.YIELD && !this.closing) {
@@ -384,7 +414,8 @@ class HostState {
         const host = this.host();
         if (delay >= 0 && host !== undefined) this.timer = setTimeout(timerOf, Math.min(delay, TIMEOUT_MAX), host);
       }
-      settle = next !== NEXT.IDLE || this.promises === 0;
+      // idle, no handler's promise pending, and no input the idle hook made
+      settle = next !== NEXT.IDLE || (this.promises === 0 && this.immediate === null);
     }
     if (error === null) error = this.takeKept();
     // a close a handler asked for runs at the leave: the waiter is kept
@@ -452,16 +483,40 @@ class HostState {
 
   // ---- dispatch ----
 
-  // A handler's call: its error kept for the turn, its promise followed.
-  invoke(handler, args) {
+  // A handler's call: its error the hook's or kept for the turn, its promise followed.
+  invoke(handler, args, effect) {
     let result;
     try {
       result = handler(...args);
     } catch (error) {
-      this.keep(error);
+      this.failed(error, effect);
       return;
     }
     this.follow(result);
+  }
+
+  // A turn went idle: the idle hook (the application layer's bound of
+  // resident actors), outside any batch; a promise it returns is followed.
+  idleHook() {
+    const hook = this.handlers()?.idle;
+    if (typeof hook === 'function') this.invoke(hook, []);
+  }
+
+  // A DONE (its donedata) or an ERROR (a fault, FLAGS its code): a
+  // top-level actor ended; the hook done(session, donedata) or
+  // error(session, fault) gets it.
+  dispatchEnd(index) {
+    const done = this.word(index, FIELD.KIND) === EFFECT.DONE;
+    const handler = this.handlers()?.[done ? 'done' : 'error'];
+    if (typeof handler !== 'function') return;
+    let value;
+    try {
+      value = done ? this.data(index) : this.word(index, FIELD.FLAGS);
+    } catch (error) {
+      this.keep(error);
+      return;
+    }
+    this.invoke(handler, [this.number(index, FIELD.SESSION), value]);
   }
 
   dispatchSend(index) {
@@ -475,8 +530,20 @@ class HostState {
     const handlers = this.handlers();
     if (host === undefined || handlers === undefined) return;
     const view = new Send(MAKING, this, index, processor);
+    // the transport is a function, an I/O processor an object with receive(send)
     const handler = handlers.processors?.[processor];
-    if (typeof handler !== 'function') { // no handler: a failed completion
+    let receiver, receive = handler;
+    if (handler !== null && typeof handler === 'object') {
+      receiver = handler;
+      try {
+        receive = handler.receive;
+      } catch (error) {
+        failUnanswered(view);
+        this.failed(error, view);
+        return;
+      }
+    }
+    if (typeof receive !== 'function') { // no handler: a failed completion
       try {
         replyTo(view, FAILURE);
       } catch (error) {
@@ -485,31 +552,33 @@ class HostState {
       return;
     }
     try {
-      const result = handler(host, view);
+      const result = receive.call(receiver, view);
       followSend(this, view, result);
     } catch (error) {
       failUnanswered(view);
-      this.keep(error);
+      this.failed(error, view);
     }
   }
 
   dispatchLog(index) {
     const handler = this.handlers()?.log;
     if (typeof handler !== 'function') return;
-    this.invoke(handler, [this.host(), new LogEntry(MAKING, this, index)]);
+    const entry = new LogEntry(MAKING, this, index);
+    this.invoke(handler, [entry], entry);
   }
 
   dispatchMigrated(index) {
     const handler = this.handlers()?.migrated;
     if (typeof handler !== 'function') return;
-    this.invoke(handler, [this.host(), new Migrated(MAKING, this, index)]);
+    const migrated = new Migrated(MAKING, this, index);
+    this.invoke(handler, [migrated], migrated);
   }
 
   dispatchWake(index) {
     const handler = this.handlers()?.wake;
     if (typeof handler !== 'function') return;
     const migration = this.number(index, FIELD.MIGRATION);
-    this.invoke(handler, [this.host(), this.number(index, FIELD.SESSION), migration === 0n ? undefined : Number(migration)]);
+    this.invoke(handler, [this.number(index, FIELD.SESSION), migration === 0n ? undefined : Number(migration)]);
   }
 
   // {migration, migrated, failed, pending}, read now (valid until the
@@ -550,7 +619,7 @@ class HostState {
       this.keep(error);
       return;
     }
-    this.invoke(handler, [this.host(), result]);
+    this.invoke(handler, [result]);
   }
 
   // The telemetry handler gets the request as a Uint8Array it keeps; in
@@ -560,9 +629,9 @@ class HostState {
     if (typeof handler !== 'function') return;
     let result;
     try {
-      result = handler(this.host(), signal, bytes);
+      result = handler(signal, bytes);
     } catch (error) {
-      this.keep(error);
+      this.failed(error, undefined);
       return;
     }
     if (this.endings === null) this.follow(result);
@@ -605,10 +674,10 @@ class HostState {
         this.keep(error);
         return;
       }
-      this.invoke(onError, [this.host(), error]);
+      this.invoke(onError, [error]);
       return;
     }
-    if (typeof onResult === 'function') this.invoke(onResult, [this.host(), reply.result]);
+    if (typeof onResult === 'function') this.invoke(onResult, [reply.result]);
   }
 
   // ---- invoked services ----
@@ -631,7 +700,7 @@ class HostState {
     let started = false, result, thrown = null;
     if (typeof handler === 'function') {
       try {
-        result = handler(this.host(), record);
+        result = handler(record);
         const then = result !== null && (typeof result === 'object' || typeof result === 'function') ? result.then : undefined;
         if (typeof then === 'function') {
           startInvocation(state, result);
@@ -644,7 +713,7 @@ class HostState {
     }
     if (!started) { // it does not run: kept as failed, so sends to it fail too, until the UNINVOKE
       failInvocation(state, { sendid: undefined, tell: !this.uninvokedInBatch(index) });
-      if (thrown !== null) this.keep(thrown[0]);
+      if (thrown !== null) this.failed(thrown[0], record);
       return;
     }
     if (state.flags & INVOCATION.ENDED) return; // done() in the handler: nothing to keep
@@ -720,7 +789,7 @@ class HostState {
     if (failed || starting) return;
     try {
       const stop = serviceMethod(service, 'stop');
-      if (stop !== null) stop.call(service, this.host());
+      if (stop !== null) stop.call(service);
     } catch (error) {
       this.keep(error);
     }
@@ -795,6 +864,7 @@ class Send {
   get type() { return sendField(viewOf(this), 'type'); }
   get origin() { return sendField(viewOf(this), 'origin'); }
   get traceparent() { return sendField(viewOf(this), 'traceparent'); }
+  get host() { return viewOf(this).state.host(); }
 
   // The send's outgoing half, the object host.send(message) takes: a text
   // field the send lacks is null.
@@ -885,7 +955,9 @@ function followSend(state, send, result) {
   materialize(send);
   const chained = then.call(result, undefined, (reason) => {
     failUnanswered(send);
-    throw reason;
+    // with a handlerError hook the rejection is the hook's, and the chain goes on
+    if (typeof state.handlers()?.handlerError === 'function') state.failed(reason, send);
+    else throw reason;
   });
   state.follow(chained);
 }
@@ -941,7 +1013,7 @@ function failUnanswered(send) {
   }
 }
 
-let entryOf;
+let entryOf, entryHost;
 
 // A <log> line: (session, label, text), a thin view until the ack.
 class LogEntry {
@@ -953,6 +1025,10 @@ class LogEntry {
   }
 
   static {
+    entryHost = (self) => {
+      if (self === null || typeof self !== 'object' || !(#view in self)) throw new TypeError('not a view of an effect');
+      return self.#view.state.host();
+    };
     entryOf = (self, name, read) => {
       if (self === null || typeof self !== 'object' || !(#view in self)) throw new TypeError('not a view of an effect');
       return cachedField(self.#view, name, read);
@@ -962,6 +1038,7 @@ class LogEntry {
   get session() { return entryOf(this, 'session', (s, i) => s.number(i, FIELD.SESSION)); }
   get label() { return entryOf(this, 'label', (s, i) => s.text(i, FIELD.AUXILIARY)); }
   get text() { return entryOf(this, 'text', (s, i) => s.text(i, FIELD.EVENT)); }
+  get host() { return entryHost(this); }
 }
 
 function cachedField(view, name, read) {
@@ -972,7 +1049,7 @@ function cachedField(view, name, read) {
   return value;
 }
 
-let migratedOf;
+let migratedOf, migratedHost;
 
 // An actor moved by a migration: a thin view until the ack.
 class Migrated {
@@ -984,6 +1061,10 @@ class Migrated {
   }
 
   static {
+    migratedHost = (self) => {
+      if (self === null || typeof self !== 'object' || !(#view in self)) throw new TypeError('not a view of an effect');
+      return self.#view.state.host();
+    };
     migratedOf = (self, name, read) => {
       if (self === null || typeof self !== 'object' || !(#view in self)) throw new TypeError('not a view of an effect');
       return cachedField(self.#view, name, read);
@@ -994,6 +1075,7 @@ class Migrated {
   get segment() { return migratedOf(this, 'segment', (s, i) => s.word(i, FIELD.SEGMENT)); }
   get chart() { return migratedOf(this, 'chart', (s, i) => s.text(i, FIELD.EVENT)); }
   get migration() { return migratedOf(this, 'migration', (s, i) => s.word(i, FIELD.MIGRATION)); }
+  get host() { return migratedHost(this); }
 }
 
 // ---- invoked services --------------------------------------------------------------------------
@@ -1055,6 +1137,7 @@ class Invocation {
   get data() { return invocationState(this).data; }
   get traceparent() { return invocationState(this).traceparent; }
   get restored() { return (invocationState(this).flags & INVOCATION.RESTORED) !== 0; }
+  get host() { return invocationState(this).host.host(); }
 
   get running() {
     const state = invocationState(this);
@@ -1156,7 +1239,7 @@ function serviceMethod(service, name) {
 function serviceReceive(state, service, receive, send) {
   let result;
   try {
-    result = receive.call(service, state.host.host(), send);
+    result = receive.call(service, send);
     const then = result !== null && (typeof result === 'object' || typeof result === 'function') ? result.then : undefined;
     if (typeof then === 'function') {
       materialize(send);
@@ -1206,7 +1289,7 @@ function startedInvocation(state, service) {
   if (!host.open) return; // closed: dropped, not started
   if (state.flags & INVOCATION.UNINVOKED) { // cancelled while it started: stopped now
     const stop = serviceMethod(service, 'stop');
-    if (stop !== null) stop.call(service, host.host());
+    if (stop !== null) stop.call(service);
     return;
   }
   if (state.flags & INVOCATION.ENDED) return; // done in its start
@@ -1254,6 +1337,8 @@ let clockOf;
 // A clock in milliseconds (nanoseconds inside, exact) that moves only with
 // increment(ms), which schedules a turn on each host made with it; such a
 // host arms no timer. It holds the hosts weakly.
+export { Send };
+
 export class SimulatedClock {
   #clock = { ns: 0n, hosts: [] };
 
@@ -1303,9 +1388,14 @@ function readHandlers(options) {
   for (const name of HANDLER_MAPS) {
     const value = options?.[name];
     if (value === undefined) continue;
-    if (value === null || typeof value !== 'object') throw new TypeError('ioProcessors and services are objects of a type -> its handler');
+    const usage = name === 'ioProcessors'
+      ? 'ioProcessors is an object of a type -> its processor, an object with receive(send)'
+      : 'services is an object of a type -> its handler, a function';
+    if (value === null || typeof value !== 'object') throw new TypeError(usage);
     for (const key of Object.keys(value)) {
-      if (typeof value[key] !== 'function') throw new TypeError('ioProcessors and services are objects of a type -> its handler');
+      const item = value[key];
+      const ok = name === 'ioProcessors' ? item !== null && typeof item === 'object' && typeof item.receive === 'function' : typeof item === 'function';
+      if (!ok) throw new TypeError(usage);
     }
     handlers[name] = value;
   }
@@ -1673,6 +1763,73 @@ export class Host {
     });
   }
 
+  // whether a live segment runs an image of these bytes: the application
+  // layer adds a restored host only the images its snapshot lacks
+  holdsImage(image) {
+    const state = checked(this, true);
+    return state.call(() => {
+      const bytes = bytesOf(image, 'holdsImage takes the image\'s bytes: a Uint8Array or an ArrayBuffer');
+      const module = state.module;
+      const [at, length] = module.copyIn(state.scratch, bytes);
+      module.setWord(0, at);
+      module.setWord(1, length);
+      return state.fn.ta_web_host_holds_image(state.pointer) !== 0;
+    });
+  }
+
+  // the actors in memory now: the application layer's bound of resident actors
+  residentCount() {
+    const state = checked(this, true);
+    return state.call(() => {
+      state.fn.ta_web_host_resident(state.pointer);
+      return Number(state.module.word64(0));
+    });
+  }
+
+  // a live actor's {chart, hibernated}, or undefined
+  actorInfo(session) {
+    const id = sessionOf(session);
+    const state = checked(this, true);
+    return state.call(() => {
+      const answer = state.fn.ta_web_host_actor_info(state.pointer, Number(id & 0xFFFFFFFFn), Number(id >> 32n));
+      if (answer < 0) return undefined;
+      const module = state.module;
+      return { chart: module.string(module.word(0), module.word(1)), hibernated: answer === 1 };
+    });
+  }
+
+  // an ask's row in the pending table, its settle function kept at the
+  // row's slot; answers the row's handle (Actor.ask's reply address)
+  askOpen(settle) {
+    const state = checked(this, true);
+    if (typeof settle !== 'function') throw new TypeError('askOpen takes the ask\'s settle function');
+    return state.call(() => {
+      const handlers = state.handlers();
+      const slot = state.fn.ta_web_pending_add(state.pointer);
+      if (slot === 0) throw refusal('TA_ERROR_NO_MEMORY', 'no memory for an ask');
+      const id = state.module.word64(0);
+      handlers.pending ??= [];
+      handlers.pending[2 * (slot - 1)] = settle;
+      handlers.pending[2 * (slot - 1) + 1] = ASK;
+      return id;
+    });
+  }
+
+  // the ask's row removed and its settle function given back; undefined
+  // for a handle that names no ask
+  askClose(handle) {
+    const state = checked(this, false);
+    if (!state.open || typeof handle !== 'bigint' || handle < 1n || handle >= 1n << 64n) return undefined;
+    const handlers = state.handlers();
+    const at = 2 * (Number(handle & 0xFFFFFFFFn) - 1);
+    if (handlers === undefined || !Array.isArray(handlers.pending) || handlers.pending[at + 1] !== ASK) return undefined;
+    if (state.fn.ta_web_pending_take(state.pointer, Number(handle & 0xFFFFFFFFn), Number(handle >> 32n)) === 0) return undefined;
+    const settle = handlers.pending[at];
+    handlers.pending[at] = undefined;
+    handlers.pending[at + 1] = undefined;
+    return settle;
+  }
+
   actorByName(name) {
     const state = checked(this, true);
     return state.call(() => {
@@ -1980,8 +2137,8 @@ function eventOf(state, message) {
 function targetOf(state, target) {
   const value = isAddress(target) ? target.text : target;
   if (typeof value !== 'string') {
-    if (typeof value === 'bigint' || typeof value === 'number') return sessionOf(value);
-    throw new TypeError('a target is a session (a bigint or a safe integer) or a local address (a string or an Address)');
+    if (typeof value === 'bigint' || typeof value === 'number' || (value !== null && typeof value === 'object')) return sessionOf(value);
+    throw new TypeError('a target is an Actor, a session (a bigint or a safe integer) or a local address (a string or an Address)');
   }
   const module = state.module;
   const [at, length] = module.text(state.scratch, value);
@@ -2019,7 +2176,7 @@ for (const [js, core] of METHODS) {
         const id = module.word64(0);
         const at = 2 * (slot - 1);
         // actor.get's timers[].due: the host's ticks as milliseconds on now()'s clock
-        handlers.pending[at] = core === 'actor.get' ? (host, result) => onResult(host, state.timesInMilliseconds(result)) : onResult;
+        handlers.pending[at] = core === 'actor.get' ? (result) => onResult(state.timesInMilliseconds(result)) : onResult;
         handlers.pending[at + 1] = failed;
         let posted = false;
         try {

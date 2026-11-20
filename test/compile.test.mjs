@@ -4,7 +4,7 @@
 // TA_ERROR_STALE), CompileError with every diagnostic, the resolver and
 // ResolveError, and the finalizer that frees a result never closed.
 import { compileCharts, compileSystem, CompileError, Host, ResolveError, TinyactorsError } from '@tinyactors/node';
-import { CONFIG, ENGINE, equal, sameBytes, scxml, status, throws, typeError, until } from './charts.mjs';
+import { CONFIG, ENGINE, equal, named, sameBytes, scxml, status, throws, typeError, until } from './charts.mjs';
 import { collect, run, test } from './harness.mjs';
 
 const GOOD = scxml('c', '<state id="s"/>');
@@ -61,7 +61,7 @@ test('the image is a Uint8Array copied on first read, the same after, and it out
   compiled.close(); // again: nothing
   equal(compiled.image, image, 'the copy read before close()');
   if (!sameBytes(image, copy)) throw new Error('the image changed at close()');
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   equal(host.addImage(image), 0, 'the copy makes a segment after close()');
   host.close();
 });
@@ -86,11 +86,11 @@ test('a compile result is made by the compile calls only', () => {
 
 test('a resolver reads src, and a ResolveError is a diagnostic at its line and column', () => {
   const resolve = resolver({ 'child.scxml': CHILD });
-  const compiled = compileCharts([{ name: 'parent.scxml', text: PARENT }], resolve);
+  const compiled = compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: resolve });
   if (!(compiled.image.length > 0)) throw new Error('no image');
   compiled.close();
   equal(JSON.stringify(resolve.asked), JSON.stringify([['parent.scxml', 'child.scxml']]), 'asked');
-  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], resolver({})), (error) => {
+  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: resolver({}) }), (error) => {
     if (!(error instanceof CompileError)) throw error;
     const diagnostic = firstError(error);
     equal(diagnostic.line, 3, 'line');
@@ -108,37 +108,38 @@ test('any callable resolves: an arrow, a bound method', () => {
   const files = { 'child.scxml': CHILD };
   const reader = { files, read(base, source) { return this.files[source]; } };
   for (const resolve of [(base, source) => files[source], reader.read.bind(reader)]) {
-    compileCharts([{ name: 'parent.scxml', text: PARENT }], resolve).close();
+    compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: resolve }).close();
   }
 });
 
 test('another error of a resolver is thrown from the compile call, whatever value it is', () => {
   const disk = new Error('disk');
-  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], () => {
+  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: () => {
     throw disk;
-  }), (error) => {
+  } }), (error) => {
     if (error !== disk) throw error;
   }, 'a resolver that throws');
   for (const thrown of ['a string', 7, undefined, null]) { // any value, not only an object
     let caught = 'nothing';
     try {
-      compileCharts([{ name: 'parent.scxml', text: PARENT }], () => { throw thrown; });
+      compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: () => { throw thrown; } });
     } catch (error) {
       caught = error;
     }
     if (caught !== thrown) throw new Error(`a resolver that throws ${String(thrown)}: ${String(caught)} thrown`);
   }
-  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], () => 42), typeError, 'a resolver returning a number');
-  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], () => '\uD800'), status('TA_ERROR_INVALID'),
+  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: () => 42 }), typeError, 'a resolver returning a number');
+  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: () => '\uD800' }), status('TA_ERROR_INVALID'),
     'a resolver returning a lone surrogate');
 });
 
 test('a resolver is a function; without one, src is refused', () => {
-  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { 'child.scxml': CHILD }), typeError, 'an object');
+  throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }], { resolver: { 'child.scxml': CHILD } }), typeError, 'an object');
+  throws(() => compileCharts([{ name: 'c.scxml', text: GOOD }], { resolve: () => '' }), typeError, 'an unknown option');
   throws(() => compileCharts([{ name: 'parent.scxml', text: PARENT }]), (error) => {
     if (!(error instanceof CompileError)) throw error;
   }, 'no resolver');
-  compileCharts([{ name: 'c.scxml', text: GOOD }], null).close();
+  compileCharts([{ name: 'c.scxml', text: GOOD }], { resolver: null }).close();
 });
 
 test('sources are an array of {name, text} of strings', () => {
@@ -153,18 +154,18 @@ test('sources are an array of {name, text} of strings', () => {
 
 test('a manifest compiles into an image whose actors boot by name', async () => {
   const resolve = resolver({ 'worker.scxml': WORKER });
-  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, resolve);
-  const host = new Host(CONFIG, ENGINE);
+  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, { resolver: resolve });
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   const segment = host.addImage(compiled.image);
   compiled.close();
-  equal(host.actorByName('first'), undefined, 'before boot');
+  equal(named(host, 'first'), undefined, 'before boot');
   host.boot(segment);
-  const first = host.actorByName('first');
-  const second = host.actorByName('second');
+  const first = named(host, 'first');
+  const second = named(host, 'second');
   if (typeof first !== 'bigint' || typeof second !== 'bigint' || first === second) throw new Error(`${first} ${second}`);
   host.terminate(first);
   host.send(second, 'stop');
-  if (!(await until(() => host.actorByName('first') === undefined && host.actorByName('second') === undefined)))
+  if (!(await until(() => named(host, 'first') === undefined && named(host, 'second') === undefined)))
     throw new Error('the boot actors did not end');
   equal(JSON.stringify(resolve.asked), JSON.stringify([['system.xml', 'worker.scxml']]), 'asked');
   throws(() => host.boot('0'), typeError, 'a segment that is not a number');
@@ -213,13 +214,40 @@ test('compileCharts parses each expression and script: a syntax error is a warni
   equal([script.severity, script.line].join(), 'warning,7', 'the script, at its own line');
   if (!/^<script>: SyntaxError: /.test(script.message)) throw new Error(script.message);
   let error;
-  try { compileCharts([{ name: 'typo.scxml', text }], undefined, { warningsAsErrors: true }); } catch (caught) { error = caught; }
+  try { compileCharts([{ name: 'typo.scxml', text }], { warningsAsErrors: true }); } catch (caught) { error = caught; }
   equal(error instanceof CompileError, true, 'a CompileError');
   equal(error.diagnostics.filter((d) => d.severity === 'error' && /SyntaxError/.test(d.message)).length, 2, 'both, as errors');
   if (!/^typo\.scxml:4:\d+: error: cond: SyntaxError: /.test(error.message)) throw new Error(error.message);
   let refused;
-  try { compileCharts([{ name: 'typo.scxml', text }], undefined, 'strict'); } catch (caught) { refused = caught; }
+  try { compileCharts([{ name: 'typo.scxml', text }], 'strict'); } catch (caught) { refused = caught; }
   equal(refused instanceof TypeError, true, 'options are an object');
+});
+
+test('compileCharts reports a script\'s top-level declarations at the script\'s line: let, const and class refused, var a variable, both naming <data>', () => {
+  const text = [
+    '<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="declares" initial="s">',
+    '  <script>',
+    '    function helper(x) { return x + 1; }',
+    '    var total = 0;',
+    '  </script>',
+    '  <state id="s">',
+    '    <transition event="go"><script>const LIMIT = 2; { let local = 1; }</script></transition>',
+    '    <transition event="fine"><script>function local() {} for (let i = 0; i &lt; 2; i++) total = helper(total);</script></transition>',
+    '  </state>',
+    '</scxml>'].join('\n');
+  const compiled = compileCharts([{ name: 'declares.scxml', text }]);
+  const found = compiled.diagnostics.filter((d) => /declares/.test(d.message)).sort((a, b) => a.line - b.line);
+  compiled.close();
+  equal(found.map((d) => [d.severity, d.line].join()).join('|'), 'warning,2|warning,7', 'the var, then the const, each at its script');
+  equal(found[0].message, '<script>: a <script> declares var total at its top level, which the native "ecmascript" datamodel ' +
+    'makes a variable of the session: declare it with <data id="total"/> instead', 'the var');
+  equal(found[1].message, '<script>: a <script> declares LIMIT with let, const or class at its top level, which the native ' +
+    '"ecmascript" datamodel refuses (the script is error.execution): declare it with <data id="LIMIT"/> instead', 'the const');
+  let error;
+  try { compileCharts([{ name: 'declares.scxml', text }], { warningsAsErrors: true }); } catch (caught) { error = caught; }
+  equal(error instanceof CompileError, true, 'a CompileError');
+  equal(error.diagnostics.filter((d) => d.severity === 'error' && /declares/.test(d.message)).length, 2, 'both, as errors');
+  if (!/^declares\.scxml:\d+:\d+: error: <script>: a <script> declares /.test(error.message)) throw new Error(error.message);
 });
 
 await run();

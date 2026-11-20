@@ -67,7 +67,7 @@ const WHOAMI = scxml('whoami', `
 class Logs {
   constructor() {
     this.lines = [];
-    this.handler = (host, entry) => this.lines.push([entry.label, entry.text]);
+    this.handler = (entry) => this.lines.push([entry.label, entry.text]);
   }
   labelled(label) {
     return this.lines.filter(([l]) => l === label).map(([, text]) => text);
@@ -81,12 +81,12 @@ class Echo {
     this.invocation = invocation;
     record.push(['start', invocation.session, invocation.invokeid, invocation.type, invocation.src, JSON.stringify(invocation.data)]);
   }
-  receive(host, send) {
+  receive(send) {
     this.record.push(['receive', send.event, send.data, send.type]);
     if (send.data === 'finish') this.invocation.done({ asked: this.record.filter((r) => r[0] === 'receive').length });
     else this.invocation.sendBack('answer', { echo: send.data });
   }
-  stop(host) {
+  stop() {
     this.record.push(['stop', this.invocation.session]);
   }
 }
@@ -111,8 +111,8 @@ test('an actor talks to its service and gets its done data', async () => {
   const logs = new Logs();
   const record = [];
   const invocations = [];
-  const host = client({ log: logs.handler, services: { [TYPE]: (h, invocation) => (invocations.push(invocation), new Echo(record, invocation)) } });
-  const session = host.spawn(host.chart('client'));
+  const host = client({ log: logs.handler, services: { [TYPE]: (invocation) => (invocations.push(invocation), new Echo(record, invocation)) } });
+  const session = host.spawn('client').id;
   await host.idle();
   equal(invocations[0].running, true, 'running');
   equal(invocations[0].restored, false, 'restored');
@@ -133,7 +133,7 @@ test('an actor talks to its service and gets its done data', async () => {
 
 test('the invocation\'s strings are shared across a population; its traceparent is the invoke\'s', async () => {
   const invocations = [];
-  const host = client({ services: { [TYPE]: (h, invocation) => void invocations.push(invocation) } });
+  const host = client({ services: { [TYPE]: (invocation) => void invocations.push(invocation) } });
   host.spawn(host.chart('client'));
   host.spawn(host.chart('client'));
   await host.idle();
@@ -147,8 +147,8 @@ test('the invocation\'s strings are shared across a population; its traceparent 
 test('leaving the invoking state stops the service, once', async () => {
   const record = [];
   const invocations = [];
-  const host = client({ services: { [TYPE]: (h, invocation) => (invocations.push(invocation), new Echo(record, invocation)) } });
-  const session = host.spawn(host.chart('client'));
+  const host = client({ services: { [TYPE]: (invocation) => (invocations.push(invocation), new Echo(record, invocation)) } });
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'leave');
   await host.idle();
@@ -160,8 +160,8 @@ test('leaving the invoking state stops the service, once', async () => {
 
 test('terminating the invoker stops the service', async () => {
   const record = [];
-  const host = client({ services: { [TYPE]: (h, invocation) => new Echo(record, invocation) } });
-  const session = host.spawn(host.chart('client'));
+  const host = client({ services: { [TYPE]: (invocation) => new Echo(record, invocation) } });
+  const session = host.spawn('client').id;
   await host.idle();
   host.terminate(session);
   await host.idle();
@@ -173,15 +173,15 @@ test('stop and receive are called on the service, with the host', async () => {
   const seen = [];
   let host;
   const service = {
-    receive(h, send) {
-      seen.push(['receive', this === service, h === host, send.event]);
+    receive(send) {
+      seen.push(['receive', this === service, send.host === host, send.event]);
     },
-    stop(h) {
-      seen.push(['stop', this === service, h === host]);
+    stop() {
+      seen.push(['stop', this === service, arguments.length === 0]);
     },
   };
   host = client({ services: { [TYPE]: () => service } });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'ask', 1);
   host.send(session, 'leave');
@@ -195,12 +195,12 @@ test('a service needs neither receive nor stop', async () => {
   const host = client({
     log: logs.handler,
     services: {
-      [TYPE]: (h, invocation) => {
+      [TYPE]: (invocation) => {
         invocation.sendBack('answer', 'hi');
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'ask', 'dropped'); // nothing receives it
   host.send(session, 'leave');
@@ -229,7 +229,7 @@ test('a handler that throws is a communication error; a send to it fails too, un
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   const error = await rejected(host.idle());
   equal(error?.message, 'cannot start', 'the handler\'s error');
   host.send(session, 'ask', 'anyone');
@@ -269,14 +269,14 @@ test('a handler that returns a promise of the service: what comes while it start
   const host = client({
     log: logs.handler,
     services: {
-      [TYPE]: async (h, invocation) => {
+      [TYPE]: async (invocation) => {
         invocation.sendBack('answer', { echo: 'starting' }); // the invocation answers while it starts
         await opened;
         return new Echo(record, invocation);
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await later(); // turns run; idle() would wait for the start
   host.send(session, 'ask', 'first');
   host.send(session, 'ask', 'second');
@@ -301,13 +301,13 @@ test('an UNINVOKE while it starts stops the service once it resolves; the sends 
   const { opened, release } = gate();
   const host = client({
     services: {
-      [TYPE]: async (h, invocation) => {
+      [TYPE]: async (invocation) => {
         await opened;
         return new Echo(record, invocation);
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await later(); // turns run; idle() would wait for the start
   host.send(session, 'ask', 'before');
   host.send(session, 'leave');
@@ -332,7 +332,7 @@ test('a handler\'s promise that rejects is a failed start: the invoker and each 
         },
       },
     });
-    const session = host.spawn(host.chart('client'));
+    const session = host.spawn('client').id;
     await later(); // turns run; idle() would wait for the start
     host.send(session, 'ask', 'queued');
     await later(); // turns run; idle() would wait for the start
@@ -356,7 +356,7 @@ test('a promise that settles after close, or after the invocation was cancelled,
     const host = client({
       log: logs.handler,
       services: {
-        [TYPE]: async (h, invocation) => {
+        [TYPE]: async (invocation) => {
           const which = started++;
           await gates[which].opened;
           if (which === 1) throw new Error('late');
@@ -391,7 +391,7 @@ test('a failure to start an invocation cancelled in the same run is not reported
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   host.send(session, 'leave'); // INVOKE and UNINVOKE in one batch
   const error = await rejected(host.idle());
   equal(error?.message, 'cannot start', 'the handler\'s error');
@@ -406,7 +406,7 @@ test('services left at close are dropped, not stopped, and collected', async () 
   const registry = new FinalizationRegistry(() => collected++);
   let host = client({
     services: {
-      [TYPE]: (h, invocation) => {
+      [TYPE]: (invocation) => {
         const service = new Echo(record, invocation);
         registry.register(service, 'service');
         return service;
@@ -430,7 +430,7 @@ test('a dropped host whose running services close over it is collected', async (
       const host = client({
         services: {
           // service -> invocation -> host -> handlers -> invocations -> service
-          [TYPE]: (h, invocation) => (started++, { host: h, invocation, receive: () => host }),
+          [TYPE]: (invocation) => (started++, { host: invocation.host, invocation, receive: () => host }),
         },
       });
       host.spawn(host.chart('client'));
@@ -453,7 +453,7 @@ test('a service done in its handler is neither kept nor stopped', async () => {
   const host = client({
     log: logs.handler,
     services: {
-      [TYPE]: (h, invocation) => {
+      [TYPE]: (invocation) => {
         const service = new Echo(record, invocation);
         registry.register(service, 'service');
         invocation.done({ at: 'start' });
@@ -461,7 +461,7 @@ test('a service done in its handler is neither kept nor stopped', async () => {
       },
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   await collect();
   equal(collected, 1, 'the host does not hold it');
@@ -479,13 +479,13 @@ test('autoforward reaches the service, and its own answers too', async () => {
     constructor(invocation) {
       this.invocation = invocation;
     }
-    receive(h, send) {
+    receive(send) {
       record.push([send.event, send.data]);
       if (send.event === 'hello') this.invocation.sendBack('answer', { echo: send.data });
     }
   }
-  const host = hostWith({ client: AUTOFORWARD }, { log: logs.handler, services: { [TYPE]: (h, i) => new Forwarded(i) } });
-  const session = host.spawn(host.chart('client'));
+  const host = hostWith({ client: AUTOFORWARD }, { log: logs.handler, services: { [TYPE]: (i) => new Forwarded(i) } });
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'hello', 'there');
   await host.idle();
@@ -510,7 +510,7 @@ test('a receive that throws is a crash: error.communication with the sendid, dro
       }),
     },
   });
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'ask', 'first');
   const error = await rejected(host.idle());
@@ -534,8 +534,8 @@ test('an async receive reads its send after the ack; its rejection is a crash', 
     const host = client({
       log: logs.handler,
       services: {
-        [TYPE]: (h, invocation) => ({
-          async receive(h2, send) {
+        [TYPE]: (invocation) => ({
+          async receive(send) {
             await new Promise((resolve) => setTimeout(resolve, 1));
             if (send.data === 'boom') throw new Error('late crash');
             invocation.sendBack('answer', { echo: send.data });
@@ -543,7 +543,7 @@ test('an async receive reads its send after the ack; its rejection is a crash', 
         }),
       },
     });
-    const session = host.spawn(host.chart('client'));
+    const session = host.spawn('client').id;
     await host.idle();
     host.send(session, 'ask', 'later');
     await host.idle();
@@ -568,9 +568,9 @@ test('an event from a service names it as its origin, which reaches the service'
   const host = hostWith({ whoami: WHOAMI }, {
     log: logs.handler,
     services: {
-      [TYPE]: (h, invocation) => {
+      [TYPE]: (invocation) => {
         invocation.sendBack('reply');
-        return { receive: (h2, send) => received.push(send.event) };
+        return { receive: (send) => received.push(send.event) };
       },
     },
   });
@@ -584,7 +584,7 @@ test('an event from a service names it as its origin, which reaches the service'
 
 test('sendBack and done refuse what they cannot take', async () => {
   const invocations = [];
-  const host = client({ services: { [TYPE]: (h, invocation) => void invocations.push(invocation) } });
+  const host = client({ services: { [TYPE]: (invocation) => void invocations.push(invocation) } });
   host.spawn(host.chart('client'));
   await host.idle();
   const [invocation] = invocations;
@@ -601,19 +601,19 @@ test('sendBack and done refuse what they cannot take', async () => {
 });
 
 test('services must be an object of functions', () => {
-  throws(() => new Host({ systemID: 't' }, { ...ENGINE, services: [() => 0, 1] }), typeError, 'not functions');
-  throws(() => new Host({ systemID: 't' }, { ...ENGINE, services: 'urn:x' }), typeError, 'a string');
+  throws(() => new Host([], { system: 't', ...ENGINE, services: [() => 0, 1] }), typeError, 'not functions');
+  throws(() => new Host([], { system: 't', ...ENGINE, services: 'urn:x' }), typeError, 'a string');
 });
 
 // ---- snapshots with running services -------------------------------------------
 
-const CONFIG = { systemID: 't', system: { ticksPerSecond: 1000 } };
+const CONFIG = { system: 't', config: { system: { ticksPerSecond: 1000 } } };
 
 async function snapshotWithAService() {
   const record = [];
-  const host = new Host(CONFIG, { ...ENGINE, clock: new SimulatedClock(), services: { [TYPE]: (h, i) => new Echo(record, i) } });
+  const host = new Host([], { ...CONFIG, ...ENGINE, clock: new SimulatedClock(), services: { [TYPE]: (i) => new Echo(record, i) } });
   host.addImage(image({ client: CLIENT }));
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'ask', 'before');
   await host.idle();
@@ -622,14 +622,14 @@ async function snapshotWithAService() {
   return { session, blob };
 }
 
-const restore = (blob, options = {}) => Host.restore(blob, CONFIG, { ...ENGINE, clock: new SimulatedClock(), ...options });
+const restore = (blob, options = {}) => Host.restore(blob, [], { ...CONFIG, ...ENGINE, clock: new SimulatedClock(), ...options });
 
 test('a restored host announces each running invocation again, and its service is started', async () => {
   const { session, blob } = await snapshotWithAService();
   const logs = new Logs();
   const record = [];
   const invocations = [];
-  const host = restore(blob, { log: logs.handler, services: { [TYPE]: (h, i) => (invocations.push(i), new Echo(record, i)) } });
+  const host = restore(blob, { log: logs.handler, services: { [TYPE]: (i) => (invocations.push(i), new Echo(record, i)) } });
   await host.idle();
   host.send(session, 'ask', 'after');
   await host.idle();
@@ -655,7 +655,7 @@ test('a restore with a stand-in service: the copy never reaches the real one', a
       this.invocation.sendBack('answer', 'stand-in');
     }
   }
-  const host = restore(blob, { log: logs.handler, services: { [TYPE]: (h, i) => new StandIn(i) } });
+  const host = restore(blob, { log: logs.handler, services: { [TYPE]: (i) => new StandIn(i) } });
   host.send(session, 'ask', 'after');
   await host.idle();
   host.close();
@@ -681,7 +681,7 @@ test('a restore of a restore reports a missing service once', async () => {
   await host.idle();
   const again = host.snapshot();
   host.close();
-  host = restore(again, { log: logs.handler, services: { [TYPE]: (h, i) => void started.push(i) } });
+  host = restore(again, { log: logs.handler, services: { [TYPE]: (i) => void started.push(i) } });
   await host.idle();
   host.close();
   same(logs.labelled('error'), ['communication'], 'told once');
@@ -691,7 +691,7 @@ test('a restore of a restore reports a missing service once', async () => {
 test('a service done before the snapshot is not started again: its done.invoke is delivered', async () => {
   const invocations = [];
   const started = [];
-  let host = new Host(CONFIG, { ...ENGINE, clock: new SimulatedClock(), services: { [TYPE]: (h, i) => void invocations.push(i) } });
+  let host = new Host([], { ...CONFIG, ...ENGINE, clock: new SimulatedClock(), services: { [TYPE]: (i) => void invocations.push(i) } });
   host.addImage(image({ client: CLIENT }));
   host.spawn(host.chart('client'));
   await host.idle();
@@ -699,7 +699,7 @@ test('a service done before the snapshot is not started again: its done.invoke i
   const blob = host.snapshot();
   host.close();
   const logs = new Logs();
-  host = restore(blob, { log: logs.handler, services: { [TYPE]: (h, i) => void started.push(i) } });
+  host = restore(blob, { log: logs.handler, services: { [TYPE]: (i) => void started.push(i) } });
   await host.idle();
   host.close();
   equal(started.length, 0, 'not started again');
@@ -709,7 +709,7 @@ test('a service done before the snapshot is not started again: its done.invoke i
 test('a service that crashed is not started again', async () => {
   const logs = new Logs();
   const started = [];
-  let host = new Host(CONFIG, {
+  let host = new Host([], { ...CONFIG, 
     ...ENGINE,
     clock: new SimulatedClock(),
     log: logs.handler,
@@ -722,7 +722,7 @@ test('a service that crashed is not started again', async () => {
     },
   });
   host.addImage(image({ client: CLIENT }));
-  const session = host.spawn(host.chart('client'));
+  const session = host.spawn('client').id;
   await host.idle();
   host.send(session, 'ask', 'first');
   await rejected(host.idle());
@@ -730,7 +730,7 @@ test('a service that crashed is not started again', async () => {
   const blob = host.snapshot();
   host.close();
   const restoredLogs = new Logs();
-  host = restore(blob, { log: restoredLogs.handler, services: { [TYPE]: (h, i) => void started.push(i) } });
+  host = restore(blob, { log: restoredLogs.handler, services: { [TYPE]: (i) => void started.push(i) } });
   await host.idle();
   host.close();
   same(logs.labelled('error'), ['communication'], 'the crash told');

@@ -22,14 +22,14 @@ export function needs(program) {
 
 // document:line -> why the block stays in node and bun
 export const BLOCKS = {
-  'docs/guide/charts.md:382': 'directoryResolver reads charts from a temporary directory it writes with node:fs, node:os and node:path',
-  'docs/guide/other-systems.md:112': 'two systems over a node:net socket, framed with Buffer',
+  'docs/guide/charts.md:359': 'compileDir reads charts from a temporary directory it writes with node:fs, node:os and node:path',
+  'docs/guide/other-systems.md:119': 'two systems over a node:net socket, framed with Buffer',
   'docs/guide/testing.md:21': 'a test written with node:assert/strict, as the guide recommends for node and bun',
 };
 
 // The example applications that do not run in a page, whole.
 export const APPLICATIONS = {
-  'chat-rooms': 'its hibernated users live in files (node:fs/promises), and its demo runs as a process',
+  'chat-rooms': 'it compiles its charts with compileDir and keeps its hibernated actors in files (node:fs), and its demo runs as a process',
   'document-approval': 'its admin view is a node:http server, and it keeps its records in files (node:fs)',
   'http-gateway': 'it is a node:http server',
   'inventory-sync': 'its two systems are two processes (node:child_process) over a node:net socket',

@@ -12,11 +12,11 @@
 // l-p1-compile-unreachable-statuses).
 import { spawnSync } from 'node:child_process';
 import { Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
-import { ENDER, ENGINE, hostWith, scxml, sleep } from './charts.mjs';
+import { ENDER, ENGINE, hostWith, named, scxml, sleep } from './charts.mjs';
 import { collect, run, test } from './harness.mjs';
 import { macrotask } from './runtime.mjs';
 
-const CONFIG = { systemID: 't' };
+const CONFIG = { system: 't' };
 
 function equal(actual, expected, what) {
   if (actual !== expected) throw new Error(`${what}: ${actual}, expected ${expected}`);
@@ -46,7 +46,7 @@ const stateError = (error) => {
 const tick = () => macrotask();
 
 test('idle() on a fresh host settles at the next turn, with no driver called', async () => {
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   const first = host.idle();
   if (!(first instanceof Promise)) throw new Error('idle() gave no promise');
   equal(host.idle(), first, 'the same promise until it settles');
@@ -58,7 +58,7 @@ test('idle() on a fresh host settles at the next turn, with no driver called', a
 });
 
 test('nextDeadline is undefined with nothing due, and on a closed host', async () => {
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   equal(host.nextDeadline, undefined, 'before a turn');
   await host.idle();
   equal(host.nextDeadline, undefined, 'after an idle turn with no deadline');
@@ -67,7 +67,7 @@ test('nextDeadline is undefined with nothing due, and on a closed host', async (
 });
 
 test('idle() on a closed host returns a rejected promise', async () => {
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   host.close();
   const promise = host.idle(); // no throw at the call
   let error;
@@ -87,13 +87,13 @@ test('idle() waits for the promises handlers return: a log handler\'s, a typed m
   const later = (what) => sleep(20).then(() => seen.push(what));
   const host = hostWith({ waits: chart }, {
     log: () => later('log'),
-    services: { 'urn:test:slow': (h, invocation) => later('service').then(() => { invocation.done(); return {}; }) },
+    services: { 'urn:test:slow': (invocation) => later('service').then(() => { invocation.done(); return {}; }) },
   });
   const session = host.spawn(host.chart('waits'), { name: 'w' });
   host.actorState({ session }, () => later('onResult'));
   await host.idle();
   equal(seen.sort().join(), 'log,onResult,service', 'every promise settled');
-  equal(host.actorByName('w'), undefined, 'the done the service gave ran too');
+  equal(named(host, 'w'), undefined, 'the done the service gave ran too');
   // a promise that rejects is still an unhandled rejection, and idle() resolves
   const reasons = [];
   const listener = (reason) => reasons.push(reason?.message);
@@ -101,7 +101,7 @@ test('idle() waits for the promises handlers return: a log handler\'s, a typed m
   try {
     const other = hostWith({ waits: chart }, {
       log: () => sleep(5).then(() => { throw new Error('late'); }),
-      services: { 'urn:test:slow': (h, invocation) => { invocation.done(); } },
+      services: { 'urn:test:slow': (invocation) => { invocation.done(); } },
     });
     other.spawn(other.chart('waits'));
     await other.idle();
@@ -115,7 +115,7 @@ test('idle() waits for the promises handlers return: a log handler\'s, a typed m
 });
 
 test('close() rejects a waiting idle() and clears its turn', async () => {
-  const host = new Host(CONFIG, ENGINE);
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   const waiting = host.idle();
   host.close();
   let rejected;
@@ -155,12 +155,12 @@ test('SimulatedClock: milliseconds, moved only by increment', () => {
   equal(clock.now, 1000.5, 'unchanged by the refusals');
   throws(() => SimulatedClock(), typeError, 'a call without new');
   throws(() => SimulatedClock.prototype.increment.call({}, 1), typeError, 'increment on another object');
-  throws(() => new Host(CONFIG, { ...ENGINE, clock: {} }), typeError, 'a clock that is not a SimulatedClock');
+  throws(() => new Host([], { ...CONFIG, ...ENGINE, clock: {} }), typeError, 'a clock that is not a SimulatedClock');
 });
 
 test('increment schedules a turn on each host made with the clock', async () => {
   const clock = new SimulatedClock();
-  const hosts = [new Host(CONFIG, { ...ENGINE, clock }), new Host(CONFIG, { ...ENGINE, clock })];
+  const hosts = [new Host([], { ...CONFIG, ...ENGINE, clock }), new Host([], { ...CONFIG, ...ENGINE, clock })];
   clock.increment(250);
   for (const host of hosts) {
     await host.idle();
@@ -178,7 +178,7 @@ test('a clock holds its hosts weakly', async () => {
   let collected = 0;
   const registry = new FinalizationRegistry(() => collected++);
   (() => {
-    for (let i = 0; i < 10; i++) registry.register(new Host(CONFIG, { ...ENGINE, clock }), i);
+    for (let i = 0; i < 10; i++) registry.register(new Host([], { ...CONFIG, ...ENGINE, clock }), i);
   })();
   await collect();
   equal(collected, 10, 'hosts collected while their clock lives');
@@ -200,7 +200,7 @@ test('a send runs its actor with no driver called', async () => {
   host.send(session, 'go');
   // only the event loop turns: no idle(), no call of the host
   for (let i = 0; i < 5; i++) await tick();
-  equal(host.actorByName('e'), undefined, 'the actor ended');
+  equal(named(host, 'e'), undefined, 'the actor ended');
   host.close();
 });
 
@@ -214,20 +214,20 @@ const SENDER = scxml('sender', `
   <final id="done"/>`);
 
 test('TA_RUN_EFFECTS: a sender goes on after the drain acknowledged its send', async () => {
-  const host = hostWith({ sender: SENDER }, { config: { systemID: 't', ioProcessors: [{ type: 'urn:out' }] } });
+  const host = hostWith({ sender: SENDER }, { system: 't' });
   host.spawn(host.chart('sender'), { name: 'sender' });
   await host.idle();
-  equal(host.actorByName('sender'), undefined, 'the sender ended');
+  equal(named(host, 'sender'), undefined, 'the sender ended');
   host.close();
 });
 
 test('TA_RUN_EFFECTS_FULL: an outbox of one is drained and run again', async () => {
   const host = hostWith({ sender: SENDER }, {
-    config: { systemID: 't', ioProcessors: [{ type: 'urn:out' }], system: { outbox: 1 } },
+    config: { system: { outbox: 1 } },
   });
   for (let i = 0; i < 8; i++) host.spawn(host.chart('sender'), { name: `sender${i}` });
   await host.idle();
-  for (let i = 0; i < 8; i++) equal(host.actorByName(`sender${i}`), undefined, `sender${i} ended`);
+  for (let i = 0; i < 8; i++) equal(named(host, `sender${i}`), undefined, `sender${i} ended`);
   host.close();
 });
 
@@ -250,14 +250,14 @@ test('TA_RUN_YIELDED and the turn\'s bound: the event loop runs between turns', 
   await sleep(20);
   equal(timers, 1, 'the timer ran');
   equal(io, 1, 'the immediate ran');
-  equal(host.actorByName('spin'), session, 'the actor still spins');
+  equal(named(host, 'spin'), session.id, 'the actor still spins');
   let settled = false;
   host.idle().then(() => { settled = true; }, () => { settled = true; });
   await sleep(10);
   equal(settled, false, 'never idle while it spins');
   host.terminate(session);
   await host.idle();
-  equal(host.actorByName('spin'), undefined, 'terminated');
+  equal(named(host, 'spin'), undefined, 'terminated');
   if (Date.now() - started > 10000) throw new Error('the turns starved the event loop');
   host.close();
 });
@@ -281,8 +281,8 @@ test('one timer at the deadline: the actor runs when it comes', async () => {
   host.spawn(host.chart('later'), { name: 'second' }); // a second deadline: the timer is replaced
   await host.idle();
   if (before !== undefined) equal(timeouts() - before, 1, 'still one timer');
-  if (!(await within(5000, () => host.actorByName('second') === undefined))) throw new Error('the deadline never ran the actor');
-  equal(host.actorByName('later'), undefined, 'the first deadline ran too');
+  if (!(await within(5000, () => named(host, 'second') === undefined))) throw new Error('the deadline never ran the actor');
+  equal(named(host, 'later'), undefined, 'the first deadline ran too');
   await host.idle();
   equal(host.nextDeadline, undefined, 'nothing due');
   if (before !== undefined) equal(timeouts() - before, 0, 'no timer left');
@@ -310,10 +310,10 @@ test('a host on a simulated clock arms no timer', async () => {
   await sleep(20);
   clock.increment(999);
   await host.idle();
-  equal(typeof host.actorByName('later'), 'bigint', 'not yet due');
+  equal(typeof named(host, 'later'), 'bigint', 'not yet due');
   clock.increment(1);
   await host.idle();
-  equal(host.actorByName('later'), undefined, 'due: the actor ran');
+  equal(named(host, 'later'), undefined, 'due: the actor ran');
   host.close();
 });
 
@@ -325,9 +325,9 @@ const LOGGER = scxml('logger', `
 test('close() from a handler is deferred to the end of the turn', async () => {
   const seen = [];
   const host = hostWith({ logger: LOGGER }, {
-    log: (h, entry) => {
-      if (entry.label === 'a') h.close();
-      seen.push([entry.text, h.closed, typeof h.actorByName('nobody')]);
+    log: (entry) => {
+      if (entry.label === 'a') entry.host.close();
+      seen.push([entry.text, entry.host.closed, typeof named(entry.host, 'nobody')]);
     },
   });
   host.spawn(host.chart('logger'));
@@ -337,15 +337,14 @@ test('close() from a handler is deferred to the end of the turn', async () => {
 });
 
 test('a handler\'s error, with no idle() waiting, is thrown from the turn\'s callback; the host goes on', () => {
-  const index = new URL('../index.mjs', import.meta.url).href;
-  const code = `import(${JSON.stringify(index)}).then(async (m) => {
+  const code = `import('@tinyactors/node').then(async (m) => {
     process.on('uncaughtException', (error) => console.log('uncaught', error.message));
     const charts = [
       { name: 'logger.scxml', text: ${JSON.stringify(LOGGER)} },
       { name: 'ender.scxml', text: ${JSON.stringify(ENDER)} },
     ];
     const compiled = m.compileCharts(charts);
-    const host = new m.Host({ systemID: 't' }, { datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native', log: (h, entry) => { throw new Error('from ' + entry.label); } });
+    const host = new m.Host([], { system: 't', datamodel: process.env.TA_NAPI_DATAMODEL ?? 'native', log: (entry) => { throw new Error('from ' + entry.label); } });
     host.addImage(compiled.image);
     compiled.close();
     host.spawn(host.chart('logger'));
@@ -353,10 +352,10 @@ test('a handler\'s error, with no idle() waiting, is thrown from the turn\'s cal
     const ender = host.spawn(host.chart('ender'), { name: 'e' });
     host.send(ender, 'go');
     await host.idle();
-    console.log('ended', host.actorByName('e') === undefined);
+    console.log('ended', (() => { try { host.actor('e'); return false; } catch { return true; } })());
     host.close();
   });`;
-  const result = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 20000 });
+  const result = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 20000, cwd: new URL('..', import.meta.url) });
   const output = `${result.stdout}${result.stderr}`;
   equal(result.status, 0, `exit status (${output})`);
   equal((output.match(/uncaught /g) ?? []).length, 1, `one uncaught error, the first (${output})`);

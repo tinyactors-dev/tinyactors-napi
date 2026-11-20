@@ -48,14 +48,54 @@ enum { TA_NAPI_BY_IMMEDIATE = 0, TA_NAPI_BY_TIMER = 1 };
 
 /* The error is kept in a one-element array: a handler may throw any value
  * (a string, undefined), and Node-API 8 references objects only. */
-void ta_napi_keep_error(napi_env env, ta_napi_host *host) {
-    bool pending = false;
-    napi_value error, box;
-    if (napi_is_exception_pending(env, &pending) != napi_ok || !pending ||
-        napi_get_and_clear_last_exception(env, &error) != napi_ok || host->error != NULL)
-        return;
+static void ta_napi_keep(napi_env env, ta_napi_host *host, napi_value error) {
+    napi_value box;
+    if (host->error != NULL) return;
     if (napi_create_array_with_length(env, 1, &box) == napi_ok && napi_set_element(env, box, 0, error) == napi_ok)
         napi_create_reference(env, box, 1, &host->error);
+}
+
+/* The host's handlerError hook (the application's onHandlerError), or
+ * NULL: on the handlers object the wrapper holds. */
+static napi_value ta_napi_error_hook(napi_env env, const ta_napi_host *host) {
+    ta_napi_instance *instance = ta_napi_instance_of(env);
+    napi_value wrapper = ta_napi_self(env, host), keys, key, handlers, hook;
+    napi_valuetype type = napi_undefined;
+    if (instance == NULL || wrapper == NULL || napi_get_reference_value(env, instance->keys, &keys) != napi_ok ||
+        napi_get_named_property(env, keys, "handlers", &key) != napi_ok || napi_get_property(env, wrapper, key, &handlers) != napi_ok ||
+        napi_typeof(env, handlers, &type) != napi_ok || type != napi_object ||
+        napi_get_named_property(env, handlers, "handlerError", &hook) != napi_ok || napi_typeof(env, hook, &type) != napi_ok ||
+        type != napi_function)
+        return NULL;
+    return hook;
+}
+
+bool ta_napi_handler_rejected(napi_env env, const ta_napi_handler_error *failure, napi_value error) {
+    napi_value hook = ta_napi_error_hook(env, failure->host), ignored, argv[2];
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) napi_get_and_clear_last_exception(env, &ignored);
+    if (hook == NULL) return false;
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    argv[0] = error;
+    argv[1] = failure->effect != NULL ? failure->effect : undefined;
+    if (napi_call_function(env, undefined, hook, 2, argv, &ignored) != napi_ok &&
+        napi_get_and_clear_last_exception(env, &ignored) == napi_ok)
+        ta_napi_keep(env, failure->host, ignored); /* the hook's own error: the turn's */
+    return true;
+}
+
+void ta_napi_handler_failed(napi_env env, const ta_napi_handler_error *failure) {
+    bool pending = false;
+    napi_value error;
+    if (napi_is_exception_pending(env, &pending) != napi_ok || !pending ||
+        napi_get_and_clear_last_exception(env, &error) != napi_ok)
+        return;
+    if (!ta_napi_handler_rejected(env, failure, error)) ta_napi_keep(env, failure->host, error);
+}
+
+void ta_napi_keep_error(napi_env env, ta_napi_host *host) {
+    ta_napi_handler_failed(env, &(ta_napi_handler_error){host, NULL});
 }
 
 /* The kept error, its reference deleted; NULL when none. */
@@ -363,6 +403,8 @@ static napi_value ta_napi_settled(napi_env env, napi_callback_info info) {
         if (host->error != NULL && host->depth == 0 && !host->turning) ta_napi_throw_kept(env, host);
     }
     if (rejected != NULL) {
+        /* with a handlerError hook the rejection is the hook's; else thrown on */
+        if (host != NULL && ta_napi_handler_rejected(env, &(ta_napi_handler_error){host, NULL}, argv[1])) return undefined;
         napi_value ignored;
         napi_get_and_clear_last_exception(env, &ignored);
         napi_throw(env, argv[1]);
@@ -407,6 +449,25 @@ static void ta_napi_settle(napi_env env, ta_napi_host *host, napi_value error) {
     else if (napi_get_undefined(env, &undefined) == napi_ok) napi_resolve_deferred(env, deferred, undefined);
 }
 
+/* A turn went idle: the idle hook (the application layer's bound of
+ * resident actors) gets it, outside any batch, inside the turn's call; a
+ * promise it returns is followed, so idle() waits for it. */
+static void ta_napi_idle_hook(napi_env env, ta_napi_host *host) {
+    ta_napi_instance *instance = ta_napi_instance_of(env);
+    napi_value wrapper = ta_napi_self(env, host), keys, key, handlers, hook, undefined, result;
+    napi_valuetype type = napi_undefined;
+    if (instance == NULL || wrapper == NULL || napi_get_undefined(env, &undefined) != napi_ok ||
+        napi_get_reference_value(env, instance->keys, &keys) != napi_ok || napi_get_named_property(env, keys, "handlers", &key) != napi_ok ||
+        napi_get_property(env, wrapper, key, &handlers) != napi_ok || napi_typeof(env, handlers, &type) != napi_ok ||
+        type != napi_object || napi_get_named_property(env, handlers, "idle", &hook) != napi_ok ||
+        napi_typeof(env, hook, &type) != napi_ok || type != napi_function) {
+        ta_napi_keep_error(env, host); /* none pending: nothing */
+        return;
+    }
+    if (napi_call_function(env, undefined, hook, 0, NULL, &result) != napi_ok) ta_napi_keep_error(env, host);
+    else ta_napi_follow(env, host, result);
+}
+
 /* One turn, called by the event loop with the Host and which handle it
  * was. The turn's first error rejects a waiting idle(); with none waiting
  * it is thrown from here, after the next turn is scheduled or the timer
@@ -432,6 +493,7 @@ static napi_value ta_napi_loop_turn(napi_env env, napi_callback_info info) {
     host->turning = true;
     ta_napi_next next = ta_napi_turn(env, host);
     host->turning = false;
+    if (next == TA_NAPI_NEXT_IDLE && !host->closing && host->host != NULL) ta_napi_idle_hook(env, host);
     napi_value error = ta_napi_turn_error(env, host, next);
     bool settle = false;
     if (next == TA_NAPI_NEXT_YIELD && !host->closing) {
@@ -443,7 +505,8 @@ static napi_value ta_napi_loop_turn(napi_env env, napi_callback_info info) {
             ta_napi_arming arming = {delay < TA_NAPI_TIMEOUT_MAX ? delay : TA_NAPI_TIMEOUT_MAX, &host->timer};
             if (!ta_napi_arm(env, host, &arming)) ta_napi_keep_error(env, host);
         }
-        settle = next != TA_NAPI_NEXT_IDLE || host->promises == 0; /* idle, and no handler's promise pending */
+        /* idle, no handler's promise pending, and no input the idle hook made */
+        settle = next != TA_NAPI_NEXT_IDLE || (host->promises == 0 && host->immediate == NULL);
     }
     if (error == NULL) error = ta_napi_take_kept(env, host); /* scheduling or arming failed */
     /* a close a handler asked for runs at the leave: the waiters are kept

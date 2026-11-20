@@ -1,104 +1,64 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- One chat room: who is in it, and what was said.
+<!-- A room: its members and what was said.
 
-     The room is the authority on its membership: a user joins and leaves
-     by asking the room, and only a member may post. Each message gets the
-     room's next sequence number, goes into the history (the last
-     historyLimit entries) and is sent to every member's actor, which
-     pushes it to the user's connection or keeps it for later.
+     When it starts it saves itself (chat:db, room.save) and announces
+     itself to its workspace (room.started), whoever spawned it: the
+     workspace's Spawner, or the application rebuilding the rooms from the
+     database after a restart.
 
-     Every variable is a plain value (strings, numbers, arrays, objects),
-     and the chart has no script, so a room hibernates whenever it is at
-     rest: its members and history go into its blob, and come back with
-     it. -->
+     Its members are connections, keyed by the fragment of their address
+     (sender(_event.origin), room.js: one key whichever form the origin
+     of their join has). A post from a member goes into the history, into the
+     database (chat:db, message.insert) and to every member's socket in
+     one send to the gateway (chat:gateway, broadcast); the gateway answers
+     members.gone with the members whose socket has gone away.
+
+     A room never ends, and hibernates when idle: a send to its name
+     (tinyactors://chat/@room.<workspace>.<name>) wakes it. -->
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
        datamodel="ecmascript" name="room" initial="open">
+  <script src="room.js"/>
   <datamodel>
-    <!-- given at spawn -->
-    <data id="room" expr="null"/>
-    <data id="capacity" expr="100"/>
-    <data id="historyLimit" expr="50"/>
-    <data id="maxLength" expr="500"/>
-    <!-- the room's own -->
-    <data id="members" expr="[]"/>
-    <data id="history" expr="[]"/>
-    <data id="seq" expr="0"/>
+    <data id="workspace"/>                <!-- given at spawn -->
+    <data id="name"/>                     <!-- given at spawn -->
+    <data id="history" expr="[]"/>        <!-- the last messages; given at a restart -->
+    <data id="members" expr="({})"/>      <!-- #_scxml_<connection> -> user -->
   </datamodel>
-
   <state id="open">
-    <!-- joining: idempotent, so a retried join is answered again -->
-    <transition event="join" cond="members.includes(_event.data.user)">
-      <send event="joined" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
-        <param name="members" expr="members"/>
-        <param name="history" expr="history.slice(-20)"/>
+    <onentry>
+      <send type="chat:db" event="room.save">
+        <content expr="{ workspace: workspace, name: name }"/>
       </send>
-    </transition>
-    <transition event="join" cond="members.length &gt;= capacity">
-      <send event="refused.join" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
-        <param name="reason" expr="'the room is full'"/>
+      <send targetexpr="workspaceAddress(workspace)" event="room.started">
+        <content expr="{ name: name }"/>
       </send>
-    </transition>
-    <transition event="join">
-      <assign location="members" expr="members.concat([_event.data.user])"/>
-      <assign location="seq" expr="seq + 1"/>
-      <assign location="history" expr="history.concat([{ seq: seq, kind: 'joined', user: _event.data.user }]).slice(-historyLimit)"/>
-      <send event="joined" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
-        <param name="members" expr="members"/>
-        <param name="history" expr="history.slice(-20)"/>
-      </send>
-    </transition>
+    </onentry>
 
-    <transition event="leave" cond="members.includes(_event.data.user)">
-      <assign location="members" expr="members.filter((m) => m !== _event.data.user)"/>
-      <assign location="seq" expr="seq + 1"/>
-      <assign location="history" expr="history.concat([{ seq: seq, kind: 'left', user: _event.data.user }]).slice(-historyLimit)"/>
-      <send event="left" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
+    <transition event="join">
+      <assign location="members" expr="withEntry(members, sender(_event.origin), _event.data.user)"/>
+      <send targetexpr="_event.origin" event="room.joined">
+        <content expr="{ room: name, history: recent(history) }"/>
       </send>
     </transition>
     <transition event="leave">
-      <send event="left" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
+      <assign location="members" expr="withoutEntry(members, sender(_event.origin))"/>
+    </transition>
+    <transition event="post" cond="sender(_event.origin) in members">
+      <assign location="history" expr="remember(history, message(name, members, _event))"/>
+      <send type="chat:db" event="message.insert">
+        <content expr="stored(workspace, name, members, _event)"/>
+      </send>
+      <send type="chat:gateway" event="broadcast">
+        <content expr="{ to: Object.keys(members), event: 'room.message', data: message(name, members, _event) }"/>
       </send>
     </transition>
-
-    <!-- posting: members only, within the length limit -->
-    <transition event="post" cond="!members.includes(_event.data.user)">
-      <send event="refused.post" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
-        <param name="reason" expr="'not a member of ' + room"/>
-      </send>
+    <transition event="members.gone">      <!-- the gateway found no socket for them -->
+      <assign location="members" expr="withoutAll(members, _event.data.members)"/>
     </transition>
-    <transition event="post" cond="typeof _event.data.text !== 'string' || _event.data.text.length === 0 || _event.data.text.length &gt; maxLength">
-      <send event="refused.post" targetexpr="_event.origin">
-        <param name="room" expr="room"/>
-        <param name="reason" expr="'a message is 1 to ' + maxLength + ' characters'"/>
-      </send>
-    </transition>
-    <transition event="post">
-      <assign location="seq" expr="seq + 1"/>
-      <assign location="history" expr="history.concat([{ seq: seq, kind: 'message', user: _event.data.user, text: _event.data.text }]).slice(-historyLimit)"/>
-      <foreach array="members" item="member">
-        <send event="message" targetexpr="'tinyactors://chat/@user-' + member">
-          <param name="room" expr="room"/>
-          <param name="seq" expr="seq"/>
-          <param name="user" expr="_event.data.user"/>
-          <param name="text" expr="_event.data.text"/>
-        </send>
-      </foreach>
-    </transition>
-
-    <!-- the application reads the room -->
-    <transition event="history">
-      <send type="urn:chat:reply" event="history" target="app">
-        <param name="request" expr="_event.data.request"/>
-        <param name="room" expr="room"/>
-        <param name="seq" expr="seq"/>
-        <param name="members" expr="members"/>
-        <param name="history" expr="history"/>
+    <transition event="kick">              <!-- an admin's ask: the reply goes to _event.origin -->
+      <assign location="members" expr="withoutUser(members, _event.data.user)"/>
+      <send targetexpr="_event.origin" event="kicked">
+        <content expr="{ members: users(members) }"/>
       </send>
     </transition>
   </state>

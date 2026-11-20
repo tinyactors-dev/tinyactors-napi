@@ -1,10 +1,16 @@
 # Inspecting a host
 
+This guide is part of operating a host (the README's [Operating a
+host](../../README.md#operating-a-host)): `actor.state()`, `actor.context()`
+and `actor.get()` are the application's, the methods on `host` an
+operator's.
+
 A running host answers questions about itself: which state an actor is
 in, what its variables hold, which actors exist, what the host has done
 so far. These are the **typed methods**, one per question. Each reads
 the host as it is when you call it and answers in a later turn, so each
-returns a promise: `await host.actorState({ session })`.
+returns a promise: `await host.actorState({ session })`, or for one
+actor `await actor.state()`, `actor.context()` and `actor.get()`.
 
 ```js
 import { compileCharts, Host } from '@tinyactors/node';
@@ -21,19 +27,18 @@ const compiled = compileCharts([{ name: 'order.scxml', text: `
     </state>
   </state>
 </scxml>` }]);
-const host = new Host({ systemID: 'shop' });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'shop' });
 compiled.close();
 
-const order = host.spawn(host.chart('order'), { name: 'first' });
-host.send(order, 'add', 'tea');
+const order = host.spawn('order', { name: 'first' });
+order.send('add', 'tea');
 await host.idle(); // the actor has started and handled 'add'
 
 const { value } = await host.actorState({ session: order });
 console.log('state:', JSON.stringify(value));
-const { variables } = await host.actorContext({ session: order });
+const { variables } = await order.context();
 console.log('variables:', JSON.stringify(variables));
-const actor = await host.actorGet({ session: order });
+const actor = await order.get();
 console.log('actor:', actor.chart, 'mailbox', actor.mailbox);
 host.close();
 ```
@@ -68,15 +73,18 @@ key per region.
 | `traceConfigure`, `traceWatch`, `traceUnwatch`, `traceEnd`, `traceSpansDecode` | | [Telemetry](telemetry.md) |
 
 A method without params is called with none: `await
-host.hostStats()`. The host checks the params: one the method does
-not take, of the wrong type or out of range is an error, as is a session
-that names no actor (it ended, or never was). **Sessions in a result are
-numbers**, while `spawn`, `actorByName` and the views give `bigint`s, so
-`result.sessions.includes(session)` is false for a `bigint` session and
-a `Map` keyed by one misses the other: compare with `Number(session) ===
-listed`, or key by `String(session)`
+host.hostStats()`. A `session` param takes an `Actor` too. The host
+checks the params: one the method does not take, of the wrong type or
+out of range is an error, as is a session that names no actor (it ended,
+or never was). **Sessions in a result are numbers**, while `actor.id`
+and the views give `bigint`s, so `result.sessions.includes(actor.id)` is
+false and a `Map` keyed by one misses the other: compare with
+`Number(actor.id) === listed`, or key by `String(actor.id)`
 ([README](../../README.md#actors-sessions-and-addresses)). The inputs take
-either back as it is (`host.send(result.sessions[0], ...)`).
+either back as it is (`host.send(result.sessions[0], ...)`), and
+`host.actor(result.sessions[0])` gives its `Actor`; `await
+host.actors({ chart })` lists the live actors as `Actor`s, every page
+read.
 
 Each method's params and result are typed in the package's `index.d.ts`
 (`SessionParams`, `ActorStateResult`, `ActorListResult`,
@@ -121,13 +129,12 @@ const compiled = compileCharts([{ name: 'review.scxml', text: `
   <state id="held"><transition event="release" target="back"/></state>
 </scxml>` }]);
 const clock = new SimulatedClock();
-const host = new Host({ systemID: 'docs' }, { clock });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'docs', clock });
 compiled.close();
 
-const doc = host.spawn(host.chart('review'));
-host.send(doc, 'submit');
-host.send(doc, 'hold');
+const doc = host.spawn('review');
+doc.send('submit');
+doc.send('hold');
 await host.idle();
 clock.increment(60_000); // a minute later
 
@@ -159,10 +166,9 @@ import { compileCharts, Host } from '@tinyactors/node';
 const compiled = compileCharts([{ name: 'idle.scxml', text: `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
        datamodel="ecmascript" name="idle"><state id="waiting"/></scxml>` }]);
-const host = new Host({ systemID: 'shop' });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'shop' });
 compiled.close();
-for (let i = 0; i < 5; i++) host.spawn(host.chart('idle'));
+for (let i = 0; i < 5; i++) host.spawn('idle');
 
 const sessions = [];
 let cursor = 0;
@@ -189,7 +195,7 @@ A call the host refuses at once (a closed host) rejects too.
 ```js
 import { Host } from '@tinyactors/node';
 
-const host = new Host({ systemID: 'shop' });
+const host = new Host([], { system: 'shop' });
 try {
   await host.actorState({ session: 99 });
 } catch (error) {
@@ -214,8 +220,8 @@ their promises never settle.
 
 Each method also takes handlers instead of returning a promise:
 `host.actorState(params, onResult, onError)`, and so on. Given handlers
-it returns nothing; `onResult(host, result)` is called in a
-later turn, or `onError(host, error)` with the same `TinyactorsError`.
+it returns nothing; `onResult(result)` is called in a
+later turn, or `onError(error)` with the same `TinyactorsError`.
 The promise is made only when no handler is given, so a caller that
 passes handlers pays for no promise. A method without params takes `undefined`:
 `host.hostStats(undefined, onResult)`.
@@ -226,15 +232,14 @@ import { compileCharts, Host } from '@tinyactors/node';
 const compiled = compileCharts([{ name: 'idle.scxml', text: `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
        datamodel="ecmascript" name="idle"><state id="waiting"/></scxml>` }]);
-const host = new Host({ systemID: 'shop' });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'shop' });
 compiled.close();
-const session = host.spawn(host.chart('idle'));
+const session = host.spawn('idle');
 await host.idle();
 
-host.actorState({ session }, (host, result) => console.log('state:', JSON.stringify(result.value)));
-host.hostStats(undefined, (host, stats) => console.log('actors:', stats.host.actors));
-host.actorGet({ session: 99 }, () => {}, (host, error) => console.log('error:', error.reason));
+host.actorState({ session }, (result) => console.log('state:', JSON.stringify(result.value)));
+host.hostStats(undefined, (stats) => console.log('actors:', stats.host.actors));
+host.actorGet({ session: 99 }, () => {}, (error) => console.log('error:', error.reason));
 console.log('asked');
 await host.idle();
 host.close();
@@ -301,13 +306,12 @@ const compiled = compileCharts([{ name: 'job.scxml', text: `
   </state>
   <final id="done"/>
 </scxml>` }]);
-const host = new Host({ systemID: 'shop' });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'shop' });
 compiled.close();
 
-const jobs = [1, 2, 3].map(() => host.spawn(host.chart('job')));
-host.send(jobs[0], 'finish');
-host.send(jobs[1], 'break');
+const jobs = [1, 2, 3].map(() => host.spawn('job'));
+jobs[0].send('finish');
+jobs[1].send('break');
 await host.idle();
 const stats = await host.hostStats();
 const [job] = stats.charts;
@@ -334,22 +338,23 @@ Between two readings while you gave no input, a loop's charts gain
 queue instead.
 
 ```js
-import { Host } from '@tinyactors/node';
+import { compileCharts, Host } from '@tinyactors/node';
 
-const host = new Host({ systemID: 'chat' });
-host.addCharts({
-  'user.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="user">
+const compiled = compileCharts([
+  { name: 'user.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="user">
     <state id="s">
       <onentry><send event="join" target="tinyactors://chat/@room"/></onentry>
       <transition event="join"><send event="join" target="tinyactors://chat/@room"/></transition>
     </state>
-  </scxml>`,
-  'room.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="room">
+  </scxml>` },
+  { name: 'room.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="room">
     <state id="s"><transition event="join"><send event="join.refused" targetexpr="_event.origin"/></transition></state>
-  </scxml>`,
-});
-host.spawnChart('room', { name: 'room' });
-const user = host.spawnChart('user');
+  </scxml>` },
+]);
+const host = new Host(compiled, { system: 'chat' });
+compiled.close();
+host.spawn('room', { name: 'room' });
+const user = host.spawn('user');
 
 /** The charts whose actors kept working for `ms` with no input given. */
 async function busy(host, ms) {
@@ -364,7 +369,7 @@ async function busy(host, ms) {
 }
 
 console.log('busy:', (await busy(host, 200)).join(', '));
-host.terminate(user); // in production: alert, and fix the chart
+user.terminate(); // in production: alert, and fix the chart
 await host.idle();
 console.log('idle again; busy:', (await busy(host, 50)).length);
 host.close();

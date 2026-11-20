@@ -16,7 +16,7 @@
  * The drain that dispatches the REPLY, a later one, reads its id in C,
  * finds the row (a stale or unknown id is dropped: the generation refuses
  * it), removes it, decodes the reply once and calls onResult(host,
- * result), or onError(host, error) with a TinyactorsError {code, reason,
+ * result), or onError(error) with a TinyactorsError {code, reason,
  * path, message}; without onError the error is kept for the turn. At
  * close the handlers object goes and the table is freed with the host:
  * pending handlers are dropped, never called. */
@@ -144,7 +144,7 @@ static napi_value ta_napi_typed(napi_env env, napi_callback_info info) {
     if (ta_napi_methods_is(env, handlers[1], napi_null)) handlers[1] = undefined;
     if (!ta_napi_methods_is(env, handlers[0], napi_function) ||
         !(ta_napi_methods_is(env, handlers[1], napi_function) || ta_napi_methods_is(env, handlers[1], napi_undefined))) {
-        napi_throw_type_error(env, NULL, "a typed method takes (params, onResult(host, result), onError?(host, error))");
+        napi_throw_type_error(env, NULL, "a typed method takes (params, onResult(result), onError?(error))");
         ta_napi_leave(&call);
         return NULL;
     }
@@ -246,7 +246,7 @@ napi_value ta_napi_reply(napi_env env, ta_napi_host *host, uint32_t index) {
         return reply;
     }
     ta_napi_pending_row *row = (ta_napi_pending_row *)ta_table_get(&host->pending, id);
-    if (row == NULL) return NULL; /* stale or unknown: dropped */
+    if (row == NULL || row->method >= TA_NAPI_METHODS) return NULL; /* stale, unknown or an ask's: dropped */
     ta_napi_pending_at at = {ta_napi_pending_list(env, ta_napi_self(env, host)), row->slot};
     bool timers = row->method < TA_NAPI_METHODS && ta_napi_methods[row->method].timers;
     ta_table_remove(&host->pending, id);
@@ -273,8 +273,7 @@ napi_value ta_napi_reply(napi_env env, ta_napi_host *host, uint32_t index) {
             ta_napi_keep_error(env, host);
             return NULL;
         }
-        napi_value argv[2] = {wrapper, error};
-        if (napi_call_function(env, undefined, handlers[1], 2, argv, &called) != napi_ok) ta_napi_keep_error(env, host);
+        if (napi_call_function(env, undefined, handlers[1], 1, &error, &called) != napi_ok) ta_napi_keep_error(env, host);
         else ta_napi_follow(env, host, called); /* idle() waits for a promise it returns */
         return NULL;
     }
@@ -283,11 +282,69 @@ napi_value ta_napi_reply(napi_env env, ta_napi_host *host, uint32_t index) {
         ta_napi_keep_error(env, host);
         return NULL;
     }
-    napi_value argv[2] = {wrapper, value};
     if (!ta_napi_methods_is(env, handlers[0], napi_function)) return NULL;
-    if (napi_call_function(env, undefined, handlers[0], 2, argv, &called) != napi_ok) ta_napi_keep_error(env, host);
+    if (napi_call_function(env, undefined, handlers[0], 1, &value, &called) != napi_ok) ta_napi_keep_error(env, host);
     else ta_napi_follow(env, host, called); /* idle() waits for a promise it returns */
     return NULL;
+}
+
+/* ---- asks: a request and its reply over a send ------------------------------------- */
+
+/* A row of the pending table that is an ask's (the application layer's
+ * Actor.ask): its handle is the name of the reply address
+ * tinyactors://tinyactors-ask/@<handle>, its handler the ask's settle
+ * function, at handlers.pending[2 * slot]. */
+#define TA_NAPI_METHOD_ASK UINT32_MAX
+
+/* askOpen(settle) -> handle: a row for an ask, the handle a bigint. */
+static napi_value ta_napi_ask_open(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {NULL}, self = NULL, undefined, result = NULL;
+    if (napi_get_cb_info(env, info, &argc, argv, &self, NULL) != napi_ok || napi_get_undefined(env, &undefined) != napi_ok)
+        return NULL;
+    ta_napi_call call;
+    if (!ta_napi_enter(env, self, &call)) return NULL;
+    napi_value list = ta_napi_pending_list(env, self), handlers[2] = {argc >= 1 ? argv[0] : undefined, undefined};
+    uint64_t id = 0;
+    ta_napi_pending_row *row = NULL;
+    if (!ta_napi_methods_is(env, handlers[0], napi_function)) napi_throw_type_error(env, NULL, "askOpen takes the ask's settle function");
+    else if (list != NULL && (row = (ta_napi_pending_row *)ta_table_add(&call.host->pending, &id)) == NULL)
+        ta_napi_throw(env, &(ta_napi_refusal){TA_ERROR_NO_MEMORY, "no memory for an ask"});
+    if (row != NULL) {
+        ta_napi_pending_at at = {list, (uint32_t)(id & 0xFFFFFFFFu) - 1u};
+        row->slot = at.slot;
+        row->method = TA_NAPI_METHOD_ASK;
+        if (!ta_napi_pending_set(env, &at, handlers) || napi_create_bigint_uint64(env, id, &result) != napi_ok) {
+            ta_table_remove(&call.host->pending, id);
+            result = NULL;
+        }
+    }
+    ta_napi_leave(&call);
+    return result;
+}
+
+/* askClose(handle) -> settle | undefined: the ask's row removed and its
+ * settle function given back; undefined for a handle that names no ask
+ * (stale, unknown, a typed method's, or a closed host's). */
+static napi_value ta_napi_ask_close(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {NULL}, self = NULL, undefined, result = NULL;
+    if (napi_get_cb_info(env, info, &argc, argv, &self, NULL) != napi_ok || napi_get_undefined(env, &undefined) != napi_ok)
+        return NULL;
+    ta_napi_host *host = ta_napi_host_of(env, &(ta_napi_host_check){self, false});
+    uint64_t id = 0;
+    bool lossless = false;
+    if (host == NULL) return NULL;
+    if (host->host == NULL || argc < 1 || !ta_napi_methods_is(env, argv[0], napi_bigint) ||
+        napi_get_value_bigint_uint64(env, argv[0], &id, &lossless) != napi_ok || !lossless)
+        return undefined;
+    ta_napi_pending_row *row = (ta_napi_pending_row *)ta_table_get(&host->pending, id);
+    if (row == NULL || row->method != TA_NAPI_METHOD_ASK) return undefined;
+    ta_napi_pending_at at = {ta_napi_pending_list(env, self), row->slot};
+    ta_table_remove(&host->pending, id);
+    if (at.list == NULL || napi_get_element(env, at.list, 2 * at.slot, &result) != napi_ok) return NULL;
+    ta_napi_pending_clear(env, &at);
+    return result;
 }
 
 napi_status ta_napi_methods_define(napi_env env, napi_value host_class) {
@@ -298,6 +355,11 @@ napi_status ta_napi_methods_define(napi_env env, napi_value host_class) {
     napi_value prototype;
     napi_status status = napi_get_named_property(env, host_class, "prototype", &prototype);
     if (status == napi_ok) status = napi_define_properties(env, prototype, TA_NAPI_METHODS, properties);
+    napi_property_descriptor asks[] = {
+        {"askOpen", NULL, ta_napi_ask_open, NULL, NULL, NULL, napi_default_method, NULL},
+        {"askClose", NULL, ta_napi_ask_close, NULL, NULL, NULL, napi_default_method, NULL},
+    };
+    if (status == napi_ok) status = napi_define_properties(env, prototype, 2, asks);
     /* each takes (params, onResult, onError) */
     ta_napi_arity arities[TA_NAPI_METHODS + 1];
     for (size_t i = 0; i < TA_NAPI_METHODS; i++) arities[i] = (ta_napi_arity){ta_napi_methods[i].js, 3};

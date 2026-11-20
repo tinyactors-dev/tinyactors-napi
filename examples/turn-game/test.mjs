@@ -158,10 +158,10 @@ for (const datamodel of ['native', 'quickjs']) {
     try {
       await startMatch(world);
       const names = ['lobby', 'player-ada', 'player-bob', 'match-1'];
-      const sessions = names.map((name) => world.server.host.actorByName(name));
+      const sessions = names.map((name) => world.server.host.actor(name).id);
       await world.server.checkpoint();
       const server = await world.restart();
-      assert.deepEqual(names.map((name) => server.host.actorByName(name)), sessions, 'the same sessions');
+      assert.deepEqual(names.map((name) => server.host.actor(name).id), sessions, 'the same sessions');
       assert.equal(server.move('match-1', 'ada', 1, 4), true, 'a move by address');
       await server.host.idle();
       assert.equal(frames(world.feed).at(-1).turn, 2);
@@ -227,7 +227,7 @@ for (const datamodel of ['native', 'quickjs']) {
     try {
       await startMatch(world);
       const before = server.stats.checkpoints;
-      const pending = server.host.actorState({ session: server.host.actorByName('match-1') });
+      const pending = server.host.actor('match-1').state();
       assert.ok(await server.checkpoint() > 0);
       assert.equal(server.stats.refusals, 1);
       assert.equal(server.stats.checkpoints, before + 1);

@@ -6,7 +6,7 @@
 // every decision of the dispatcher (urn:elevator:report) goes through a
 // Monitor, which checks the safety and service rules as they happen.
 import { readFileSync } from 'node:fs';
-import { Host } from '@tinyactors/node';
+import { compileCharts, Host } from '@tinyactors/node';
 
 const chart = (name) => readFileSync(new URL(`./charts/${name}`, import.meta.url), 'utf8');
 export const CHARTS = { 'car.scxml': chart('car.scxml'), 'door.scxml': chart('door.scxml'), 'dispatcher.scxml': chart('dispatcher.scxml') };
@@ -167,31 +167,30 @@ export class Building {
     this.monitor = new Monitor(this.clock, this.names);
     this.logs = [];
     this.trace = trace;
-    this.host = new Host(
-      { systemID: SYSTEM, ioProcessors: [{ type: 'urn:elevator:hw' }, { type: 'urn:elevator:report' }] },
-      {
+    const compiled = compileCharts(Object.entries(charts).map(([name, text]) => ({ name, text })));
+    this.host = new Host(compiled, {
+        system: SYSTEM,
         clock,
         datamodel,
         ioProcessors: {
-          'urn:elevator:hw': (host, send) => {
+          'urn:elevator:hw': { receive: (send) => {
             const { event, data } = send;
             this.trace?.(`${this.clock.now} ${data.car} ${event} ${data.state ?? data.mode ?? data.floor ?? data.on}`);
             this.monitor.hardware(event, data);
-          },
-          'urn:elevator:report': (host, send) => {
+          } },
+          'urn:elevator:report': { receive: (send) => {
             const { event, data } = send;
             this.trace?.(`${this.clock.now} dispatcher ${event} ${data.floor}${data.car ? ` ${data.car}` : ''}`);
             this.monitor.report(event, data);
-          },
+          } },
         },
-        log: (host, entry) => this.logs.push({ at: this.clock.now, label: entry.label, text: entry.text }),
-      },
-    );
-    this.host.addCharts(charts);
+        log: (entry) => this.logs.push({ at: this.clock.now, label: entry.label, text: entry.text }),
+      });
+    compiled.close();
     const { floors, travelMs, doorMs, dwellMs, capacity } = this.spec;
     // The dispatcher first: each car tells it when it enters service.
-    this.dispatcher = this.host.spawnChart('dispatcher', { name: 'dispatcher', params: { system: SYSTEM, cars: this.names } });
-    this.sessions = new Map(this.names.map((car) => [car, this.host.spawnChart('car', {
+    this.dispatcher = this.host.spawn('dispatcher', { name: 'dispatcher', params: { system: SYSTEM, cars: this.names } });
+    this.sessions = new Map(this.names.map((car) => [car, this.host.spawn('car', {
       name: car,
       params: { car, floors, travelMs, doorMs, dwellMs, capacity, dispatcher: `tinyactors://${SYSTEM}/@dispatcher` },
     })]));

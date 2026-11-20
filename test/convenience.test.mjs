@@ -2,7 +2,7 @@
 // 2026-11-18): each typed method returns a promise when given no handler,
 // `host.<method>(params)`, resolving from onResult, rejecting from onError
 // with the same TinyactorsError; given handlers it is the direct call.
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { Host, TinyactorsError, version } from '@tinyactors/node';
 import { equal, hostWith, status, until, WAITER } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
@@ -64,7 +64,7 @@ test('each promise resolves with the result its direct method gives', async () =
   equal(typeof watch.id, 'number', 'trace.watch: a watch id');
   equal(JSON.stringify(await host.traceUnwatch({ id: watch.id })), '{}', 'trace.unwatch of the watch');
   equal(spans.spans.length, 0, 'trace.spans.decode of nothing');
-  equal(JSON.stringify(state), await new Promise((resolve) => host.actorState({ session }, (h, r) => resolve(JSON.stringify(r)))),
+  equal(JSON.stringify(state), await new Promise((resolve) => host.actorState({ session }, (r) => resolve(JSON.stringify(r)))),
     'the same result as the direct method\'s');
   host.close();
 });
@@ -77,7 +77,7 @@ test('a promise rejects with the TinyactorsError onError gets: code, reason, pat
   equal(error.reason, 'stale', 'reason');
   equal(error.path, 'params.session', 'path');
   equal(error.status, undefined, 'no status: it is no call\'s');
-  const direct = await new Promise((resolve) => host.actorGet({ session: 99n }, () => {}, (h, e) => resolve(e)));
+  const direct = await new Promise((resolve) => host.actorGet({ session: 99n }, () => {}, (e) => resolve(e)));
   equal(`${direct.code} ${direct.reason} ${direct.path} ${direct.message}`, `${error.code} ${error.reason} ${error.path} ${error.message}`,
     'the direct method\'s error');
   const unwatch = await rejection(host.traceUnwatch({ id: 99 }), 'traceUnwatch of no watch');
@@ -148,8 +148,8 @@ test('a continuation runs after the turn, and may call the host again', async ()
 test('with handlers the call is the direct one: it returns nothing and answers the handler', async () => {
   const { host } = await waiting();
   let got;
-  equal(host.hostStats(undefined, (h, result) => (got = result)), undefined, 'returns nothing');
-  equal(host.hostStats(undefined, (h, result) => {}, null), undefined, 'a null onError is none');
+  equal(host.hostStats(undefined, (result) => (got = result)), undefined, 'returns nothing');
+  equal(host.hostStats(undefined, (result) => {}, null), undefined, 'a null onError is none');
   await host.idle();
   equal(got.host.actors, 1, 'answered to the handler');
   let threw;
@@ -170,6 +170,14 @@ test('a method pending at close never settles', async () => {
   host.close();
   await until(() => false, 20);
   equal(settled, false, 'its handlers were dropped');
+});
+
+test('version is the package\'s, and its package.json can be imported by name', async () => {
+  equal(typeof version, 'string', 'a string');
+  equal(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version), true, `a semantic version: ${version}`);
+  if (globalThis.process?.versions?.node === undefined) return; // a page resolves no package.json by name
+  const { default: packageJSON } = await import('@tinyactors/node/package.json', { with: { type: 'json' } });
+  equal(version, packageJSON.version, 'the package.json the package resolves to');
 });
 
 await run();

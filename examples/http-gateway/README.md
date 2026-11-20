@@ -50,8 +50,8 @@ as spawn params, and the chart enforces them.
 
 ## The tinyactors features it uses, and why
 
-- **An actor per session, named by its token** (`spawnChart('session',
-  { name: token, params })`, `host.actorByName(token)`): the session's
+- **An actor per session, named by its token** (`host.spawn('session',
+  { name: token, params })`, `host.actor(token)`): the session's
   state (its tokens, what it has in flight, its timers) lives in one
   place, and the HTTP handler only finds the actor and sends it the
   request. A session that ended is found no more, which is how a request

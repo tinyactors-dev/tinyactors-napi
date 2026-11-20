@@ -8,7 +8,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { Address, decode, encode, Host, SimulatedClock } from '@tinyactors/node';
-import { DATAMODEL, ENDER, ENGINE, equal, hostWith, scxml, status, throws, typeError, until } from './charts.mjs';
+import { DATAMODEL, ENDER, ENGINE, equal, hostWith, named, processor, scxml, status, throws, typeError, until } from './charts.mjs';
 import { collect, run, test } from './harness.mjs';
 
 /** Counts `inc`, an error.communication included, and keeps running. */
@@ -53,15 +53,15 @@ test('a Host posted to a worker arrives as a plain object, which every method re
       ['close', () => m.Host.prototype.close.call(posted)],
       ['idle', () => m.Host.prototype.idle.call(posted)],
       ['hostStats', () => m.Host.prototype.hostStats.call(posted, undefined, () => {})],
-      ['closed', () => Object.getOwnPropertyDescriptor(m.Host.prototype, 'closed').get.call(posted)],
+      ['closed', () => Object.getOwnPropertyDescriptor(Object.getPrototypeOf(m.Host.prototype), 'closed').get.call(posted)],
     ]) {
       try { call(); refusals.push(name + ': not refused'); } catch (error) { refusals.push(name + ': ' + (error instanceof TypeError)); }
     }
-    const own = new m.Host({ systemID: 'w' }, { datamodel: process.env.TA_NAPI_DATAMODEL });
+    const own = new m.Host([], { system: 'w', datamodel: process.env.TA_NAPI_DATAMODEL });
     const ownWorks = own.closed === false;
     own.close();
     parentPort.postMessage({ plain: Object.getPrototypeOf(posted) === Object.prototype, keys: Object.keys(posted).length, refusals, ownWorks });`,
-  { host, session });
+  { host, session: session.id });
   equal(code, 0, `the worker's exit code (${JSON.stringify(messages)})`);
   const [result] = messages;
   equal(result.plain, true, 'a structured clone: a plain object');
@@ -71,7 +71,7 @@ test('a Host posted to a worker arrives as a plain object, which every method re
   // ("not a Host"): a TypeError on both
   for (const refusal of result.refusals) if (!refusal.endsWith(': true')) throw new Error(refusal);
   equal(result.ownWorks, true, 'a Host the worker makes is its own');
-  equal(host.actorByName('e'), session, 'the posted host is untouched');
+  equal(named(host, 'e'), session.id, 'the posted host is untouched');
   host.close();
 });
 
@@ -83,7 +83,7 @@ test('a worker that ends with its hosts open frees them at its teardown, with no
     const compiled = m.compileCharts([{ name: 'keeper.scxml', text: chart }]);
     const hosts = [];
     for (let i = 0; i < 3; i++) {
-      const host = new m.Host({ systemID: 'w' + i }, { datamodel: process.env.TA_NAPI_DATAMODEL, log: () => { throw new Error('a handler ran at teardown'); } });
+      const host = new m.Host([], { system: 'w' + i, datamodel: process.env.TA_NAPI_DATAMODEL, log: () => { throw new Error('a handler ran at teardown'); } });
       host.addImage(compiled.image);
       for (let j = 0; j < 20; j++) host.spawn(host.chart('keeper'), { params: { kept: { j } } });
       hosts.push(host);
@@ -92,7 +92,7 @@ test('a worker that ends with its hosts open frees them at its teardown, with no
     await hosts[0].idle();
     for (const host of hosts) host.hostStats(undefined, () => { throw new Error('a pending handler was called'); });
     globalThis.hosts = hosts; // still reachable: freed by the environment's teardown, not the collector
-    parentPort.postMessage({ open: hosts.filter((host) => !host.closed).length });
+    parentPort.postMessage({ open: hosts.filter((h) => !h.closed).length });
     process.exit(0);`);
   equal(code, 0, `the worker's exit code (${JSON.stringify(messages)})`);
   equal(messages[0]?.open, 3, 'the hosts were open when the worker ended');
@@ -112,9 +112,9 @@ test('a payload whose last reference goes is let go after the call: its value is
     </state>
     <final id="done"/>`);
   const host = hostWith({ sender }, {
-    config: { systemID: 't', ioProcessors: [{ type: 'urn:out' }] },
+    system: 't',
     // the payload row's value itself (not a copy), released by core after the ack
-    ioProcessors: { 'urn:out': (h, send) => { registry.register(send.data, 1); } },
+    ioProcessors: { 'urn:out': processor((send) => { registry.register(send.data, 1); }) },
   });
   for (let i = 0; i < 10; i++) host.spawn(host.chart('sender'));
   await host.idle();
@@ -132,7 +132,7 @@ test('marks nest in the host\'s arena: an input whose data\'s getter calls the h
       /^(outer\\.o+|inner\\.i+)$/.test(_event.name), _event.sendid.length, /^(x+|s+)$/.test(_event.sendid),
       JSON.stringify(_event.data).length,
       /^(\\{&quot;before&quot;:&quot;b+&quot;,&quot;nested&quot;:&quot;n&quot;,&quot;after&quot;:&quot;a+&quot;\\}|\\{&quot;deep&quot;:&quot;d+&quot;\\})$/.test(JSON.stringify(_event.data))].join(' ')"/></transition></state>`);
-  const host = hostWith({ logger }, { log: (h, entry) => lines.push(entry.text) });
+  const host = hostWith({ logger }, { log: (entry) => lines.push(entry.text) });
   const session = host.spawn(host.chart('logger'), { name: 'l' });
   // each text under a slab page (core keeps an event's strings in pages of
   // 4096 bytes), together past the arena's first chunk (16 KiB)
@@ -142,7 +142,7 @@ test('marks nest in the host\'s arena: an input whose data\'s getter calls the h
     before: 'b'.repeat(2000),
     get nested() { // runs while the outer send's texts are in the arena
       host.send(session, inner, { deep: 'd'.repeat(3000) }, { sendid: 's'.repeat(3000) });
-      host.actorByName('n'.repeat(3500));
+      named(host, 'n'.repeat(3500));
       return 'n';
     },
     after: 'a'.repeat(2000),
@@ -161,9 +161,9 @@ test('outputs read in a handler stay valid across the later calls of its batch',
   let first;
   const seen = [];
   const host = hostWith({ one: sender('one', 'a'), two: sender('two', 'b'), ender: ENDER }, {
-    config: { systemID: 't', ioProcessors: [{ type: 'urn:out' }] },
+    system: 't',
     ioProcessors: {
-      'urn:out': (h, send) => {
+      'urn:out': processor((send) => {
         if (first === undefined) {
           first = send;
           seen.push(send.target);
@@ -171,11 +171,11 @@ test('outputs read in a handler stay valid across the later calls of its batch',
         }
         // the batch's second effect: inputs, a typed method and another
         // view's fields in between, the first view still valid
-        h.send(h.actorByName('e'), 'go');
-        h.hostStats(undefined, () => {});
+        send.host.send(named(send.host, 'e'), 'go');
+        send.host.hostStats(undefined, () => {});
         seen.push(send.target, first.sendid, first.traceparent === undefined ? 'untraced' : 'traced');
         first.answer('reply');
-      },
+      }),
     },
   });
   host.spawn(host.chart('ender'), { name: 'e' });
@@ -184,7 +184,7 @@ test('outputs read in a handler stay valid across the later calls of its batch',
   await host.idle();
   equal(seen.join(), 'one,two,a,traced', 'the fields of both views, read across the batch');
   throws(() => first.event, status('TA_ERROR_STALE'), 'the first view after the ack');
-  if (!(await until(() => host.actorByName('e') === undefined))) throw new Error('the input made in the batch ran');
+  if (!(await until(() => named(host, 'e') === undefined))) throw new Error('the input made in the batch ran');
   host.close();
 });
 
@@ -198,8 +198,8 @@ test('rows are handles: a slot reused under a new generation gives each session 
     <final id="done"/>`);
   const seen = [];
   const host = hostWith({ sender }, {
-    config: { systemID: 't', ioProcessors: [{ type: 'urn:out' }] },
-    ioProcessors: { 'urn:out': (h, send) => { seen.push(send.data.v.join(':')); } },
+    system: 't',
+    ioProcessors: { 'urn:out': processor((send) => { seen.push(send.data.v.join(':')); }) },
   });
   // one at a time: each session's and payload's rows go before the next
   // are made, so the next take the same slots
@@ -231,8 +231,8 @@ test('a dropped host with rows (charts, sessions, payloads) is collected and fre
 
 test('sessions are bigints from 1 to 2^64-1 or safe integers from 1, never a number that saturates', async () => {
   const host = hostWith({ ender: ENDER, keeper: KEEPER });
-  const session = host.spawn(host.chart('ender'), { name: 'e' });
-  equal(typeof session, 'bigint', 'spawn gives a bigint');
+  const session = host.spawn(host.chart('ender'), { name: 'e' }).id;
+  equal(typeof session, 'bigint', 'spawn gives an Actor, its id a bigint');
   const outside = [0, -1, 1.5, 2 ** 53, 2 ** 64, Number.NaN, Infinity, null, -1n, 0n, 1n << 64n, (1n << 64n) + session];
   for (const value of outside) {
     throws(() => host.send(value, 'go'), typeError, `send(${String(value)})`);
@@ -246,10 +246,10 @@ test('sessions are bigints from 1 to 2^64-1 or safe integers from 1, never a num
   }
   for (const take of [(v) => host.terminate(v), (v) => host.hibernate(v), (v) => host.migrate({ session: v })])
     throws(() => take(String(session)), typeError, 'a string where only a session goes');
-  equal(host.actorByName('e'), session, 'nothing reached the actor');
+  equal(named(host, 'e'), session, 'nothing reached the actor');
   // a safe integer is the same session as its bigint, for every input
   const keeper = host.spawn(host.chart('keeper'));
-  const number = Number(keeper);
+  const number = Number(keeper.id);
   host.send(number, 'inc');
   host.send({ target: number, event: 'inc' });
   host.send(Address.fromSession('t', number), 'inc');
@@ -260,12 +260,12 @@ test('sessions are bigints from 1 to 2^64-1 or safe integers from 1, never a num
   host.migrate({ session: number });
   await host.idle();
   let n;
-  host.actorContext({ session: number }, (h, result) => { n = result.variables.n; });
+  host.actorContext({ session: number }, (result) => { n = result.variables.n; });
   await host.idle();
   equal(n, 4, 'three events and a failure reached the session given as a number');
   host.send(Number(session), 'go');
   await host.idle();
-  equal(host.actorByName('e'), undefined, 'the ender ended');
+  equal(named(host, 'e'), undefined, 'the ender ended');
   host.terminate(number);
   await host.idle();
   throws(() => host.terminate(number), status('TA_ERROR_STALE'), 'the keeper is gone');
@@ -280,7 +280,7 @@ test('a SimulatedClock\'s methods on another object are refused by its type tag'
   const clock = new SimulatedClock();
   const increment = SimulatedClock.prototype.increment;
   const now = Object.getOwnPropertyDescriptor(SimulatedClock.prototype, 'now').get;
-  for (const self of [{}, Object.create(SimulatedClock.prototype), new Host({ systemID: 't' }, ENGINE)]) {
+  for (const self of [{}, Object.create(SimulatedClock.prototype), new Host([], { system: 't', ...ENGINE })]) {
     throws(() => increment.call(self, 1), typeError, 'increment on another object');
     throws(() => now.call(self), typeError, 'now on another object');
     if (self instanceof Host) self.close();
@@ -294,7 +294,8 @@ test('the README says what no test can show: charts are trusted, deadlines keep 
     ['chart code is trusted, a vm context no boundary, quickjs the sandbox', /Chart code is trusted code\..*not a security boundary.*quickjs, the sandbox/],
     ['a pending deadline keeps the process alive until close()', /pending deadline keeps the process alive.*host\.close\(\)/],
     ['a handler\'s error ends the process by default', /A handler's error ends the process by default.*uncaughtException.*unhandledRejection/],
-    ['let, const or class keeps a chart\'s sessions resident', /let`, `const` or `class` keeps its sessions resident/],
+    ['a script\'s top-level let, const or class is refused, a var the session\'s, a function the chart\'s helper',
+      /chart-level `<script>`'s `function`s are the chart's helpers.*top-level `var` is a variable of the session.*top-level `let`, `const` or `class` is refused/],
     ['the charts of a host share builtins', /The charts of a host share the builtins of its shared context/],
     ['using needs a runtime that parses it', /`using host = new Host\(\.\.\.\)` needs a runtime that parses `using`:\*\* Bun 1\.4 does, Node\.js 22 does not/],
   ]) if (!said.test(readme)) throw new Error(`the README does not say: ${what}`);

@@ -15,7 +15,7 @@ const WASM = new URL('../tinyactors.wasm', import.meta.url);
 
 test('before init() the instance is refused with TA_ERROR_STATE; init.mjs loads it, from a URL too', async () => {
   const state = await import('../lib/state.mjs?before');
-  assert.throws(() => state.instance(), { name: 'TinyactorsError', status: 'TA_ERROR_STATE' });
+  assert.throws(() => state.instance(), { name: 'StateError', status: 'TA_ERROR_STATE' });
   const entry = await import('../init.mjs');
   assert.equal(typeof entry.init, 'function');
   await entry.init(WASM);

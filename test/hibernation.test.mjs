@@ -1,6 +1,6 @@
 // Hibernation (docs/plan.xml, p2-hibernate; translated from
 // tinyactors-cpython/tests/test_hibernation.py): sweep, hibernate, the
-// wake handler and wake, on the datamodel under test. A blob is a Uint8Array
+// store a WAKE loads from and wake, on the datamodel under test. A blob is a Uint8Array
 // copied once; a hibernated native session leaves nothing in the engine;
 // its events and its delayed sends wait in the host until the application
 // wakes it; a value outside the value table keeps it resident.
@@ -30,24 +30,27 @@ const counter = ({ exit = '', more = '' } = {}) => scxml('counter', `
     ${more}
   </state>`);
 
-/** A wake handler over a Map, as an application's store would be. */
+/** A store over a Map, recording the sessions it loads (`wakes`). */
 class Store {
   constructor() {
     this.blobs = new Map();
     this.wakes = [];
-    this.handler = (host, session, migration) => {
-      this.wakes.push([session, migration]);
-      host.wake(session, this.blobs.get(session));
-      this.blobs.delete(session);
-    };
   }
+  /** A blob the test hibernated itself, for an Actor or a session. */
+  put(session, blob) { this.blobs.set(typeof session === 'object' ? session.id : session, blob); }
+  save(session, blob) { this.blobs.set(session, blob); }
+  load(session) {
+    this.wakes.push([session]);
+    return this.blobs.get(session);
+  }
+  delete(session) { this.blobs.delete(session); }
 }
 
 /** A log handler keeping the lines of each label. */
 class Logs {
   constructor() {
     this.lines = [];
-    this.handler = (host, entry) => this.lines.push([entry.label, entry.text]);
+    this.handler = (entry) => this.lines.push([entry.label, entry.text]);
   }
   labelled(label) {
     return this.lines.filter(([l]) => l === label).map(([, text]) => text);
@@ -57,19 +60,19 @@ class Logs {
 test('an actor wakes with its variables: the blob is a Uint8Array, one WAKE brings it back', async () => {
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ counter: counter() }, { log: logs.handler, wake: store.handler });
+  const host = hostWith({ counter: counter() }, { log: logs.handler, store });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'inc', { k: 1 });
   host.send(session, 'inc', 'two');
   await host.idle();
   const blob = host.hibernate(session);
   if (!(blob instanceof Uint8Array) || blob.length === 0) throw new Error('the blob is not a non-empty Uint8Array');
-  store.blobs.set(session, blob);
+  store.put(session, blob);
   host.send(session, 'report');
   await host.idle();
   equal(store.wakes.length, 1, 'one WAKE');
-  equal(store.wakes[0][0], session, 'for the session');
-  equal(store.wakes[0][1], undefined, 'no migration asked');
+  equal(store.wakes[0][0], session.id, 'for the session');
+  equal(store.blobs.size, 0, 'the blob deleted once it was woken');
   equal(logs.labelled('n').join('|'), '2 [{"k":1},"two"] report', 'its variables survived');
   host.close();
 });
@@ -92,7 +95,8 @@ test('an actor wakes with its last event: an <onexit> at terminate reads it', as
 test('events wait until the wake: one WAKE however many come, then they run in order', async () => {
   const logs = new Logs();
   const wakes = [];
-  const host = hostWith({ counter: counter() }, { log: logs.handler, wake: (h, session) => wakes.push(session) });
+  const store = { save() {}, load: (session) => { wakes.push(session); throw new Error('not yet'); }, delete() {} };
+  const host = hostWith({ counter: counter() }, { log: logs.handler, store, onHandlerError: () => {} });
   const session = host.spawn(host.chart('counter'));
   await host.idle();
   const blob = host.hibernate(session);
@@ -107,7 +111,7 @@ test('events wait until the wake: one WAKE however many come, then they run in o
   host.close();
 });
 
-test('without a wake handler the effect is dropped: the actor stays hibernated until wake', async () => {
+test('without a store the effect is dropped: the actor stays hibernated until wake', async () => {
   const logs = new Logs();
   const host = hostWith({ counter: counter() }, { log: logs.handler });
   const session = host.spawn(host.chart('counter'));
@@ -133,7 +137,7 @@ test('the sweep returns the actors that did not run since the last one', async (
   const cold = host.sweep(1024, 16);
   for (const session of cold) if (typeof session !== 'bigint') throw new Error('a session is not a bigint');
   const sorted = (list) => list.map(String).sort().join();
-  equal(sorted(cold), sorted([sessions[0], sessions[2], sessions[3]]), 'the cold ones');
+  equal(sorted(cold), sorted([sessions[0].id, sessions[2].id, sessions[3].id]), 'the cold ones');
   equal(host.sweep(1024, 2).length, 2, 'at most limit');
   equal(host.sweep(0, 16).length, 0, 'nothing scanned');
   host.close();
@@ -144,12 +148,12 @@ test('a delayed send wakes the actor it was sent to when it falls due', async ()
   const store = new Store();
   const clock = new SimulatedClock();
   const more = '<transition event="later"><log label="later" expr="String(n)"/></transition>';
-  const host = hostWith({ counter: counter({ more }) }, { log: logs.handler, wake: store.handler, clock });
+  const host = hostWith({ counter: counter({ more }) }, { log: logs.handler, store, clock });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'inc', 0);
   host.send(session, 'wait');
   await host.idle();
-  store.blobs.set(session, host.hibernate(session));
+  store.put(session, host.hibernate(session));
   clock.increment(999);
   await host.idle();
   equal(store.wakes.length, 0, 'not yet due');
@@ -222,7 +226,7 @@ test('native: a hibernated actor holds nothing in the engine; its values come ba
     </state>`);
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ big: chart }, { log: logs.handler, wake: store.handler });
+  const host = hostWith({ big: chart }, { log: logs.handler, store });
   const ref = host.chart('big');
   const sessions = Array.from({ length: 200 }, () => host.spawn(ref));
   await host.idle();
@@ -232,7 +236,7 @@ test('native: a hibernated actor holds nothing in the engine; its values come ba
   await host.idle();
   await collect();
   const full = process.memoryUsage().heapUsed;
-  for (const session of sessions) store.blobs.set(session, host.hibernate(session));
+  for (const session of sessions) store.put(session, host.hibernate(session));
   await collect();
   // Bun counts a Buffer's bytes in heapUsed, node does not: the blobs the
   // store keeps are not the actors' (bun:jsc's heapStats, 2026-10-16)
@@ -248,49 +252,51 @@ test('native: a hibernated actor holds nothing in the engine; its values come ba
   host.close();
 });
 
-test('a chart whose scripts declare: its var and function come back after the wake', async () => {
-  const chart = scxml('declares', `
-    <script>var count = 10; function next() { count = count + 1; return count; }</script>
+test('a chart with helpers: its var comes back with the blob, its helpers with the chart', async () => {
+  const chart = scxml('helpers', `
+    <script>var count = 10; function next(n) { return n + 1; }</script>
     <state id="s">
-      <transition event="tick"><script>next();</script></transition>
-      <transition event="report"><log label="count" expr="String(next())"/></transition>
+      <transition event="tick"><script>count = next(count);</script></transition>
+      <transition event="report"><log label="count" expr="String(next(count))"/></transition>
     </state>`);
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ declares: chart }, { log: logs.handler, wake: store.handler });
-  const session = host.spawn(host.chart('declares'));
+  const host = hostWith({ helpers: chart }, { log: logs.handler, store });
+  const session = host.spawn(host.chart('helpers'));
   host.send(session, 'tick');
-  host.send(session, 'tick'); // the var written by the function twice: its last value goes (bun's global is stale)
+  host.send(session, 'tick');
   await host.idle();
-  store.blobs.set(session, host.hibernate(session));
+  const blob = host.hibernate(session);
+  store.put(session, blob);
   host.send(session, 'report');
   await host.idle();
-  equal(logs.labelled('count').join('|'), '13', 'the var kept, the function made again');
+  equal(logs.labelled('count').join('|'), '13', 'the var kept, the helper the chart\'s');
   host.close();
+  if (DATAMODEL === 'native') {
+    const text = new TextDecoder().decode(blob);
+    if (text.includes('next')) throw new Error('the blob holds the helper');
+  }
 });
 
-test('a chart whose scripts declare with let: native keeps it resident, quickjs hibernates it', async () => {
+test('a script\'s let: native refuses the script and hibernates the actor, quickjs keeps the binding', async () => {
   const chart = scxml('lexical', `
     <script>let count = 10;</script>
     <state id="s">
       <transition event="tick"><script>count = count + 1;</script></transition>
-      <transition event="report"><log label="count" expr="String(count)"/></transition>
+      <transition event="report"><log label="count" expr="typeof count === 'number' ? String(count) : 'none'"/></transition>
+      <transition event="error.execution"><log label="error" expr="_event.name"/></transition>
     </state>`);
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ lexical: chart }, { log: logs.handler, wake: store.handler });
+  const host = hostWith({ lexical: chart }, { log: logs.handler, store });
   const session = host.spawn(host.chart('lexical'));
   host.send(session, 'tick');
   await host.idle();
-  if (DATAMODEL === 'native') {
-    throws(() => host.hibernate(session), (error) => {
-      status('TA_ERROR_UNSUPPORTED')(error);
-      if (!/let, const or class/.test(error.message)) throw new Error(`the message says nothing of let: ${error.message}`);
-    }, 'a let binding');
-  } else store.blobs.set(session, host.hibernate(session));
+  store.put(session, host.hibernate(session));
   host.send(session, 'report');
   await host.idle();
-  equal(logs.labelled('count').join('|'), '11', 'its binding kept');
+  if (DATAMODEL === 'native') equal(logs.lines.map(([label, text]) => `${label}: ${text}`).join('|'), 'error: error.execution|error: error.execution|count: none', 'refused');
+  else equal(logs.labelled('count').join('|'), '11', 'its binding kept');
   host.close();
 });
 
@@ -317,7 +323,7 @@ test('wake refuses another host\'s blob for a session of the same number; a rest
   const one = hostWith({ counter: counter() }, { log: logs.handler });
   const two = hostWith({ counter: counter() }); // the same config, system id and image
   const session = one.spawn(one.chart('counter'));
-  equal(two.spawn(two.chart('counter')), session, 'the same session number');
+  equal(two.spawn(two.chart('counter')).id, session.id, 'the same session number');
   one.send(session, 'inc', 1);
   await one.idle();
   await two.idle();
@@ -329,7 +335,7 @@ test('wake refuses another host\'s blob for a session of the same number; a rest
   two.close();
   const snapshot = one.snapshot();
   one.close();
-  const restored = Host.restore(snapshot, CONFIG, { ...ENGINE, log: logs.handler });
+  const restored = Host.restore(snapshot, [], { ...CONFIG, ...ENGINE, log: logs.handler });
   throws(() => restored.wake(session, blobTwo), status('TA_ERROR_INVALID'), 'the second host\'s blob after the restore');
   restored.wake(session, blobOne);
   restored.send(session, 'report');
@@ -354,11 +360,9 @@ test('wake refuses a blob it cannot read, and a session that is not hibernated',
   host.close();
 });
 
-test('a wake handler that throws: its error rejects idle()', async () => {
+test('a store whose load throws: its error rejects idle(), and the actor stays hibernated', async () => {
   const host = hostWith({ counter: counter() }, {
-    wake: () => {
-      throw new Error('store down');
-    },
+    store: { save() {}, load() { throw new Error('store down'); }, delete() {} },
   });
   const session = host.spawn(host.chart('counter'));
   await host.idle();
@@ -370,19 +374,23 @@ test('a wake handler that throws: its error rejects idle()', async () => {
   host.close();
 });
 
-test('an async wake handler wakes the actor later, from its promise', async () => {
+test('a store whose load returns a promise wakes the actor later, from it', async () => {
   const logs = new Logs();
   const blobs = new Map();
   const host = hostWith({ counter: counter() }, {
     log: logs.handler,
-    wake: async (h, session) => {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      h.wake(session, blobs.get(session));
+    store: {
+      save(session, blob) { blobs.set(session, blob); },
+      load: async (session) => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return blobs.get(session);
+      },
+      delete: async (session) => { blobs.delete(session); },
     },
   });
   const session = host.spawn(host.chart('counter'));
   await host.idle();
-  blobs.set(session, host.hibernate(session));
+  blobs.set(session.id, host.hibernate(session));
   host.send(session, 'inc', 5);
   host.send(session, 'report');
   await host.idle();
@@ -397,7 +405,7 @@ test('an async wake handler wakes the actor later, from its promise', async () =
 test('hibernate from a call inside a call outside a turn leaves no batch open', async () => {
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ counter: counter() }, { log: logs.handler, wake: store.handler });
+  const host = hostWith({ counter: counter() }, { log: logs.handler, store });
   const ref = host.chart('counter');
   const a = host.spawn(ref);
   const b = host.spawn(ref);
@@ -405,7 +413,7 @@ test('hibernate from a call inside a call outside a turn leaves no batch open', 
   const item = {
     target: b,
     get event() {
-      store.blobs.set(a, host.hibernate(a)); // a getter sendMany reads: a call inside a call
+      store.put(a, host.hibernate(a)); // a getter sendMany reads: a call inside a call
       return 'inc';
     },
     data: 1,
@@ -423,10 +431,10 @@ test('hibernate from a handler joins the open batch', async () => {
   const logs = new Logs();
   let taken = 0;
   const host = hostWith({ counter: counter() }, {
-    wake: store.handler,
-    log: (h, entry) => {
-      logs.handler(h, entry);
-      if (taken++ === 0) store.blobs.set(entry.session, h.hibernate(entry.session));
+    store,
+    log: (entry) => {
+      logs.handler(entry);
+      if (taken++ === 0) store.put(entry.session, entry.host.hibernate(entry.session));
       equal(entry.label, 'n', 'the view is still valid after the take');
     },
   });
@@ -442,9 +450,9 @@ test('hibernate from a handler joins the open batch', async () => {
 
 test('hibernate between turns ends no effect undispatched', async () => {
   let replies = 0;
-  const again = (h) => {
+  const again = () => {
     replies++;
-    if (replies < 200) h.hostStats(undefined, again);
+    if (replies < 200) host.hostStats(undefined, again);
   };
   const host = hostWith({ counter: counter() });
   const session = host.spawn(host.chart('counter'));
@@ -472,7 +480,7 @@ test('sweep, hibernate and wake refuse numbers out of range', async () => {
 });
 
 test('a function declared in a transition\'s script, and a \'use strict\' that starts one, hibernate and wake', async () => {
-  // a chart-level var makes the chart declaring: a context per session
+  // a chart-level var is a variable of the session; f is the script's at each run
   const chart = scxml('blocks', `
     <script>var n = 0;</script>
     <state id="s">
@@ -482,16 +490,16 @@ test('a function declared in a transition\'s script, and a \'use strict\' that s
     </state>`);
   const logs = new Logs();
   const store = new Store();
-  const host = hostWith({ blocks: chart }, { log: logs.handler, wake: store.handler });
+  const host = hostWith({ blocks: chart }, { log: logs.handler, store });
   const session = host.spawn(host.chart('blocks'));
   host.send(session, 'go');
   await host.idle();
-  store.blobs.set(session, host.hibernate(session)); // f is the script's again at each run: not stored
+  store.put(session, host.hibernate(session)); // f is the script's again at each run: not stored
   host.send(session, 'go');
   await host.idle();
   host.send(session, 'strict');
   await host.idle();
-  store.blobs.set(session, host.hibernate(session));
+  store.put(session, host.hibernate(session));
   host.send(session, 'go');
   await host.idle();
   host.close();

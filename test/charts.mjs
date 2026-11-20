@@ -3,14 +3,15 @@
 // once on "native" and once on "quickjs"; "native", the default, when run
 // on its own), and the helpers that make a host run them. Actors are
 // observed with what the inputs give: an actor that reaches a final state
-// ends, so host.actorByName stops finding it.
-import { compileCharts, Host, TinyactorsError } from '@tinyactors/node';
+// ends, so host.actor stops finding it (named() below).
+import { compileCharts, Host, StaleError, TinyactorsError } from '@tinyactors/node';
 import { datamodel, macrotask, wasm } from './runtime.mjs';
 
 export const DATAMODEL = datamodel;
 /** The Host options that name the datamodel under test. */
 export const ENGINE = { datamodel: DATAMODEL };
-export const CONFIG = { systemID: 't' };
+/** The Host options that name the system. */
+export const CONFIG = { system: 't' };
 /** The label a snapshot of the package under test holds: each package
  * labels its own, and refuses the other's. */
 export const LABEL = wasm ? 'tinyactors-wasm' : 'tinyactors-napi';
@@ -31,12 +32,24 @@ export function image(charts) {
   }
 }
 
-/** A host on the datamodel under test running `charts`; `host.ref(name)` is a chart's reference. */
-export function hostWith(charts, { config = CONFIG, ...options } = {}) {
-  const host = new Host(config, { ...ENGINE, ...options });
-  host.addImage(image(charts));
-  return host;
+/** A host on the datamodel under test running `charts` (an object of
+ * name -> text), with `options` over the system and the datamodel. */
+export function hostWith(charts, options = {}) {
+  return new Host(image(charts), { ...CONFIG, ...ENGINE, ...options });
 }
+
+/** The session of the live actor named `name`, or undefined. */
+export function named(host, name) {
+  try {
+    return host.actor(name).id;
+  } catch (error) {
+    if (error instanceof StaleError) return undefined;
+    throw error;
+  }
+}
+
+/** An I/O processor whose receive is `receive`. */
+export const processor = (receive) => ({ receive });
 
 /** A chart that ends on `event` whose data's `n` is 1. */
 export const WAITER = scxml('waiter', `

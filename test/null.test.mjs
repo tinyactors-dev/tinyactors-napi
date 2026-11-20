@@ -7,12 +7,12 @@
 // hosts, invoked services, hibernation, migration, snapshots and
 // telemetry, each the null datamodel's part of what the other test files
 // show on the ECMAScript datamodels.
-import { Address, Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
-import { ENGINE, equal, image, indexOfBytes, LABEL, sameBytes, scxml, status, throws, typeError, until } from './charts.mjs';
+import { Address, Host, MemoryStore, SimulatedClock, TinyactorsError } from '@tinyactors/node';
+import { ENGINE, equal, image, indexOfBytes, LABEL, named, processor, sameBytes, scxml, status, throws, typeError, until } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
 const OUT = 'urn:test:out';
-const CONFIG = { systemID: 't', ioProcessors: [{ type: OUT }] };
+const CONFIG = { system: 't' };
 const nullChart = (name, body, initial = 's') => scxml(name, body, { datamodel: 'null', initial });
 
 /** Sends `hello` to the app at entry, ends on `reply`, fails over to `failed`. */
@@ -34,32 +34,29 @@ const WAITER = nullChart('waiter', `
   <final id="done"/>`);
 
 function hostOf(charts, options = {}) {
-  const { config = CONFIG, ...rest } = options;
-  const host = new Host(config, { ...ENGINE, ...rest });
-  host.addImage(image(charts));
-  return host;
+  return new Host(image(charts), { ...CONFIG, ...ENGINE, ...options });
 }
 
-const gone = (host, name) => until(() => host.actorByName(name) === undefined);
+const gone = (host, name) => until(() => named(host, name) === undefined);
 
 test('a send to an I/O processor: a thin view of its fields, answered in its handler', async () => {
   let seen;
   const host = hostOf({ asker: ASKER }, {
     ioProcessors: {
-      [OUT]: (h, send) => {
-        equal(h, host, 'the handler gets the host');
+      [OUT]: processor((send) => {
+        equal(send.host, host, 'the view has the host');
         seen = {
           session: send.session, event: send.event, target: send.target, sendid: send.sendid, type: send.type,
           origin: send.origin instanceof Address, data: send.data, traceparent: typeof send.traceparent,
         };
         equal(send.answer('reply'), true, 'delivered');
         throws(() => send.answer('reply'), status('TA_ERROR_STATE'), 'a second answer');
-      },
+      }),
     },
   });
   const session = host.spawn(host.chart('asker'), { name: 'a' });
   if (!(await gone(host, 'a'))) throw new Error('the answer did not reach the actor');
-  equal(seen.session, session, 'session');
+  equal(seen.session, session.id, 'session');
   equal(seen.event, 'hello', 'event');
   equal(seen.target, 'the-app', 'target');
   equal(seen.sendid, 'ask-1', 'sendid');
@@ -73,7 +70,7 @@ test('a send to an I/O processor: a thin view of its fields, answered in its han
 test('a view read after its ack throws TA_ERROR_STALE; what was read stays', async () => {
   let kept, event;
   const host = hostOf({ asker: ASKER }, {
-    ioProcessors: { [OUT]: (h, send) => { kept = send; event = send.event; } },
+    ioProcessors: { [OUT]: processor((send) => { kept = send; event = send.event; }) },
   });
   host.spawn(host.chart('asker'));
   await host.idle();
@@ -87,7 +84,7 @@ test('a view read after its ack throws TA_ERROR_STALE; what was read stays', asy
 test('a handler that returns a promise gets a record: it answers after the ack', async () => {
   let record;
   const host = hostOf({ asker: ASKER }, {
-    ioProcessors: { [OUT]: async (h, send) => { record = send; } },
+    ioProcessors: { [OUT]: processor(async (send) => { record = send; }) },
   });
   host.spawn(host.chart('asker'), { name: 'a' });
   await host.idle();
@@ -103,7 +100,7 @@ test('a handler that returns a promise gets a record: it answers after the ack',
 
 test('a handler that throws has its send failed, and its error rejects idle()', async () => {
   const host = hostOf({ asker: ASKER }, {
-    ioProcessors: { [OUT]: () => { throw new Error('from the handler'); } },
+    ioProcessors: { [OUT]: processor(() => { throw new Error('from the handler'); }) },
   });
   host.spawn(host.chart('asker'), { name: 'a' });
   let error;
@@ -113,12 +110,15 @@ test('a handler that throws has its send failed, and its error rejects idle()', 
   host.close();
 });
 
-test('a send with no handler is failed; a log entry is a thin view', async () => {
+test('a send its processor fails is error.communication; a log entry is a thin view', async () => {
   const entries = [];
-  const host = hostOf({ asker: ASKER }, { log: (h, entry) => entries.push([entry.session, entry.label, entry.text]) });
+  const host = hostOf({ asker: ASKER }, {
+    ioProcessors: { [OUT]: processor((send) => send.fail()) },
+    log: (entry) => entries.push([entry.session, entry.label, entry.text]),
+  });
   const session = host.spawn(host.chart('asker'), { name: 'a' });
   if (!(await gone(host, 'a'))) throw new Error('the failure did not reach the actor');
-  equal(JSON.stringify(entries.map(([s, label, text]) => [s === session, label, text])), JSON.stringify([[true, 'asked', '']]), 'the entry');
+  equal(JSON.stringify(entries.map(([s, label, text]) => [s === session.id, label, text])), JSON.stringify([[true, 'asked', '']]), 'the entry');
   host.close();
 });
 
@@ -127,9 +127,9 @@ test('typed methods: a result, an error to onError, and their promises', async (
   const session = host.spawn(host.chart('waiter'), { name: 'w' });
   await host.idle();
   let stats, state, error;
-  host.hostStats(undefined, (h, result) => { stats = result; });
-  host.actorState({ session: Number(session) }, (h, result) => { state = result; });
-  host.actorState({ session: 999 }, () => {}, (h, e) => { error = e; });
+  host.hostStats(undefined, (result) => { stats = result; });
+  host.actorState({ session: Number(session.id) }, (result) => { state = result; });
+  host.actorState({ session: 999 }, () => {}, (e) => { error = e; });
   await host.idle();
   equal(typeof stats.host, 'object', 'host.stats');
   equal(state.value, 's', 'actor.state');
@@ -147,18 +147,18 @@ test('typed methods: a result, an error to onError, and their promises', async (
 
 test('a delayed send on a simulated clock: nextDeadline, increment, no timer', async () => {
   const clock = new SimulatedClock();
-  const host = hostOf({ waiter: WAITER }, { clock, config: { systemID: 't', system: { ticksPerSecond: 1000 } } });
+  const host = hostOf({ waiter: WAITER }, { clock, config: { system: { ticksPerSecond: 1000 } } });
   host.spawn(host.chart('waiter'), { name: 'w' });
-  host.send(host.actorByName('w'), 'wait');
+  host.send(named(host, 'w'), 'wait');
   await host.idle();
   equal(host.nextDeadline, 2000, 'the deadline, in milliseconds');
   equal(host.now(), 0, 'the host\'s clock');
   clock.increment(1999);
   await host.idle();
-  equal(host.actorByName('w') !== undefined, true, 'not yet');
+  equal(named(host, 'w') !== undefined, true, 'not yet');
   clock.increment(1);
   await host.idle();
-  equal(host.actorByName('w'), undefined, 'the delayed event came');
+  equal(named(host, 'w'), undefined, 'the delayed event came');
   equal(host.nextDeadline, undefined, 'no deadline');
   host.close();
 });
@@ -171,16 +171,16 @@ test('the transport: a send to another system\'s address, its message sent on th
   const echo = nullChart('echo', `
     <state id="s"><transition event="ping"><send event="pong" target="tinyactors://a/@sender"/></transition></state>`);
   let a, b;
-  const route = (target) => (h, send) => {
+  const route = (target) => (send) => {
     equal(send.type, undefined, 'the transport\'s type');
     equal(send.target instanceof Address, true, 'the target an Address');
     target().send(send.message);
   };
-  a = hostOf({ sender }, { config: { systemID: 'a' }, transport: route(() => b) });
-  b = hostOf({ echo }, { config: { systemID: 'b' }, transport: route(() => a) });
+  a = hostOf({ sender }, { system: 'a', transport: route(() => b) });
+  b = hostOf({ echo }, { system: 'b', transport: route(() => a) });
   b.spawn(b.chart('echo'), { name: 'echo' });
   a.spawn(a.chart('sender'), { name: 'sender' });
-  if (!(await until(() => a.actorByName('sender') === undefined))) throw new Error('no pong came back');
+  if (!(await until(() => named(a, 'sender') === undefined))) throw new Error('no pong came back');
   a.close();
   b.close();
 });
@@ -199,12 +199,12 @@ test('invoked services: start, receive, sendBack, done, and stop at the UNINVOKE
   const events = [];
   let invocation, stopped = 0;
   const host = hostOf({ client }, {
-    log: (h, entry) => labels.push(entry.label),
+    log: (entry) => labels.push(entry.label),
     services: {
-      'urn:test:svc': (h, inv) => {
+      'urn:test:svc': (inv) => {
         invocation = inv;
         return {
-          receive(hh, send) { events.push(send.event); inv.sendBack('answer'); },
+          receive(send) { events.push(send.event); inv.sendBack('answer'); },
           stop() { stopped++; },
         };
       },
@@ -215,7 +215,7 @@ test('invoked services: start, receive, sendBack, done, and stop at the UNINVOKE
   equal(invocation.type, 'urn:test:svc', 'type');
   equal(invocation.src, 'svc://here', 'src');
   equal(invocation.invokeid, 'svc', 'invokeid');
-  equal(invocation.session, one, 'session');
+  equal(invocation.session, one.id, 'session');
   equal(invocation.restored, false, 'restored');
   equal(invocation.running, true, 'running');
   host.send(one, 'ask');
@@ -250,24 +250,18 @@ test('a service with no handler is a communication error for the invoker, and no
 });
 
 test('hibernation: a blob, a WAKE for an event, the actor goes on', async () => {
-  const blobs = new Map();
-  const wakes = [];
-  const host = hostOf({ waiter: WAITER }, {
-    wake: (h, session, migration) => {
-      wakes.push(migration);
-      h.wake(session, blobs.get(session));
-    },
-  });
+  const store = new MemoryStore();
+  const host = hostOf({ waiter: WAITER }, { store });
   const session = host.spawn(host.chart('waiter'), { name: 'w' });
   await host.idle();
   const blob = host.hibernate(session);
   equal(blob instanceof Uint8Array && blob.length > 0, true, 'a blob');
-  blobs.set(session, blob);
-  equal(host.actorByName('w'), session, 'by name while hibernated');
+  store.save(session.id, blob);
+  equal(named(host, 'w'), session.id, 'by name while hibernated');
   equal(JSON.stringify(host.sweep(100, 10).map(String)), '[]', 'nothing to sweep: it is out');
   host.send(session, 'go');
   await host.idle();
-  equal(JSON.stringify(wakes), '[null]', 'one WAKE, no migration');
+  equal(store.blobs.size, 0, 'the WAKE loaded the blob, and it is spent');
   if (!(await gone(host, 'w'))) throw new Error('the event did not run after the wake');
   throws(() => host.hibernate(session), (error) => {
     if (!(error instanceof TinyactorsError)) throw error;
@@ -282,8 +276,8 @@ test('migration: actors move to the new version; MIGRATED views and the result',
   const moved = [];
   let result;
   const host = hostOf({ m: v1 }, {
-    migrated: (h, view) => moved.push([view.session, view.segment, view.chart, view.migration]),
-    migrationDone: (h, done) => { result = done; },
+    migrated: (view) => moved.push([view.session, view.segment, view.chart, view.migration]),
+    migrationDone: (done) => { result = done; },
   });
   const sessions = [host.spawn(host.chart('m')), host.spawn(host.chart('m'))];
   await host.idle();
@@ -291,14 +285,14 @@ test('migration: actors move to the new version; MIGRATED views and the result',
   const migration = host.migrate({ chart: 'm' });
   await host.idle();
   equal(moved.length, 2, 'two MIGRATED');
-  equal(moved.every(([s, segment, chart, id]) => sessions.includes(s) && segment === 1 && chart === 'm' && id === migration), true, 'their fields');
+  equal(moved.every(([s, segment, chart, id]) => sessions.some((actor) => actor.id === s) && segment === 1 && chart === 'm' && id === migration), true, 'their fields');
   equal(result.migration, migration, 'its id');
   equal(result.migrated, 2, 'migrated');
   equal(Object.isFrozen(result.failed) && result.failed.length, 0, 'failed');
   equal(Object.isFrozen(result.pending) && result.pending.length, 0, 'pending');
   host.send(sessions[0], 'go');
   await host.idle();
-  equal(host.actorByName('x'), undefined, 'no name');
+  equal(named(host, 'x'), undefined, 'no name');
   throws(() => host.migrate({ chart: '' }), (error) => {
     if (!(error instanceof RangeError)) throw error;
   }, 'an empty chart');
@@ -313,32 +307,32 @@ test('snapshots: a restored host goes on; another system and another program\'s 
   const blob = host.snapshot();
   equal(blob instanceof Uint8Array && blob.length > 0, true, 'a snapshot');
   host.close();
-  const restored = Host.restore(blob, CONFIG, { ...ENGINE, clock: new SimulatedClock() });
-  const session = restored.actorByName('w');
+  const restored = Host.restore(blob, [], { ...CONFIG, ...ENGINE, clock: new SimulatedClock() });
+  const session = named(restored, 'w');
   equal(typeof session, 'bigint', 'the actor is there');
   equal(sameBytes(restored.snapshot(), blob), true, 'the snapshot of a restored host is the same bytes');
   restored.send(session, 'go');
   if (!(await gone(restored, 'w'))) throw new Error('the restored actor did not run');
   restored.close();
-  throws(() => Host.restore(blob, { systemID: 'other', ioProcessors: [{ type: OUT }] }, ENGINE), status('TA_ERROR_INVALID'), 'another system');
+  throws(() => Host.restore(blob, [], { system: 'other', ...ENGINE }), status('TA_ERROR_INVALID'), 'another system');
   const label = new TextEncoder().encode(LABEL);
   const at = indexOfBytes(blob, label);
   if (at < 0) throw new Error('the pack does not hold its label');
   const relabelled = new Uint8Array(blob);
   relabelled[at] = 'x'.charCodeAt(0);
-  throws(() => Host.restore(relabelled, CONFIG, ENGINE), status('TA_ERROR_INVALID'), 'another program\'s pack');
-  throws(() => Host.restore(new Uint8Array([1, 2, 3]), CONFIG, ENGINE), status('TA_ERROR_INVALID'), 'no pack');
-  throws(() => Host.restore('pack', CONFIG, ENGINE), typeError, 'not bytes');
+  throws(() => Host.restore(relabelled, [], { ...CONFIG, ...ENGINE }), status('TA_ERROR_INVALID'), 'another program\'s pack');
+  throws(() => Host.restore(new Uint8Array([1, 2, 3]), [], { ...CONFIG, ...ENGINE }), status('TA_ERROR_INVALID'), 'no pack');
+  throws(() => Host.restore('pack', [], { ...CONFIG, ...ENGINE }), typeError, 'not bytes');
 });
 
 test('a snapshot from a handler is refused; one with a reply pending is refused', async () => {
   let refused;
   const host = hostOf({ asker: ASKER }, {
     ioProcessors: {
-      [OUT]: (h, send) => {
-        try { h.snapshot(); } catch (error) { refused = error.status; }
+      [OUT]: processor((send) => {
+        try { send.host.snapshot(); } catch (error) { refused = error.status; }
         send.answer('reply');
-      },
+      }),
     },
   });
   host.spawn(host.chart('asker'));
@@ -355,8 +349,8 @@ test('telemetry: traces and logs to the handler as Uint8Arrays, metrics(), the l
   const got = [];
   const host = hostOf({ waiter: WAITER }, {
     clock,
-    config: { systemID: 't', system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 100 } },
-    telemetry: (h, signal, data) => got.push([signal, data]),
+    config: { system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 100 } },
+    telemetry: (signal, data) => got.push([signal, data]),
   });
   host.spawn(host.chart('waiter'));
   await host.idle();

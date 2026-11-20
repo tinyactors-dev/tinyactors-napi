@@ -60,7 +60,7 @@ test('the module in a Chromium page and a module Worker, through both entries', 
 // Worker's in its own global. Under a policy that refuses string
 // evaluation, a host on the native datamodel is refused at its creation,
 // naming the directive, and compileCharts skips its syntax check.
-const NATIVE_LOGS = ['count=1:1', 'count=2:1', 'realm=iframe', 't=12:2:2', 't=14:3:2'];
+const NATIVE_LOGS = ['count=1:1', 'count=2:1', 'realm=iframe', 't=12:6:function', 't=14:7:function'];
 
 test('the native datamodel in a page (an iframe per host) and a Worker (its own global)', async () => {
   const pw = playwright();
@@ -142,7 +142,7 @@ test('a snapshot crosses neither way between the addon and a page: each refuses 
     return;
   }
   const compiled = compileCharts([{ name: 'c.scxml', text: '<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="c" initial="s"><state id="s"/></scxml>' }]);
-  const addon = new Host({ systemID: 't' });
+  const addon = new Host([], { system: 't' });
   addon.addImage(compiled.image);
   compiled.close();
   addon.spawn(addon.chart('c'));
@@ -157,7 +157,7 @@ test('a snapshot crosses neither way between the addon and a page: each refuses 
     const out = await page.evaluate(async ([u, bytes]) => (await import(u)).crossing(bytes), [napi('wasm/test/native.mjs'), snapshot]);
     assert.equal(out.refused?.[0], 'TA_ERROR_INVALID', String(out.refused));
     assert.match(out.refused[1], /^a snapshot of @tinyactors\/node: /);
-    assert.throws(() => Host.restore(new Uint8Array(out.own), { systemID: 't' }), (error) => error.status === 'TA_ERROR_INVALID' &&
+    assert.throws(() => Host.restore(new Uint8Array(out.own), [], { system: 't' }), (error) => error.status === 'TA_ERROR_INVALID' &&
       /^a snapshot of @tinyactors\/wasm: /.test(error.message));
   } finally {
     await browser.close();

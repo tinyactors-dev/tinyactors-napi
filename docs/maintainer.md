@@ -102,6 +102,13 @@ package's do? [l-p5-design-generator-addon, l-p5-datamodel-differences]
 make it a step of its own to move the addon to the generator sessions,
 behind the shared tests.
 
+**Answered (2026-11-19):** neither package keeps declaring sessions. The
+maintainer cut the declaring-chart context (root ROADMAP.md 8.6, items
+16 and 17): both packages run every session as a scope in the shared
+context, a chart-level script's functions are the chart's helpers, a
+top-level `var` is a variable of the session, and a top-level `let`,
+`const` or `class` is the script's `error.execution`.
+
 ### 6. Limits of the wasm package
 
 - **memory64** [l-p5-design-memory64]: wasm32 stops near two million

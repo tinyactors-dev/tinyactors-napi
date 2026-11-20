@@ -1,5 +1,9 @@
 # Telemetry
 
+This guide is part of operating a host (the README's [Operating a
+host](../../README.md#operating-a-host)); `decodeTraces`, which reads
+an export without a host, is the [wire format](../../README.md#wire-format)'s.
+
 Telemetry is optional: a host without it runs the same. Turn it on to see
 what your actors did in an OpenTelemetry backend.
 
@@ -19,7 +23,7 @@ the encoder wrote, as a `Buffer`, with its signal (`'traces'` or
 `'logs'`).
 
 ```js
-import { compileCharts, Host, SimulatedClock } from '@tinyactors/node';
+import { compileCharts, decodeTraces, Host, SimulatedClock } from '@tinyactors/node';
 
 const compiled = compileCharts([{ name: 'order.scxml', text: `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
@@ -32,23 +36,23 @@ const compiled = compileCharts([{ name: 'order.scxml', text: `
 
 const requests = [];
 const clock = new SimulatedClock();
-const host = new Host({
-  systemID: 'shop',
-  system: { ticksPerSecond: 1000 },                                        // the host's clock in milliseconds
-  telemetry: { flushInterval: 1000, resource: { 'service.name': 'shop' } }, // a request at most a second after its first record
-}, {
+const host = new Host(compiled, {
+  system: 'shop',
+  config: {
+    system: { ticksPerSecond: 1000 },                                        // the host's clock in milliseconds
+    telemetry: { flushInterval: 1000, resource: { 'service.name': 'shop' } }, // a request at most a second after its first record
+  },
   clock,
-  telemetry: (host, signal, data) => {
+  telemetry: (signal, data) => {
     // A real exporter posts the bytes, from a promise so the host goes on:
     // fetch(`${collector}/v1/${signal}`, { method: 'POST', headers: { 'content-type': 'application/x-protobuf' }, body: data })
     requests.push([signal, data]);
   },
 });
-host.addImage(compiled.image);
 compiled.close();
 
 const caller = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'; // a W3C traceparent, from an HTTP header
-host.send(host.spawn(host.chart('order')), 'pay', undefined, { traceparent: caller });
+host.spawn('order').send('pay', undefined, { traceparent: caller });
 await host.idle();
 console.log('requests before the flush interval:', requests.length);
 clock.increment(1000);
@@ -58,7 +62,7 @@ console.log('signals:', requests.map(([signal]) => signal).sort().join(', '));
 // Read the spans back (for a test; a collector does this for you).
 for (const [signal, data] of requests) {
   if (signal !== 'traces') continue;
-  const { spans } = await host.traceSpansDecode({ traces: data });
+  const spans = decodeTraces(data);
   const ours = spans.filter((span) => span.trace === '0af7651916cd43dd8448eb211c80319c');
   console.log('spans in the caller\'s trace:', ours.map((span) => span.name).sort().join(', '));
   const step = ours.find((span) => span.name === 'scxml.macrostep pay');
@@ -114,17 +118,20 @@ alive until then), and a test that asserts "no timer is left" first steps
 its clock past the flush:
 
 ```js
-import { Host, SimulatedClock } from '@tinyactors/node';
+import { compileCharts, Host, SimulatedClock } from '@tinyactors/node';
 
-const clock = new SimulatedClock();
-const host = new Host({ systemID: 'shop', system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 1000 } }, {
-  clock,
-  telemetry: (host, signal) => console.log(signal, 'at', clock.now),
-});
-host.addCharts({ 'job.scxml': `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="job">
+const compiled = compileCharts([{ name: 'job.scxml', text: `<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="job">
   <final id="done"/>
-</scxml>` });
-host.spawnChart('job');
+</scxml>` }]);
+const clock = new SimulatedClock();
+const host = new Host(compiled, {
+  system: 'shop',
+  config: { system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 1000 } },
+  clock,
+  telemetry: (signal) => console.log(signal, 'at', clock.now),
+});
+compiled.close();
+host.spawn('job');
 await host.idle();
 console.log('the job ended; nextDeadline', host.nextDeadline);
 clock.increment(host.nextDeadline ?? 0);
@@ -143,8 +150,9 @@ flushed; nextDeadline undefined
 ## Trace context
 
 The host carries W3C trace context through every step. An input may name
-the trace it continues: `host.send(session, event, data, { traceparent
-})` and `host.spawn(ref, { traceparent })` take a `traceparent` header's
+the trace it continues: `actor.send(event, data, { traceparent })`,
+`host.send(actor, event, data, { traceparent })` and `host.spawn(chart,
+{ traceparent })` take a `traceparent` header's
 text, and text that does not parse starts a new trace. Toward the
 outside, a send's `traceparent` is the sending step's context, for the
 header of the request your I/O processor makes, and `send.answer()`
@@ -160,18 +168,20 @@ const compiled = compileCharts([{ name: 'c.scxml', text: `
     <transition event="go"><send type="urn:example:api" event="call"/></transition>
   </state>
 </scxml>` }]);
-const host = new Host({ systemID: 'demo', ioProcessors: [{ type: 'urn:example:api' }] }, {
+const host = new Host(compiled, {
+  system: 'demo',
   ioProcessors: {
-    'urn:example:api': (host, send) => {
-      const [, trace] = send.traceparent.split('-');
-      console.log('the outgoing request continues trace', trace);
-      // fetch(url, { headers: { traceparent: send.traceparent } })
+    'urn:example:api': {
+      receive(send) {
+        const [, trace] = send.traceparent.split('-');
+        console.log('the outgoing request continues trace', trace);
+        // fetch(url, { headers: { traceparent: send.traceparent } })
+      },
     },
   },
 });
-host.addImage(compiled.image);
 compiled.close();
-host.send(host.spawn(host.chart('c')), 'go', undefined, {
+host.spawn('c').send('go', undefined, {
   traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
 });
 await host.idle();
@@ -206,11 +216,12 @@ compiled.close();
 
 const firstTrace = async (system) => {
   let trace;
-  const host = new Host({ systemID: 'demo', ioProcessors: [{ type: 'urn:example:api' }], system }, {
-    ioProcessors: { 'urn:example:api': (host, send) => { trace = send.traceparent.split('-')[1]; } },
+  const host = new Host(image, {
+    system: 'demo',
+    config: { system },
+    ioProcessors: { 'urn:example:api': { receive: (send) => { trace = send.traceparent.split('-')[1]; } } },
   });
-  host.addImage(image);
-  host.spawn(host.chart('c'));
+  host.spawn('c');
   await host.idle();
   host.close();
   return trace;
@@ -241,7 +252,8 @@ records:
   everything.
 - **`traceEnd()`** ends every open span now, as `close()` does.
 - **`traceSpansDecode({ traces })`** reads the spans of a traces request
-  back, as above.
+  back through the host. `decodeTraces(bytes)`, used above, needs no host
+  and also gives each span's `flags`, `links`, `resource` and `scope`.
 
 A rule matches by `chart`, `actor` (a trailing `*` makes it a prefix),
 `event` (SCXML's prefix rule), `session` or `from` (`'host'`, `'actor'`,
@@ -251,7 +263,7 @@ A rule matches by `chart`, `actor` (a trailing `*` makes it a prefix),
 ```js
 import { Host } from '@tinyactors/node';
 
-const host = new Host({ systemID: 'shop', telemetry: {} });
+const host = new Host([], { system: 'shop', config: { telemetry: {} } });
 await host.traceConfigure({ detail: 'summary', sample: 0.01 });
 console.log('1 trace in 100, summarized');
 const watch = await host.traceWatch({ rules: [{ chart: 'checkout', sample: 'keep', detail: 'full' }], seconds: 60 });

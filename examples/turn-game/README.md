@@ -46,7 +46,7 @@ the checkpoint:
   lobby `matchmaker.restarted`; the lobby, which holds the waiting list,
   gives it the waiting players again, in the order they joined. The
   chart is the record, and the service is a cache of it.
-- **Every session, name and address is the same.** `host.actorByName`
+- **Every session, name and address is the same.** `host.actor(name)`
   finds the lobby, the players and the matches under their old sessions,
   and inputs reach players and matches by address
   (`tinyactors://game/@match-3`), as the charts reach each other.
@@ -141,7 +141,7 @@ it out of the handler first, so the demo rarely sees one.
 - **I/O processors**: the spectator feed (`urn:game:spectators`), the
   matches' output to the world; and `urn:game:control`, through which the
   lobby has the application spawn a match.
-- **Named actors and addresses** (`host.actorByName`, `host.send` to
+- **Named actors and addresses** (`host.actor(name)`, `host.send` to
   `tinyactors://game/@<name>`): clients and charts find players and
   matches by name, before and after a restore.
 - **A `SimulatedClock`** for the replay, to move time to each journaled

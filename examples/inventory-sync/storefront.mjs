@@ -5,7 +5,7 @@
 // warehouse, and tell the customer each step through urn:shop:customer.
 import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
-import { Host } from '@tinyactors/node';
+import { compileCharts, Host, StaleError } from '@tinyactors/node';
 import { Link } from './link.mjs';
 import { STOREFRONT, WAREHOUSE } from './warehouse.mjs';
 
@@ -33,14 +33,16 @@ export class Storefront {
   constructor({ timing = {}, clock, datamodel, fault, trace } = {}) {
     this.timing = timing;
     this.link = new Link({ system: STOREFRONT, peer: WAREHOUSE, fault, trace });
-    this.host = new Host({ systemID: STOREFRONT, ioProcessors: [{ type: 'urn:shop:customer' }] }, {
+    const compiled = compileCharts([{ name: 'cart.scxml', text: CART_CHART }]);
+    this.host = new Host(compiled, {
+      system: STOREFRONT,
       clock,
       datamodel,
       transport: this.link.transport,
-      ioProcessors: { 'urn:shop:customer': (host, send) => this.#notify({ event: send.event, ...send.data }) },
-      log: (host, entry) => this.logs.push(`${entry.label}: ${entry.text}`),
+      ioProcessors: { 'urn:shop:customer': { receive: (send) => this.#notify({ event: send.event, ...send.data }) } },
+      log: (entry) => this.logs.push(`${entry.label}: ${entry.text}`),
     });
-    this.host.addCharts({ 'cart.scxml': CART_CHART });
+    compiled.close();
     this.link.host = this.host;
   }
 
@@ -57,7 +59,7 @@ export class Storefront {
 
   /** Opens a cart: an actor named `cart`. */
   open(cart) {
-    return this.host.spawnChart('cart', { name: cart, params: this.timing });
+    return this.host.spawn('cart', { name: cart, params: this.timing });
   }
 
   add(cart, sku, qty) { return this.#tell(cart, 'add', { sku, qty }); }
@@ -86,9 +88,12 @@ export class Storefront {
   /** Sends the customer's request to the cart; false when there is no such
    * cart any more (its order ended, or it never was). */
   #tell(cart, event, data) {
-    const session = this.host.actorByName(cart);
-    if (session === undefined) return false;
-    this.host.send(session, event, data);
+    try {
+      this.host.actor(cart).send(event, data);
+    } catch (error) {
+      if (error instanceof StaleError) return false;
+      throw error;
+    }
     return true;
   }
 

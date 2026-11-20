@@ -48,7 +48,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Address, compileCharts, compileSystem, Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
+import { Address, compileCharts, compileSystem, Host, SimulatedClock, StaleError, TinyactorsError } from '@tinyactors/node';
 import { BATCH, engine, random, Store } from './store.mjs';
 
 /** The most the cost at 2N may be of the cost at N. */
@@ -239,7 +239,7 @@ class Clock {
 /** The actors `host` holds, resident and hibernated (host.stats). */
 async function actorsOf(host) {
   let got;
-  host.hostStats(undefined, (h, result) => (got = Number(result.host.actors)), (h, error) => { throw error; });
+  host.hostStats(undefined, (result) => (got = Number(result.host.actors)), (error) => { throw error; });
   await host.idle();
   return got;
 }
@@ -254,8 +254,8 @@ async function elapsed(body) {
 /** The answers to `count` calls of a typed method, made by `call(i, onResult, onError)`. */
 function answering(count) {
   const answers = { results: [], errors: [] };
-  answers.onResult = (h, result) => answers.results.push(result);
-  answers.onError = (h, error) => answers.errors.push(error);
+  answers.onResult = (result) => answers.results.push(result);
+  answers.onError = (error) => answers.errors.push(error);
   answers.all = () => answers.results.length + answers.errors.length === count;
   return answers;
 }
@@ -320,22 +320,27 @@ async function hibernated(o, results, failures) {
     const i = Number(session - base);
     return i >= 0 && i < N && sessions[i] === session ? i : -1;
   };
-  const wake = (host, session) => {
-    const i = index(session);
-    if (i < 0 || (state[i] !== HIBERNATED && state[i] !== DYING)) return; // woken already (by the gate itself)
-    host.wake(session, store.get(session));
-    if (state[i] === DYING) {
-      state[i] = GONE;
-      return;
-    }
-    state[i] = RESIDENT_;
-    resident.add(i);
+  // the host's store: a WAKE loads the blob (the host wakes the actor and
+  // deletes the blob); what the gate keeps of each actor follows
+  const tracked = {
+    save: (session, blob) => store.save(session, blob),
+    load: (session) => {
+      const i = index(session);
+      const blob = store.load(session);
+      if (i >= 0 && state[i] === DYING) state[i] = GONE;
+      else if (i >= 0) {
+        state[i] = RESIDENT_;
+        resident.add(i);
+      }
+      return blob;
+    },
+    delete: (session) => store.delete(session),
   };
-  const putBack = (host, list) => { // hibernate again, into the store
+  const putBack = (list) => { // hibernate again, into the store
     for (const i of list) {
       if (state[i] !== RESIDENT_) continue;
       try {
-        store.put(sessions[i], host.hibernate(sessions[i]));
+        store.save(sessions[i], host.hibernate(sessions[i]));
       } catch (error) {
         if (!(error instanceof TinyactorsError) || error.status !== 'TA_ERROR_STATE') throw error;
         continue;
@@ -355,10 +360,10 @@ async function hibernated(o, results, failures) {
 
   // services: one per invoker, answering each ping with a pong
   const services = { started: 0, pings: 0 };
-  const startService = (host, invocation) => {
+  const startService = (invocation) => {
     services.started++;
     return {
-      receive(h, send) {
+      receive(send) {
         services.pings++;
         invocation.sendBack('pong');
       },
@@ -370,8 +375,6 @@ async function hibernated(o, results, failures) {
   const room = RESIDENT + 2 * I + Q + 16 * BATCH;
   const events = 16384 + Q + (o.datamodel === 'quickjs' ? room : 0);
   const config = {
-    systemID: 'scale',
-    ioProcessors: [{ type: 'urn:scale:echo' }],
     telemetry: {}, // metrics(), and trace.end with something to end
     system: {
       maxActors: N + room, maxEvents: events, maxRequests: I + 4096, maxTimers: 4096,
@@ -381,9 +384,9 @@ async function hibernated(o, results, failures) {
   // the other system of the transport round trip
   let host;
   let returned = 0;
-  const other = new Host({ systemID: 'other' }, {
+  const other = new Host([], { system: 'other', 
     ...engine(o.datamodel),
-    transport: (h, send) => {
+    transport: (send) => {
       host.send(send.message);
       returned++;
     },
@@ -393,7 +396,7 @@ async function hibernated(o, results, failures) {
     other.addImage(compiled.image);
     compiled.close();
   }
-  const echo = Address.fromSession('other', other.spawn(other.chart('echo'))).text;
+  const echo = Address.fromSession('other', other.spawn(other.chart('echo')).id).text;
   await other.idle();
 
   const simulated = new SimulatedClock();
@@ -401,14 +404,14 @@ async function hibernated(o, results, failures) {
     ...engine(o.datamodel),
     clock: simulated,
     telemetry: () => {}, // exported nowhere
-    wake,
+    store: tracked,
     services: { 'urn:scale:service': startService },
-    ioProcessors: { 'urn:scale:echo': (h, send) => { ioProcessed.count++; send.answer('answer'); } },
-    transport: (h, send) => other.send(send.message),
-    migrationDone: (h, result) => { migrationsDone.count++; migrationsDone.failed += result.failed.length; },
+    ioProcessors: { 'urn:scale:echo': { receive: (send) => { ioProcessed.count++; send.answer('answer'); } } },
+    transport: (send) => other.send(send.message),
+    migrationDone: (result) => { migrationsDone.count++; migrationsDone.failed += result.failed.length; },
   };
-  host = new Host(config, handlers);
-  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, (b, source) => FILES[source]);
+  host = new Host([], { system: 'scale', config, ...handlers });
+  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, { resolver: (b, source) => FILES[source] });
   const segment = host.addImage(compiled.image);
   compiled.close();
   const counter = host.chart('counter');
@@ -418,12 +421,12 @@ async function hibernated(o, results, failures) {
   let ms = await elapsed(async () => {
     let oldest = 0;
     for (let i = 0; i < N; i++) {
-      sessions[i] = host.spawn(counter);
+      sessions[i] = host.spawn(counter).id;
       state[i] = RESIDENT_;
       if (i - oldest + 1 >= RESIDENT + BATCH) {
         await host.idle();
         for (const end = oldest + BATCH; oldest < end; oldest++) {
-          store.put(sessions[oldest], host.hibernate(sessions[oldest]));
+          store.save(sessions[oldest], host.hibernate(sessions[oldest]));
           state[oldest] = HIBERNATED;
         }
       }
@@ -492,7 +495,7 @@ async function hibernated(o, results, failures) {
       await host.idle();
     });
     if (chosen.some((i) => state[i] !== RESIDENT_)) failures.push('an event did not wake its actor');
-    putBack(host, chosen);
+    putBack(chosen);
     return { ms: t, calls: chosen.length };
   });
   await clock.time('hibernate', 'per call', async () => {
@@ -507,7 +510,7 @@ async function hibernated(o, results, failures) {
   });
   await clock.time('wake', 'per call', async () => {
     const chosen = pickHibernated(32);
-    const blobs = chosen.map((i) => store.get(sessions[i]));
+    const blobs = chosen.map((i) => store.load(sessions[i]));
     const t = await elapsed(async () => {
       chosen.forEach((i, k) => host.wake(sessions[i], blobs[k]));
       await host.idle();
@@ -516,7 +519,7 @@ async function hibernated(o, results, failures) {
       state[i] = RESIDENT_;
       resident.add(i);
     }
-    putBack(host, chosen);
+    putBack(chosen);
     return { ms: t, calls: chosen.length };
   });
   // Q hibernated actors get an event each, so each waits in core's queue of
@@ -527,10 +530,10 @@ async function hibernated(o, results, failures) {
     for (let first = 0; first < chosen.length; first += BATCH)
       host.sendMany(chosen.slice(first, first + BATCH).map((i) => ({ target: sessions[i], event: 'inc' })));
     const last = chosen.slice(-Math.min(128, chosen.length >> 1));
-    const blobs = last.map((i) => store.get(sessions[i]));
+    const blobs = last.map((i) => store.load(sessions[i]));
     const t = await elapsed(() => act(last, blobs));
     await host.idle(); // the rest: asked for, woken from the store
-    putBack(host, chosen);
+    putBack(chosen);
     return { ms: t, calls: last.length };
   };
   await clock.time('wake (an event waiting)', 'per call', () => queued((last, blobs) => {
@@ -558,14 +561,18 @@ async function hibernated(o, results, failures) {
     if (chosen.some((i) => state[i] !== GONE)) failures.push('a terminated hibernated actor was not asked for');
     return { ms: t, calls: chosen.length };
   }, { batches: 4 }); // each batch ends 64 actors
-  await clock.time('actorByName', 'per call', async () => {
+  await clock.time('actor (by name)', 'per call', async () => {
     let found;
     let missing;
     const t = await elapsed(() => {
-      found = host.actorByName('probe');
-      missing = host.actorByName('nobody');
+      found = host.actor('probe');
+      try {
+        missing = host.actor('nobody');
+      } catch (error) {
+        if (!(error instanceof StaleError)) throw error;
+      }
     });
-    if (found !== probe || missing !== undefined) failures.push(`actorByName: ${found}, ${missing}`);
+    if (!found.equals(probe) || missing !== undefined) failures.push(`actor by name: ${found}, ${missing}`);
     return { ms: t, calls: 2 };
   });
   await clock.time('boot', 'per call', async () => {
@@ -674,7 +681,7 @@ async function hibernated(o, results, failures) {
       let cursor = 0;
       while (cursor !== null) {
         let page;
-        host.actorList({ limit: 512, cursor }, (h, result) => (page = result), (h, error) => { throw error; });
+        host.actorList({ limit: 512, cursor }, (result) => (page = result), (error) => { throw error; });
         await host.idle();
         listed += page.sessions.length;
         cursor = page.cursor;
@@ -708,7 +715,7 @@ async function hibernated(o, results, failures) {
   // snapshot, restore, close: per actor
   total = await actorsOf(host);
   store.flush();
-  await snapshots(host, config, { ...handlers, wake: () => {}, services: { 'urn:scale:service': () => ({}) } }, clock, total, o);
+  await snapshots(host, config, { ...handlers, store: undefined, services: { 'urn:scale:service': () => ({}) } }, clock, total, o);
   other.close();
   rmSync(directory, { recursive: true, force: true });
 }
@@ -754,7 +761,7 @@ async function snapshots(host, config, handlers, clock, total, o, then) {
   await clock.time('restore (and its first turn)', 'per actor', async () => {
     let restored;
     const t = await elapsed(async () => {
-      restored = Host.restore(blob, config, { ...handlers, clock: new SimulatedClock() });
+      restored = Host.restore(blob, [], { system: 'scale', config, ...handlers, clock: new SimulatedClock() });
       await restored.idle();
     });
     if (++round === samples && then) {
@@ -778,12 +785,12 @@ async function residentScenario(o, results, failures) {
   const handlers = {
     ...engine(o.datamodel),
     clock: new SimulatedClock(),
-    migrationDone: (h, result) => { migrationsDone.count++; migrationsDone.failed += result.failed.length; migrationsDone.migrated += result.migrated; },
+    migrationDone: (result) => { migrationsDone.count++; migrationsDone.failed += result.failed.length; migrationsDone.migrated += result.migrated; },
   };
   // no pools sized: the segment grows from core's defaults as the actors come
-  const config = { systemID: 'scale', system: { tracing: false } };
-  const host = new Host(config, handlers);
-  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, (b, source) => FILES[source]);
+  const config = { system: { tracing: false } };
+  const host = new Host([], { system: 'scale', config, ...handlers });
+  const compiled = compileSystem({ name: 'system.xml', text: SYSTEM }, { resolver: (b, source) => FILES[source] });
   host.addImage(compiled.image);
   compiled.close();
   const counter = host.chart('counter');
@@ -793,7 +800,7 @@ async function residentScenario(o, results, failures) {
   console.log(`resident: ${N} actors, all in memory`);
   const ms = await elapsed(async () => {
     for (let i = 0; i < N; i++) {
-      sessions[i] = host.spawn(counter);
+      sessions[i] = host.spawn(counter).id;
       live.add(i);
       if (i % 4096 === 4095) await host.idle();
     }
@@ -837,7 +844,7 @@ async function residentScenario(o, results, failures) {
       for (const i of chosen) host.terminate(sessions[i]);
       await host.idle();
     });
-    for (const i of chosen) sessions[i] = host.spawn(counter); // the population stays as large
+    for (const i of chosen) sessions[i] = host.spawn(counter).id; // the population stays as large
     await host.idle();
     return { ms: t, calls: chosen.length };
   });
@@ -859,14 +866,18 @@ async function residentScenario(o, results, failures) {
     total -= last.length;
     return { ms: t, calls: last.length };
   }, { batches: 1 });
-  await clock.time('actorByName', 'per call', async () => {
+  await clock.time('actor (by name)', 'per call', async () => {
     let found;
     let missing;
     const t = await elapsed(() => {
-      found = host.actorByName('probe');
-      missing = host.actorByName('nobody');
+      found = host.actor('probe');
+      try {
+        missing = host.actor('nobody');
+      } catch (error) {
+        if (!(error instanceof StaleError)) throw error;
+      }
     });
-    if (found !== probe || missing !== undefined) failures.push(`actorByName: ${found}, ${missing}`);
+    if (!found.equals(probe) || missing !== undefined) failures.push(`actor by name: ${found}, ${missing}`);
     return { ms: t, calls: 2 };
   });
   await clock.time('hostStats', 'per call', async () => {
@@ -883,7 +894,7 @@ async function residentScenario(o, results, failures) {
       let cursor = 0;
       while (cursor !== null) {
         let page;
-        host.actorList({ limit: 512, cursor }, (h, result) => (page = result), (h, error) => { throw error; });
+        host.actorList({ limit: 512, cursor }, (result) => (page = result), (error) => { throw error; });
         await host.idle();
         listed += page.sessions.length;
         cursor = page.cursor;

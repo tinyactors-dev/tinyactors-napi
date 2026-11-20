@@ -41,7 +41,7 @@ async def main():
     chart = (pathlib.Path(__file__).parent / "charts" / "pong.scxml").read_text(encoding="utf-8")
     peer = {"writer": None}           # the one connection, from the Node system
 
-    def transport(host, send):
+    def transport(send):
         """Every send to another system: the message goes to the peer, or fails."""
         writer = peer["writer"]
         if writer is None or writer.is_closing():
@@ -49,13 +49,13 @@ async def main():
             return
         writer.write(frame("message.send", send.message))
 
-    def log(host, entry):
+    def log(entry):
         emit({"label": entry.label, "text": entry.text})
 
-    async with tinyactors.Host({"systemID": SYSTEM}, log=log, transport=transport) as host:
-        with tinyactors.compile_charts([("pong.scxml", chart)]) as compiled:
-            host.add_image(compiled.image)
-        host.spawn(host.chart("pong"), name="pong")
+    with tinyactors.compile_charts([("pong.scxml", chart)]) as compiled:
+        image = compiled.image         # bytes: the host copies them
+    async with tinyactors.Host(image, system=SYSTEM, log=log, transport=transport) as host:
+        host.spawn("pong", name="pong")
 
         def receive(writer, notification):
             if not isinstance(notification, dict) or not isinstance(notification.get("params"), dict):

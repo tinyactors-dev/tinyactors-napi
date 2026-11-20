@@ -43,30 +43,29 @@
     <data id="outcome" expr="null"/>
   </datamodel>
 
-  <!-- Helpers declared at the chart level. A script that declares
-       top-level functions gives each actor a context of its own, so the
-       functions see this actor's variables. -->
+  <!-- Helpers declared at the chart level: the chart's, made once for
+       every document, so they see no document's variables by name and
+       take what they read as arguments. -->
   <script><![CDATA[
     function ms(n) { return Math.max(0, Math.round(n)) + 'ms'; }
-    function legalFirst() { return amount >= legalFirstAt; }
+    function legalFirst(amount, threshold) { return amount >= threshold; }
     function escapeXML(text) {
       return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;')
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
-    function approvalXML(stage) {
-      var a = approvals[stage];
+    function approvalXML(stage, a) {
       return '  <approval stage="' + stage + '" by="' + escapeXML(a.by) + '">' + escapeXML(a.note) + '</approval>\n';
     }
-    function metadataXML() {
-      var xml = '<document id="' + escapeXML(docID) + '" version="' + version + '">\n'
-        + '  <title>' + escapeXML(title) + '</title>\n'
-        + '  <author>' + escapeXML(author) + '</author>\n'
-        + '  <amount currency="EUR">' + amount + '</amount>\n';
-      for (var stage of ['legal', 'finance', 'signoff']) if (approvals[stage]) xml += approvalXML(stage);
-      for (var c of changeRequests) {
+    function metadataXML(d) {
+      var xml = '<document id="' + escapeXML(d.docID) + '" version="' + d.version + '">\n'
+        + '  <title>' + escapeXML(d.title) + '</title>\n'
+        + '  <author>' + escapeXML(d.author) + '</author>\n'
+        + '  <amount currency="EUR">' + d.amount + '</amount>\n';
+      for (var stage of ['legal', 'finance', 'signoff']) if (d.approvals[stage]) xml += approvalXML(stage, d.approvals[stage]);
+      for (var c of d.changeRequests) {
         xml += '  <changes stage="' + c.stage + '" by="' + escapeXML(c.by) + '" version="' + c.version + '">' + escapeXML(c.note) + '</changes>\n';
       }
-      for (var e of escalations) xml += '  <escalation stage="' + e.stage + '" version="' + e.version + '"/>\n';
+      for (var e of d.escalations) xml += '  <escalation stage="' + e.stage + '" version="' + e.version + '"/>\n';
       return xml + '</document>\n';
     }
   ]]></script>
@@ -166,7 +165,7 @@
           </state>
           <state id="financeReviewing">
             <!-- A large amount needs legal's approval first. -->
-            <transition event="finance.approve" cond="!legalFirst() || In('legalApproved')" target="financeApproved">
+            <transition event="finance.approve" cond="!legalFirst(amount, legalFirstAt) || In('legalApproved')" target="financeApproved">
               <assign location="financeNote" expr="_event.data.note ?? ''"/>
             </transition>
             <transition event="finance.approve">
@@ -272,7 +271,7 @@
       <onentry>
         <assign location="archiveAttempts" expr="archiveAttempts + 1"/>
         <send type="urn:approval:archive" event="archive.store">
-          <content expr="metadataXML()"/>
+          <content expr="metadataXML({ docID, version, title, author, amount, approvals, changeRequests, escalations })"/>
         </send>
       </onentry>
       <transition event="archived" target="approved">

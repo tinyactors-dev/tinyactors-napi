@@ -5,7 +5,7 @@
 // `bun test ./test.mjs`).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Host, SimulatedClock } from '@tinyactors/node';
+import { Host, SimulatedClock, StaleError } from '@tinyactors/node';
 import { Gateway } from './gateway.mjs';
 import { run } from './main.mjs';
 import { Collector, Upstream } from './world.mjs';
@@ -223,7 +223,7 @@ for (const datamodel of ['native', 'quickjs']) {
       clock.increment(1);
       await gateway.host.idle();
       assert.deepEqual(gateway.closed.map(({ reason, requests, limited }) => ({ reason, requests, limited })), [{ reason: 'idle', requests: 2, limited: 0 }]);
-      assert.equal(gateway.host.actorByName(token), undefined, 'the actor has ended');
+      assert.throws(() => gateway.host.actor(token), StaleError, 'the actor has ended');
       const late = await call(url, token, '/api/items');
       assert.equal(late.status, 401);
       // the encoder's flush is a deadline too (docs/log.xml,
@@ -285,7 +285,7 @@ for (const datamodel of ['native', 'quickjs']) {
     }
     // after the close, which sent the last requests and waited for them
     assert.equal(gateway.exportFailures, 0);
-    decoder = new Host({ systemID: 'decoder', telemetry: {} });
+    decoder = new Host([], { system: 'decoder', config: { telemetry: {} } });
     try {
       const spans = [];
       for (const traces of collector.bodies('traces')) spans.push(...(await decoder.traceSpansDecode({ traces })).spans);

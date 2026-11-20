@@ -105,7 +105,7 @@ async function engineHeap() {
 
 function region(host) {
   return new Promise((resolve, reject) => {
-    host.hostStats(undefined, (_host, result) => resolve(result.host.regionBytes), (_host, error) => reject(error));
+    host.hostStats(undefined, (result) => resolve(result.host.regionBytes), (error) => reject(error));
   });
 }
 
@@ -121,8 +121,8 @@ async function measure(datamodel, actors) {
   const collect = await collector();
   // every pool sized for the population, so nothing grows: a segment that grows doubles every pool
   // (quickjs keeps each actor's last event, so maxEvents counts the actors); tracing off
-  const config = { systemID: 'measure', system: { maxActors: actors + 16, maxEvents: actors + 4096, tracing: false } };
-  const host = new Host(config, { datamodel });
+  const config = { system: { maxActors: actors + 16, maxEvents: actors + 4096, tracing: false } };
+  const host = new Host([], { system: 'measure', config, datamodel });
   try {
     const compiled = compileCharts([{ name: 'fit.scxml', text: CHART }]);
     host.addImage(compiled.image);
@@ -134,7 +134,7 @@ async function measure(datamodel, actors) {
     await host.idle();
     const before = await sample(host, collect);
     const sessions = new BigInt64Array(actors); // 8 B an actor, in heap (external)
-    for (let i = 0; i < actors; i++) sessions[i] = host.spawn(chart);
+    for (let i = 0; i < actors; i++) sessions[i] = host.spawn(chart).id;
     await host.idle();
     const after = await sample(host, collect);
     for (let first = 0; first < actors; first += 256) { // one event each: each keeps its _event

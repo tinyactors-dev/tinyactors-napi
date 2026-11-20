@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, StaleError } from '@tinyactors/node';
 
 const SESSION_CHART = readFileSync(new URL('./charts/session.scxml', import.meta.url), 'utf8');
 
@@ -50,23 +50,22 @@ export class Gateway {
     this.forwarding = 0;
     this.nextRequest = 1;
 
-    this.host = new Host(
-      {
-        systemID: 'gateway',
-        ioProcessors: [{ type: 'urn:gateway:upstream' }, { type: 'urn:gateway:http' }],
-        system: { ticksPerSecond: 1000, traceSeed },
-        // a request at most a second after its first record
-        ...(this.collector && { telemetry: { flushInterval: 1000, resource: { 'service.name': 'http-gateway' } } }),
-      },
-      {
+    const compiled = compileCharts([{ name: 'session.scxml', text: SESSION_CHART }]);
+    this.host = new Host(compiled, {
+        system: 'gateway',
+        config: {
+          system: { ticksPerSecond: 1000, traceSeed },
+          // a request at most a second after its first record
+          ...(this.collector && { telemetry: { flushInterval: 1000, resource: { 'service.name': 'http-gateway' } } }),
+        },
         clock,
         datamodel,
         ioProcessors: {
           // The request to the upstream, answered when the upstream answers:
-          // an async handler, so its send stays readable after the await. A
+          // an async receive, so its send stays readable after the await. A
           // connection that fails fails the send: the chart gets
           // error.communication with its sendid.
-          'urn:gateway:upstream': async (host, send) => {
+          'urn:gateway:upstream': { receive: async (send) => {
             const { requestID, method, path, body, client } = send.data;
             let answer;
             this.forwarding++;
@@ -90,20 +89,19 @@ export class Gateway {
             // is left to tell. A session that ended meanwhile (a logout, an
             // expiry) makes answer() and fail() deliver nothing and give
             // false.
-            if (host.closed) return;
+            if (send.host.closed) return;
             if (answer === undefined) send.fail();
             else send.answer('upstream.response', answer);
-          },
-          'urn:gateway:http': (host, send) => {
+          } },
+          'urn:gateway:http': { receive: (send) => {
             if (send.event === 'respond') this.respond(send.data, send.traceparent);
             else if (send.event === 'closed') this.sessionClosed(send.session, send.data);
-          },
+          } },
         },
-        log: (host, entry) => this.logs.push(`${entry.label}: ${entry.text}`),
-        ...(this.collector && { telemetry: (host, signal, data) => this.export(signal, data) }),
-      },
-    );
-    this.host.addCharts({ 'session.scxml': SESSION_CHART });
+        log: (entry) => this.logs.push(`${entry.label}: ${entry.text}`),
+        ...(this.collector && { telemetry: (signal, data) => this.export(signal, data) }),
+      });
+    compiled.close();
     this.server = createServer((req, res) => this.serve(req, res));
   }
 
@@ -120,7 +118,7 @@ export class Gateway {
     if (key === undefined) return { status: 403, body: { error: 'unknown API key' } };
     const token = randomUUID();
     const limits = this.plans[key.plan];
-    this.host.spawnChart('session', { name: token, params: { client: key.client, ...limits } });
+    this.host.spawn('session', { name: token, params: { client: key.client, ...limits } });
     return { status: 201, body: { token, plan: key.plan, limits } };
   }
 
@@ -128,16 +126,21 @@ export class Gateway {
    * `'logout'`. Resolves with the response, `{ status, headers, body }`,
    * when the chart (or the session's end) answers it. */
   dispatch({ token, kind = 'request', method = 'GET', path = '/', body = '', traceparent }) {
-    const session = token === undefined ? undefined : this.host.actorByName(token);
-    if (session === undefined) return Promise.resolve(this.unauthorized(traceparent));
-    const requestID = `r${this.nextRequest++}`;
-    const response = new Promise((resolve) => this.pending.set(requestID, { resolve, session }));
+    let actor;
     try {
-      this.host.send(session, kind, { requestID, method, path, body }, { traceparent });
+      if (token !== undefined) actor = this.host.actor(token);
+    } catch (error) {
+      if (!(error instanceof StaleError)) throw error; // no live session of that token
+    }
+    if (actor === undefined) return Promise.resolve(this.unauthorized(traceparent));
+    const requestID = `r${this.nextRequest++}`;
+    const response = new Promise((resolve) => this.pending.set(requestID, { resolve, session: actor.id }));
+    try {
+      actor.send(kind, { requestID, method, path, body }, { traceparent });
     } catch (error) {
       // the session ended between the lookup and the send
       this.pending.delete(requestID);
-      if (error instanceof TinyactorsError && error.status === 'TA_ERROR_STALE') return Promise.resolve(this.unauthorized(traceparent));
+      if (error instanceof StaleError) return Promise.resolve(this.unauthorized(traceparent));
       throw error;
     }
     return response;

@@ -4,7 +4,7 @@
 // export (its kind, a function's name and length, a class's prototype
 // chain, its prototype's and its static members, each member's kind,
 // length and attributes), the objects the API hands out (a compile
-// result, a chart reference, a send view and the record a promise-returning
+// result, a chart reference, an actor, a send view and the record a promise-returning
 // handler gets, a log entry, an invocation, a migration's result and its
 // Migrated view, a diagnostic, an address, a clock, a host, the errors),
 // and what a set of misuses throws (the class and core's status).
@@ -59,7 +59,13 @@ function functionShape(fn) {
   if (prototype !== undefined && prototype.value !== undefined && Reflect.ownKeys(prototype.value).length > 1) {
     out.kind = 'class';
     out.extends = chain(prototype.value);
-    out.prototype = members(prototype.value, ['constructor']);
+    // its prototype's members and those it inherits from the package's own
+    // classes (the convenience layer's Host over the direct layer's), not
+    // from the language's Object and Error
+    out.prototype = {};
+    for (let p = prototype.value; p !== null && p !== Object.prototype && p !== Error.prototype; p = Object.getPrototypeOf(p)) {
+      out.prototype = { ...members(p, ['constructor']), ...out.prototype };
+    }
     out.static = members(fn, ['length', 'name', 'prototype']);
   }
   return out;
@@ -122,7 +128,6 @@ const shapes = { exports: {}, objects: {}, refusals: {} };
 for (const [name, value] of Object.entries(tinyactors).sort(([a], [b]) => (a < b ? -1 : 1))) shapes.exports[name] = exportShape(value);
 
 const objects = shapes.objects;
-const config = { systemID: 't', telemetry: {}, ioProcessors: [{ type: 'http://www.w3.org/TR/scxml/#BasicHTTPEventProcessor' }] };
 const compiled = compileCharts(CHARTS);
 objects.Compiled = objectShape(compiled);
 objects.Diagnostic = compiled.diagnostics.length > 0 ? objectShape(compiled.diagnostics[0]) : 'none';
@@ -132,11 +137,13 @@ objects.image = { constructor: Object.getPrototypeOf(image).constructor.name, is
 const clock = new SimulatedClock();
 objects.SimulatedClock = objectShape(clock);
 const seen = {};
-const host = new Host(config, {
+const host = new Host([], {
+  system: 't',
+  config: { telemetry: {} },
   clock,
   telemetry: () => {},
   ioProcessors: {
-    'http://www.w3.org/TR/scxml/#BasicHTTPEventProcessor': (h, send) => {
+    'http://www.w3.org/TR/scxml/#BasicHTTPEventProcessor': { receive: (send) => {
       if (send.event === 'out') {
         seen.Send = objectShape(send);
         seen.message = objectShape(send.message);
@@ -145,21 +152,21 @@ const host = new Host(config, {
       return Promise.resolve().then(() => {
         seen.record = objectShape(send);
       });
-    },
+    } },
   },
-  log: (h, entry) => {
+  log: (entry) => {
     seen.LogEntry = objectShape(entry);
   },
   services: {
-    thing: (h, invocation) => {
+    thing: (invocation) => {
       seen.Invocation = objectShape(invocation);
       return { receive() {}, stop() {} };
     },
   },
-  migrated: (h, migrated) => {
+  migrated: (migrated) => {
     seen.Migrated = objectShape(migrated);
   },
-  migrationDone: (h, result) => {
+  migrationDone: (result) => {
     seen.MigrationResult = objectShape(result);
   },
 });
@@ -168,9 +175,16 @@ const segment = host.addImage(image);
 compiled.close();
 const ref = host.chart('main');
 objects.ChartRef = objectShape(ref);
-const session = host.spawn(ref, { name: 'one' });
-host.spawn(host.chart('plain')); // an actor with no invocation running, to migrate
+const actor = host.spawn(ref, { name: 'one' });
+objects.Actor = objectShape(actor);
+const session = actor.id;
+host.spawn('plain'); // an actor with no invocation running, to migrate
 objects.session = typeof session;
+objects.MemoryStore = objectShape(new tinyactors.MemoryStore());
+objects.Spawner = objectShape(new tinyactors.Spawner());
+const sqlite = new tinyactors.SQLiteStore(':memory:');
+objects.SQLiteStore = objectShape(sqlite);
+sqlite.close();
 await host.idle();
 objects.snapshot = Object.getPrototypeOf(host.snapshot()).constructor.name;
 host.addImage(image);
@@ -200,11 +214,14 @@ function refusalError(body) {
 // misuses, each refused the same way by both packages
 const refusals = shapes.refusals;
 refusals['new Host without a config'] = refusal(() => new Host());
-refusals['new Host with an unknown option'] = refusal(() => new Host({ systemID: 't' }, { nonsense: 1 }));
-refusals['new Host with a bad config'] = refusal(() => new Host({ systemID: 't', system: { maxActors: -1 } }));
-refusals['new Host with datamodel quickjs'] = refusal(() => new Host({ systemID: 't' }, { datamodel: 'quickjs' }).close());
-refusals['new Host with an unknown datamodel'] = refusal(() => new Host({ systemID: 't' }, { datamodel: 'lua' }));
+refusals['new Host with an unknown option'] = refusal(() => new Host([], { system: 't', nonsense: 1 }));
+refusals['new Host with a bad config'] = refusal(() => new Host([], { system: 't', config: { system: { maxActors: -1 } } }));
+refusals['new Host with datamodel quickjs'] = refusal(() => new Host([], { system: 't', datamodel: 'quickjs' }).close());
+refusals['new Host with an unknown datamodel'] = refusal(() => new Host([], { system: 't', datamodel: 'lua' }));
 refusals['host.chart of an unknown chart'] = refusal(() => host.chart('nothing'));
+refusals['host.actor of a name nobody has'] = refusal(() => host.actor('nobody'));
+refusals['new Host with a config holding systemID'] = refusal(() => new Host([], { system: 't', config: { systemID: 't' } }));
+refusals['new Host with a processor that is a function'] = refusal(() => new Host([], { system: 't', ioProcessors: { x: () => {} } }));
 refusals['host.spawn of a bad reference'] = refusal(() => host.spawn({ segment: 99, chart: 0 }));
 refusals['host.send of an unknown event type'] = refusal(() => host.send(session, 1));
 refusals['host.send of a function'] = refusal(() => host.send(session, 'e', () => 1));
@@ -212,7 +229,7 @@ refusals['host.send to a session that never was'] = refusal(() => host.send(1234
 refusals['host.addImage of garbage'] = refusal(() => host.addImage(new Uint8Array(8)));
 refusals['host.hibernate of a session that never was'] = refusal(() => host.hibernate(123456));
 refusals['host.wake with garbage'] = refusal(() => host.wake(123456, new Uint8Array(8)));
-refusals['Host.restore of garbage'] = refusal(() => Host.restore(new Uint8Array(16), config));
+refusals['Host.restore of garbage'] = refusal(() => Host.restore(new Uint8Array(16), [], { system: 't' }));
 refusals['compileCharts of nothing'] = refusal(() => compileCharts([]));
 refusals['compileCharts of a broken chart'] = refusal(() => compileCharts([{ name: 'bad.scxml', text: '<scxml' }]));
 refusals['compiled.image after close'] = refusal(() => {
@@ -230,7 +247,7 @@ refusals['clock.increment of a negative time'] = refusal(() => clock.increment(-
 refusals['a method of Host called on another object'] = refusal(() => Host.prototype.spawn.call({}, ref));
 // a typed method's error: the class, core's status, its JSON-RPC code and reason
 const replied = (method, params) => new Promise((resolve) => {
-  host[method](params, () => resolve('answered'), (h, error) => resolve({
+  host[method](params, () => resolve('answered'), (error) => resolve({
     class: error?.constructor?.name, tinyactors: error instanceof TinyactorsError, status: error?.status, code: error?.code, reason: error?.reason,
   }));
 });

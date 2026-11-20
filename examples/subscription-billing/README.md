@@ -14,7 +14,7 @@ renewals, payments and customers' changes go on.
 - **A trial** converts into a subscription when its timer falls due,
   unless the customer cancels first.
 - **Most actors are hibernated** in a blob store between their events,
-  and a renewal, a retry or a customer's event wakes them.
+  and a renewal, a retry or a customer's event loads them back.
 
 Release 2 changes both charts:
 
@@ -49,11 +49,12 @@ What makes the migration interesting:
   it ends. A bank that answers in three days holds its subscription past
   the migration's timeout: the result lists it as pending, and a second
   migration moves it once the charge has answered.
-- **Hibernated actors.** With `wake: true` the migration asks the wake
-  handler for each; the application queues those requests and wakes a
-  batch a round, so the resident set stays bounded. An event for an actor
-  in that queue wakes it at once, and the migration takes it too. Without
-  `wake`, the hibernated actors hold the migration until its timeout.
+- **Hibernated actors.** With `wake: true` the migration asks the host
+  for each; the host, given a `store` and a `resident` bound, loads them
+  as room allows and hibernates the surplus after each turn, so the
+  resident set stays bounded. An event for an actor still waiting loads
+  it at once, and the migration takes it too. Without `wake`, the
+  hibernated actors hold the migration until its timeout.
 - **One chart, one session.** A migration can name a chart (the
   subscriptions move, the trials stay on release 1) or one session (a
   canary, or a straggler).
@@ -63,7 +64,8 @@ What makes the migration interesting:
 `rollout.mjs` is this procedure as a program, and `main.mjs` runs it on
 day 45 of four months of business:
 
-1. **Deploy** release 2 (`host.addCharts`, which returns its segment).
+1. **Deploy** release 2 (`compileCharts`, then `host.addImage`, which
+   returns its segment).
    From then on every new subscription and trial is release 2's; running
    ones stay on release 1. Nothing else changes yet, so this is safe to do
    at any time.
@@ -73,12 +75,11 @@ day 45 of four months of business:
    gives the segment it runs on. Look at its variables (`actorContext`)
    and its state. If it did not move, stop: the rollout does so.
 3. **Move each chart** (`host.migrate({ chart, wake: true, timeout })`),
-   one at a time, subscriptions first. While it runs, each round wakes a
-   batch of the hibernated actors it asked for, lets the business go on
-   for ten minutes of the host's clock, and hibernates back down to the
-   resident bound. Size the batch so that the rounds before the timeout
-   reach the whole population; the timeout keeps an actor that cannot be
-   reached (a payment in flight) from holding the migration open.
+   one at a time, subscriptions first. While it runs, each round lets the
+   business go on for ten minutes of the host's clock, while the host
+   loads the hibernated actors the migration asked for as its resident
+   bound allows. The timeout keeps an actor that cannot be reached (a
+   payment in flight) from holding the migration open.
 4. **Find who is left** on release 1. `migrationDone` counts the actors
    that failed but does not name them, so `leftBehind` asks the host about
    every live actor (`actorList`, then `actorGet` for its segment).
@@ -106,7 +107,7 @@ name with `host.chart` first.
 
 ## The tinyactors features it uses, and why
 
-- **Versions and migration** (`host.addCharts` per release,
+- **Versions and migration** (`host.addImage` per release,
   `host.migrate` with `chart`, `session`, `wake` and `timeout`): the
   point of the example. A subscription lives for years and its chart
   changes; stopping it would lose its billing history and its timers.
@@ -123,14 +124,16 @@ name with `host.chart` first.
 - **Invoked services** (`urn:billing:payments`): one invocation per
   charge, answered with `done` or `sendBack` from the gateway's promise;
   an invocation in flight holds its actor's migration.
-- **Hibernation** (`host.sweep`, `host.hibernate`, the `wake` handler,
-  `host.wake`): most subscriptions spend their month waiting. The wake
-  handler tells an event's request (now) from a migration's (queued).
+- **Hibernation** (the host's `store` and `resident` options): most
+  subscriptions spend their month waiting. The host hibernates the
+  coldest past the bound after each turn and loads an actor back when an
+  event, a due timer or a migration needs it, a migration's only as room
+  allows; the store is the application's, a `Map` of blobs here.
 - **Typed methods** for the operator: `actorGet` (which segment, so which
   release), `actorList` (the inventory), `actorContext` and `actorState`
   in the tests, `hostStats` for the resident set and retired segments.
 - **Named actors** (`sub-<customer>`, `trial-<customer>`,
-  `host.actorByName`) and **spawn params** for each subscription's plan
+  `host.actor(name)`) and **spawn params** for each subscription's plan
   and timings; a trial's `trial.converted` spawns its subscription from
   the I/O processor's handler, on the newest release.
 - **An I/O processor** (`urn:billing:notify`) for the customer
@@ -167,7 +170,7 @@ day 120: pass 1: retried the 15 still on release 1 (17 after the rollout): 15 mo
 rollout: canary sub-c0111 on release 2; subscription 193 moved, 16 failed, 2 pending; trial 22 moved, 0 failed, 0 pending
 231 migrated events in all, 209 upgrades seen by the charts; 8 paused on release 2
 595 invoices paid (468 by release 2), 84 failed payments, 16 suspensions after a grace period, 27 cancelled, 40 trials converted
-memory: 40 of 234 in memory before the rollout, 40 of 213 at the end; 1460 hibernations, 1093 wakes for events, 194 for migrations; 173 blobs stored
+memory: 40 of 234 in memory before the rollout, 40 of 213 at the end; 1456 hibernations, 1283 loaded from the store; 173 blobs stored
 segments: 1 live, 1 retired
 every charge invoiced once, every invoice numbered in order, nothing left on release 1
 ```

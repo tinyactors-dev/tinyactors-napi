@@ -6,8 +6,8 @@
 // once the host is freed, its promises awaited by [Symbol.asyncDispose]),
 // spans decoded back with traceSpansDecode, and watches on a simulated
 // clock and on the real one.
-import { Host, SimulatedClock } from '@tinyactors/node';
-import { ENGINE, equal, hostWith, scxml, sleep, status, throws } from './charts.mjs';
+import { decodeTraces, Host, InvalidError, SimulatedClock } from '@tinyactors/node';
+import { ENGINE, equal, hostWith, processor, scxml, sleep, status, throws } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
 /** A chart that logs and counts at each `go`. */
@@ -25,7 +25,7 @@ const quiet = (name) => scxml(name, '<state id="s"><transition event="go"/></sta
 
 /** A config with an encoder: ticks are milliseconds, flushInterval in ticks. */
 function config(telemetry = {}) {
-  return { systemID: 't', system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 100, ...telemetry } };
+  return { system: { ticksPerSecond: 1000 }, telemetry: { flushInterval: 100, ...telemetry } };
 }
 
 /** A host running LOGGING with `telemetry` as its handler, on a simulated clock unless one is given. */
@@ -37,24 +37,24 @@ function logging(telemetry, { clock = new SimulatedClock(), flush, ...options } 
 async function spanNames(host, requests) {
   const names = [];
   for (const [signal, data] of requests)
-    if (signal === 'traces') host.traceSpansDecode({ traces: data }, (h, result) => names.push(...result.spans.map((span) => span.name)));
+    if (signal === 'traces') host.traceSpansDecode({ traces: data }, (result) => names.push(...result.spans.map((span) => span.name)));
   await host.idle();
   return names;
 }
 
 /** A host that decodes, with no encoder of its own. */
-const decoder = () => new Host({ systemID: 'd' }, ENGINE);
+const decoder = () => new Host([], { system: 'd', ...ENGINE });
 
 /** The trace id of the first send of a new host made with `system` (no
  * `system` key when undefined), and its effective traceSeed. */
 async function firstTrace(system) {
   let trace;
   const chart = scxml('sender', '<state id="s"><onentry><send type="urn:t:out" target="x" event="out"/></onentry></state>');
-  const config = { systemID: 't', ioProcessors: [{ type: 'urn:t:out' }], ...(system === undefined ? {} : { system }) };
+  const config = system === undefined ? {} : { system };
   const given = JSON.stringify(config);
   const host = hostWith({ sender: chart }, {
     config,
-    ioProcessors: { 'urn:t:out': (h, send) => { trace = send.traceparent.split('-')[1]; } },
+    ioProcessors: { 'urn:t:out': processor((send) => { trace = send.traceparent.split('-')[1]; }) },
   });
   equal(JSON.stringify(config), given, 'the caller\'s config is not changed');
   host.spawn(host.chart('sender'));
@@ -80,24 +80,55 @@ test('the binding picks a random trace seed when the config gives none; a given 
 test('traces and logs reach the handler as Uint8Arrays, copied once, after flushInterval', async () => {
   const got = [];
   const clock = new SimulatedClock();
-  const host = logging((h, signal, data) => got.push([signal, data, h]), { clock });
+  const host = logging((signal, data) => got.push([signal, data]), { clock });
   host.send(host.spawn(host.chart('c')), 'go');
   await host.idle();
   equal(got.length, 0, 'staged until flushInterval passed');
   clock.increment(200);
   await host.idle();
   equal(got.map(([signal]) => signal).sort().join(), 'logs,traces', 'one request of each');
-  for (const [, data, h] of got) {
+  for (const [, data] of got) {
     if (!(data instanceof Uint8Array) || data.length === 0) throw new Error('data is not a non-empty Uint8Array');
-    equal(h, host, 'the handler gets the host');
   }
   if (!(await spanNames(host, got)).includes('scxml.macrostep go')) throw new Error('no macrostep go');
   host.close();
 });
 
+test('decodeTraces reads spans without a host: the typed method\'s fields, flags, links, resource and scope', async () => {
+  const got = [];
+  const clock = new SimulatedClock();
+  const host = logging((signal, data) => got.push([signal, data]), { clock });
+  host.send(host.spawn(host.chart('c')), 'go');
+  await host.idle();
+  clock.increment(200);
+  await host.idle();
+  const traces = got.find(([signal]) => signal === 'traces')[1];
+  const typed = (await host.traceSpansDecode({ traces })).spans;
+  host.close();
+  const spans = decodeTraces(traces);
+  equal(spans.length, typed.length, 'as many spans');
+  spans.forEach((span, i) => {
+    for (const [key, value] of Object.entries(typed[i])) equal(JSON.stringify(span[key], (k, v) => (typeof v === 'bigint' ? String(v) : v)),
+      JSON.stringify(value, (k, v) => (typeof v === 'bigint' ? String(v) : v)), `span ${i}: ${key}`);
+    equal(Array.isArray(span.links) && span.links.length, 0, 'no links');
+    equal(typeof span.flags, 'number', 'flags');
+    equal(span.scope.name, 'tinyactors', 'the scope');
+    equal(span.scope.attributes['tinyactors.chart.name'], 'c', 'the scope\'s chart');
+    equal(typeof span.resource, 'object', 'the resource');
+  });
+  equal(decodeTraces(traces.buffer.slice(traces.byteOffset, traces.byteOffset + traces.byteLength)).length, spans.length, 'an ArrayBuffer');
+  equal(decodeTraces(new Uint8Array(0)).length, 0, 'no spans');
+  throws(() => decodeTraces(new Uint8Array([255, 255, 255])), (error) => {
+    if (!(error instanceof InvalidError)) throw error;
+  }, 'not a request');
+  throws(() => decodeTraces('bytes'), (error) => {
+    if (!(error instanceof TypeError)) throw error;
+  }, 'not bytes');
+});
+
 test('close hands over the last take: trace.end and what is staged', async () => {
   const got = [];
-  const host = logging((h, signal, data) => got.push([signal, data]), { flush: 0 });
+  const host = logging((signal, data) => got.push([signal, data]), { flush: 0 });
   host.send(host.spawn(host.chart('c')), 'go');
   await host.idle();
   equal(got.length, 0, 'no flush interval: only a full staging or the stop');
@@ -128,7 +159,7 @@ test('metrics are pulled outside a drain: its own batch, acknowledged at once', 
   host.send(host.spawn(host.chart('c')), 'go');
   await host.idle(); // and nothing was left open for the run
   host.close();
-  const plain = new Host({ systemID: 't' }, ENGINE);
+  const plain = new Host([], { system: 't', ...ENGINE });
   throws(() => plain.metrics(), status('TA_ERROR_STATE'), 'metrics() without telemetry');
   plain.close();
   throws(() => plain.metrics(), status('TA_ERROR_STATE'), 'metrics() on a closed host');
@@ -137,7 +168,7 @@ test('metrics are pulled outside a drain: its own batch, acknowledged at once', 
 test('metrics from a handler join the open batch', async () => {
   const sizes = [];
   const clock = new SimulatedClock();
-  const host = logging((h) => sizes.push(h.metrics().length), { clock });
+  const host = logging(() => sizes.push(host.metrics().length), { clock });
   host.send(host.spawn(host.chart('c')), 'go');
   await host.idle();
   clock.increment(200);
@@ -169,7 +200,7 @@ test('a handler that throws: idle() rejects, the encoder goes on, close() throws
 
 test('a handler that returns a promise runs in the turn; asyncDispose awaits the last take\'s', async () => {
   const got = [];
-  const host = logging(async (h, signal) => {
+  const host = logging(async (signal) => {
     await sleep(5);
     got.push(signal);
   }, { flush: 0 });
@@ -182,7 +213,7 @@ test('a handler that returns a promise runs in the turn; asyncDispose awaits the
 
 test('asyncDispose rejects with a promise\'s rejection in the last take', async () => {
   const got = [];
-  const host = logging(async (h, signal) => {
+  const host = logging(async (signal) => {
     await sleep(5);
     got.push(signal);
     if (signal === 'logs') throw new Error('down');
@@ -210,9 +241,9 @@ async function staged(telemetry, options = {}) {
 
 test('close() from the handler of the last take is the close running', async () => {
   const got = [];
-  const host = await staged((h, signal) => {
+  const host = await staged((signal) => {
     got.push(signal);
-    h.close(); // deferred: the close running now finishes
+    host.close(); // deferred: the close running now finishes
   });
   host.close();
   equal(host.closed, true, 'closed');
@@ -221,9 +252,9 @@ test('close() from the handler of the last take is the close running', async () 
 
 test('inputs from the handler of the last take end: it is bounded', async () => {
   let calls = 0;
-  const host = await staged((h) => {
+  const host = await staged(() => {
     calls++;
-    h.send(h.spawn(h.chart('c')), 'go'); // more records at every take
+    host.send(host.spawn('c'), 'go'); // more records at every take
   });
   host.close();
   equal(host.closed, true, 'closed');
@@ -232,7 +263,7 @@ test('inputs from the handler of the last take end: it is bounded', async () => 
 
 test('metrics from the handler of the last take join its batch', async () => {
   const sizes = [];
-  const host = await staged((h) => sizes.push(h.metrics().length));
+  const host = await staged(() => sizes.push(host.metrics().length));
   host.close();
   if (sizes.length === 0 || !sizes.every((size) => size > 0)) throw new Error(`sizes ${sizes}`);
 });
@@ -243,9 +274,9 @@ test('a close a handler asked for: its last take\'s error rejects the waiting id
     if (closing) throw new Error('down at close');
   }, {
     flush: 0,
-    log: (h) => {
+    log: () => {
       closing = true;
-      h.close();
+      host.close();
     },
   });
   host.send(host.spawn(host.chart('c')), 'go');
@@ -274,20 +305,20 @@ test('actor spans are children of the application\'s span, and the trace goes ou
   const got = [];
   const seen = [];
   const host = hostWith({ front, stock }, {
-    config: { systemID: 't', ioProcessors: [{ type: 'urn:test:app' }], telemetry: {} },
-    ioProcessors: { 'urn:test:app': (h, send) => { seen.push(send.traceparent); send.answer('reserved'); } },
-    telemetry: (h, signal, data) => got.push([signal, data]),
+    config: { telemetry: {} },
+    ioProcessors: { 'urn:test:app': processor((send) => { seen.push(send.traceparent); send.answer('reserved'); }) },
+    telemetry: (signal, data) => got.push([signal, data]),
   });
   const frontSession = host.spawn(host.chart('front'));
   const stockSession = host.spawn(host.chart('stock'));
   await host.idle();
-  host.send(frontSession, 'order', { to: `#_scxml_${stockSession}` }, { traceparent: `00-${APP_TRACE}-${APP_SPAN}-01` });
+  host.send(frontSession, 'order', { to: `#_scxml_${stockSession.id}` }, { traceparent: `00-${APP_TRACE}-${APP_SPAN}-01` });
   await host.idle();
   host.close(); // the last take
   const other = decoder();
   const spans = [];
   for (const [signal, data] of got)
-    if (signal === 'traces') other.traceSpansDecode({ traces: data }, (h, result) => spans.push(...result.spans));
+    if (signal === 'traces') other.traceSpansDecode({ traces: data }, (result) => spans.push(...result.spans));
   await other.idle();
   other.close();
   const ours = new Map(spans.filter((span) => span.trace === APP_TRACE)
@@ -313,7 +344,7 @@ async function chartsTraced(host, requests) {
   const traced = [];
   for (const [signal, data] of requests)
     if (signal === 'traces')
-      host.traceSpansDecode({ traces: data }, (h, result) => traced.push(...result.spans
+      host.traceSpansDecode({ traces: data }, (result) => traced.push(...result.spans
         .filter((span) => span.name === 'scxml.macrostep go').map((span) => span.attributes['tinyactors.chart.name'])));
   await host.idle();
   requests.length = 0;
@@ -324,10 +355,10 @@ test('a watch traces what it matches until it ends, on a simulated clock', async
   const got = [];
   const replies = [];
   const clock = new SimulatedClock();
-  const host = hostWith(TWO, { config: config({ flushInterval: 10 }), telemetry: (h, signal, data) => got.push([signal, data]), clock });
+  const host = hostWith(TWO, { config: config({ flushInterval: 10 }), telemetry: (signal, data) => got.push([signal, data]), clock });
   const a = host.spawn(host.chart('a'));
   const b = host.spawn(host.chart('b'));
-  const keep = (h, result) => replies.push(result);
+  const keep = (result) => replies.push(result);
   async function step() {
     host.send(a, 'go');
     host.send(b, 'go');
@@ -351,7 +382,7 @@ test('a watch traces what it matches until it ends, on a simulated clock', async
   await host.idle();
   equal(await step(), '', 'unwatched');
   const errors = [];
-  host.traceUnwatch({ id: 2 }, keep, (h, error) => errors.push(error.reason));
+  host.traceUnwatch({ id: 2 }, keep, (error) => errors.push(error.reason));
   await host.idle();
   equal(errors.join(), 'stale', 'a watch that ended');
   host.close();
@@ -366,7 +397,7 @@ test('a watch ends on the real clock, through the host\'s timer', async () => {
   for (let seconds = 0.25; ; seconds *= 4) {
     const got = [];
     // 1 ms: ticks are nanoseconds by default
-    const host = hostWith(TWO, { config: { systemID: 't', telemetry: { flushInterval: 1_000_000 } }, telemetry: (h, signal, data) => got.push([signal, data]) });
+    const host = hostWith(TWO, { config: { telemetry: { flushInterval: 1_000_000 } }, telemetry: (signal, data) => got.push([signal, data]) });
     async function settle() { // the host's own timer flushes what is staged
       for (let i = 0; i < 10; i++) {
         await sleep(5);

@@ -51,8 +51,10 @@ API"). Node's names and shapes (decided 2026-10-16, docs/plan.xml):
   a compile call that also parses every expression and script of an
   `"ecmascript"` chart with the engine (`new vm.Script` in the native
   datamodel's shapes, nothing run; 2026-10-18,
-  l-p4-examples-iot-syntax-unchecked), each syntax error a warning
-  diagnostic at its element's line, an error with `{warningsAsErrors}`
+  l-p4-examples-iot-syntax-unchecked), each syntax error, and each
+  top-level declaration of a script ("The native "ecmascript"
+  datamodel"), a warning diagnostic at its element's line, an error with
+  `{warningsAsErrors}`
   (core's `TA_COMPILE_WERROR`), since SCXML makes such an expression an
   `error.execution` at its evaluation (W3C 156, 277, 309, 312, 344, 487,
   488, 528 have them); `addImage(image)` returning the segment
@@ -74,15 +76,80 @@ API"). Node's names and shapes (decided 2026-10-16, docs/plan.xml):
   resolves and one that rejects with the same `TinyactorsError` (a
   refusal at the call rejects; a rejection with no `catch` is an
   unhandled rejection, never the turn's; pending at `close()`, it never
-  settles); then the shapes chosen in p3-shapes (2026-10-17):
-  **`host.addCharts({name: text}, {resolver}?)`** (compileCharts,
-  addImage, close; returns the segment), **`host.spawnChart(name,
-  options?)`** (chart, then spawn), **`directoryResolver(root)`** (reads
-  `source` under `root` relative to `base`, refusing with `ResolveError` a
-  path that leaves it, symbolic links included; the one use of the
-  built-ins the layer may import, `node:fs` and `node:path`) and
-  **`Address.prototype.toJSON`** (its text). A chart builder waits for the
-  direct layer to expose `ta_xml_writer`.
+  settles); **`Address.prototype.toJSON`** (its text); and the
+  application API of ROADMAP.md step 8.6 (items 1 to 9 and 18, 2026-11-19,
+  as the Python binding's 9c84f1c4, 24190ca0, 48a46745 and 5f780d23 in
+  JavaScript's shapes), which replaced `host.addCharts`, `host.spawnChart`,
+  `directoryResolver` and `host.actorByName`:
+  - **`Host`** is the layer's `class Host extends` the direct layer's
+    (the addon's class, `(config, options)`, which `index.mjs` no longer
+    exports): **`new Host(charts, {system, ioProcessors, config, clock,
+    store, resident, log, telemetry, services, transport, onDone,
+    onError, onHandlerError, migrated, migrationDone, datamodel,
+    quickjs})`** makes the direct host's config from `system` (the
+    `systemID`; `"tinyactors-ask"` is reserved) and `ioProcessors` (each
+    an object with `receive(send)` and an optional `location`; a plain
+    function a `TypeError` naming its type), refuses `systemID` or
+    `ioProcessors` in `config`, and adds `charts` (a `Compiled`, image
+    bytes, or an array) in order; **`Host.restore(snapshot, charts,
+    options)`** adds only the images the snapshot does not hold (by
+    bytes, the direct layer's hidden `holdsImage`).
+  - **Handlers take no host**: `receive(send)`, `transport(send)`,
+    `log(entry)`, `telemetry(signal, data)`, a service's
+    `handler(invocation)`, `receive(send)` and `stop()`,
+    `migrated(migrated)`, `migrationDone(result)`, a typed method's
+    `onResult(result)` and `onError(error)`; the views and records have
+    `.host`, and **`send.sender`** is an `Actor`. The direct layer calls
+    them so (C and `wasm/lib/host.mjs`), so nothing is wrapped per event.
+  - **`host.spawn(chart, options?) → Actor`** (a chart's name or a
+    `ChartRef`), **`host.actor(which)`** (a session, an `Actor`, a name or
+    an address; `StaleError` for none), **`await host.actors({chart}?)`**;
+    every call that takes a session takes an **`Actor`** (`id`, `host`,
+    `address`, `send`, `terminate`, `state()`, `context()`, `get()`,
+    `ask`, `done`, `equals`).
+  - **`store: {save, load, delete}`** (each sync or returning a
+    promise), **`MemoryStore`**, **`SQLiteStore(path)`** (`node:sqlite`,
+    `bun:sqlite`) and **`resident: n`**, over the direct layer's hidden
+    `wake` and `idle` hooks: a WAKE's blob loaded, woken and deleted; after
+    a turn that went idle the actors past `resident` hibernated (CLOCK
+    sweeps) and saved, a save that fails waking the actor back; a
+    migration's WAKEs loaded as room allows. The `wake` option is gone;
+    `sweep`, `hibernate` and `wake` stay.
+  - **`onDone(actor, donedata)`**, **`onError(actor, error)`** and
+    `actor.done`, over the direct layer's `done` and `error` hooks
+    (`TA_EFFECT_DONE`, `TA_EFFECT_ERROR`); **`onHandlerError(error,
+    effect)`** receives what a handler threw, with its view, instead of
+    the turn.
+  - **`actor.ask(event, data?, {signal}?)`**: a row of the pending
+    `ta_table` (`TA_NAPI_METHOD_ASK`) holds the settle function, the
+    event's origin is `tinyactors://tinyactors-ask/@<handle>`, and the
+    reply, a send to that system, is taken before the application's
+    `transport`.
+  - **`Spawner`**, an I/O processor that spawns the current version of
+    the chart a send names (`{chart, name, params}`) under the name and
+    answers `spawned` with `{name, address}` (`address` the new actor's
+    session address; the answer keeps the sendid), or fails the send. It
+    spawns; it does not look names up (the maintainer, 2026-11-19,
+    replacing a get-or-spawn per version). A name has one owner: the
+    collection actor that decides which actors of a kind exist spawns
+    those names, one request at a time, and records its spawns in flight
+    (chat-rooms' `creating`, keyed by sendid). Two actors spawning one
+    name is the application's design error; core then keeps the oldest
+    holder within a version and lets a newer version's win
+    (`ta_host_actor_by_name`). A spawn under an existing name after
+    `addImage` of a new version is the update: new spawns run the newest
+    version, running actors finish on theirs, `migrate` moves those that
+    must not wait. And **`compileDir(dir,
+    {resolver}?)`** (every `*.scxml` under `dir`, named by its path, sorted,
+    a `src` read by a resolver confined to `dir`); with `SQLiteStore`, the
+    layer's uses of the built-ins, reached by
+    `process.getBuiltinModule` of a literal name (`node:fs`, `node:path`,
+    `node:url`, `node:sqlite`, `bun:sqlite`), so a browser loads the layer
+    and refuses only those calls.
+
+  Both packages share the file (`#direct`), so `@tinyactors/wasm` has the
+  same API. A chart builder waits for the direct layer to expose
+  `ta_xml_writer`.
 - **A resolver is any callable** `(base, source) => text` (a function,
   an arrow, a bound method; decided 2026-10-16, as Python's API review
   did), given to the compile call only (a static `src`, at compile time;
@@ -152,8 +219,8 @@ the ack.
   says. **`await host.idle()`** is a promise that settles at the next idle
   turn with no handler's promise pending (2026-10-18,
   l-p4-examples-order-settle: every promise a handler returns, the I/O
-  processors', the services' and their `receive`'s, wake, telemetry, log,
-  migration and typed-method handlers', is followed with `then` and
+  processors', the services' and their `receive`'s, a store's, telemetry,
+  log, `onDone`, migration and typed-method handlers', is followed with `then` and
   counted on the host, and the count reaching zero with an `idle()`
   waiting schedules a turn; the last take's at close is `asyncDispose`'s
   instead): it observes, it drives nothing. On a closed host it returns a
@@ -236,7 +303,9 @@ The rules the Python binding follows hold here too (bindings.md, sections
 
 | JavaScript sees | Through | Core |
 |---|---|---|
-| an actor's output | an I/O processor's handler the application configures per host, given the send as a thin view; it may answer or fail it | `TA_EFFECT_SEND`; `ta_host_send` (with `TA_EVENT_IN_ERROR_COMMUNICATION` for a failure) |
+| an actor's output | an I/O processor's `receive` the application configures per host, given the send as a thin view; it may answer or fail it | `TA_EFFECT_SEND`; `ta_host_send` (with `TA_EVENT_IN_ERROR_COMMUNICATION` for a failure) |
+| an actor's end | `onDone(actor, donedata)`, `onError(actor, error)`, `actor.done` | `TA_EFFECT_DONE`, `TA_EFFECT_ERROR` |
+| a hibernated actor wanted again | the host's `store`, loaded and woken by the convenience layer | `TA_EFFECT_WAKE`; `ta_host_wake` |
 | services the charts invoke | a service registered by type | `TA_EFFECT_INVOKE`, `UNINVOKE`, sends with `IO_PROCESSOR` `TA_NIL` |
 | an actor's state | the typed method over `actor.state` (subscriptions are removed, ADR 0012 decision 4) | `ta_host_post`, `TA_HOST_EFFECT_REPLY` |
 | inspection and trace control | typed methods, each taking a response handler the drain calls when its `REPLY` is dispatched | `ta_host_post`, `TA_HOST_EFFECT_REPLY` |
@@ -253,20 +322,22 @@ The rules the Python binding follows hold here too (bindings.md, sections
   so hosts start different trace ids; a seed the caller sets is kept and
   reproduces; `Host.restore` passes its config as given, its segments
   keeping the snapshot's generators. Core stays free of I/O.
-- **`DONE` and `ERROR` are internal:** the addon releases its rows for the
-  session; no application callback.
+- **`DONE` and `ERROR`:** the addon releases its rows for the session,
+  then calls the direct layer's `done` or `error` hook, which the
+  convenience layer makes `actor.done`, `onDone` and `onError`
+  (2026-11-19, step 8.6, item 5: replacing "no application callback").
 - **An I/O processor's handler that throws before answering** (or whose
   promise rejects before an answer) has its send failed, as ADR 0009 has
   a runtime that cannot do what an effect asks answer with a failed
   completion (`error.communication` for the sender), and the error is
   reported as "The loop" says.
-- **A log entry is `(session, label, text)`**, no chart.
+- **A log entry is `(session, label, text)`**, no chart, and its `host`.
 - **No synchronous request and no raw `post`** (ADR 0012, decision 3): one typed method per method of
   `tinyactors-core/docs/requests.md` but `actor.send` (which is
   `host.send`), shaped `method(params, onResult, onError)` (decided
   2026-10-16): `params` an object passed to core as given (`undefined`
-  for none), `onResult(host, result)` at the `REPLY`'s dispatch,
-  `onError(host, error)` optional and never a param for core; it returns
+  for none), `onResult(result)` at the `REPLY`'s dispatch,
+  `onError(error)` optional and never a param for core; it returns
   nothing. Called with no handler it returns a promise instead (the
   convenience layer, 2026-11-18). The
   message id is the handle of a row in a pending `ta_table` holding the
@@ -275,10 +346,10 @@ The rules the Python binding follows hold here too (bindings.md, sections
 - **No notification is defined;** the addon drops a
   `TA_HOST_EFFECT_NOTIFICATION` whose method it does not know.
 - **Invoked services** (decided 2026-10-16, as Python's "Invoked
-  services"; docs/plan.xml, p2-services): `services: {[type]: (host,
-  invocation) => service}`. At a `TA_EFFECT_INVOKE` the handler of its
+  services"; docs/plan.xml, p2-services): `services: {[type]:
+  (invocation) => service}`. At a `TA_EFFECT_INVOKE` the handler of its
   type (`EVENT`) gets an **`Invocation`**, a record made before the ack (a
-  service outlives it): `session` (a `bigint`), `invokeid` (`SENDID`),
+  service outlives it): `host`, `session` (a `bigint`), `invokeid` (`SENDID`),
   `type`, `src` (`TARGET`), `data` (the payload's value), `traceparent`,
   `restored` (`TA_EFFECT_FLAG_RESTORED`) and `running`; its type, src and
   invokeid are the last invocation's strings when the text is the same,
@@ -292,9 +363,9 @@ The rules the Python binding follows hold here too (bindings.md, sections
   {traceparent}?)`** with `TA_EVENT_IN_INVOKE_DONE` (the entry goes); both
   keep the invoke's trace unless given one (`null`: a new trace) and throw
   `TA_ERROR_STALE` once it ended or the host closed. A `TA_EFFECT_SEND`
-  with `IO_PROCESSOR` `TA_NIL` goes to the service's **`receive(host,
-  send)`**, called on the service, with a thin `Send` whose `type` is
-  `undefined`; a `TA_EFFECT_UNINVOKE` to its **`stop(host)`**, then the
+  with `IO_PROCESSOR` `TA_NIL` goes to the service's **`receive(send)`**,
+  called on the service, with a thin `Send` whose `type` is
+  `undefined`; a `TA_EFFECT_UNINVOKE` to its **`stop()`**, then the
   entry goes; both optional. **A handler may return a thenable of the
   service** (decided 2026-10-17, l-p2-services-promise revised: async is
   the event loop's): the invocation is starting until it settles, its
@@ -547,23 +618,51 @@ d-dom, d-separate):
   host holds one: `new Host(config, {datamodel: "native" | "quickjs"})`,
   and a host that names none gets `"native"`, the maintainer's exception
   to "no defaults of our own" ("it's what most people will expect").
-- **Charts evaluate in `node:vm` contexts, never the application's
-  realm.** One shared context per host's native datamodel holds the
-  charts that declare nothing at the top of their scripts; each of their
-  sessions is a scope object inside it. A chart whose scripts declare
-  top-level names (`var`, `function`, `let`, `const`, `class`) gets a
-  context per session, where a script runs as global code and closures
-  work (about 143 KB a session on node, 60 KB on bun). Which charts
-  declare is asked of the engine at `chart_attach` (the script after
-  `throw 0;` in a scratch context: the global's new names, and a
-  redeclaration error for lexical ones): the addon parses no JavaScript.
-  Pre-declaring names on a scope and copying bindings out is refused: a
-  script's functions close over its own `var`s.
+- **Charts evaluate in one `node:vm` context per host, never the
+  application's realm**, and each session is a scope object inside it,
+  whatever its chart's scripts declare (the maintainer, 2026-11-19: "cut
+  the declaring-chart context, keep native as default"; the context per
+  session of a declaring chart cost about 143 KB on node and 60 KB on
+  bun, and one that declared with `let`, `const` or `class` could never
+  hibernate). What a script declares at its top level is asked of the
+  engine, in the context, by the kit's `script` (`realm.js`; the addon
+  parses no JavaScript): a candidate name is declared when the script
+  followed by `let <name>` does not parse as a strict function body,
+  lexically when the script followed by `var <name>` does not either, and
+  a function when `typeof` reads one before any statement runs.
+  - A chart-level script's (`TA_EXPRESSION_GLOBAL_SCRIPT`'s) functions
+    are the chart's helpers, made once per chart at `chart_attach` from
+    the script's text (`'use strict';return {f, ...};` ahead of it, no
+    statement run) onto its scopes' prototype, so every expression of the
+    chart's sessions sees them through `with (scope)` and no other chart
+    does. A helper closes over the context's globals only: it takes the
+    session's variables as arguments. Its other statements run once per
+    session, as SCXML runs a chart-level script, the helpers visible.
+  - A script's top-level `var`s are variables of the session: on the
+    chart's shape, read from the scope before the script runs and written
+    back after (`try { ... } finally { ... }` around it), so W3C 302, 303
+    and 304 hold and a `var` hibernates as a `<data>` does.
+  - A top-level `let`, `const` or `class`, in any script, refuses the
+    script: each evaluation of it is `error.execution`, the message
+    naming the `<data id>` to declare instead. Inside a block or a
+    function they are the script's own.
+  - A function a script of executable content declares is that run's,
+    local to the strict function the script runs in.
+  - The compile call reports each top-level `let`, `const` or `class`,
+    and each top-level `var` (a variable of the session), as a warning at
+    the script's line, an error with `{warningsAsErrors}`, asked of the
+    application's kit (`advice`): it is not refused at compile time, since
+    the compile call cannot know which
+    datamodel will run the image, and quickjs runs a declaring script as
+    global code (refusing it there would refuse quickjs's charts too);
+    SCXML makes a bad script an `error.execution` at its evaluation.
 - **A scope is shaped once per chart:** a per-chart constructor whose
   properties are, from the start, the `<data>` ids, the names a
-  `<foreach>`'s item and index and a script's assignments bind, the
+  `<foreach>`'s item and index and a script's top-level `var`s bind, the
   session's link and `_event`, over a frozen prototype of null prototype
-  holding the system variables as read-only accessors (V8 makes an
+  holding the system variables as read-only accessors (and, for a chart
+  with helpers, a frozen prototype of the chart's own over it holding
+  them) (V8 makes an
   `Object.create(null)` object a dictionary: 280 B against 56 to 64 B).
   `_event` is a non-writable data property redefined at each
   `bind_event`.
@@ -598,26 +697,11 @@ d-dom, d-separate):
   next call; core puts the bytes in the blob and calls `destroy`, which
   removes the row, so a hibernated session holds nothing in the engine.
   The ids live in the session's row (set at `bind_event`), not on the
-  frozen `_event`. A shared chart's variables are its scope's own names
-  but `_event`; a declaring session's are the names its chart and scripts
-  put on its global (the realm's baseline and the system variables left
-  out), and a name the chart's scripts declare as a function is left out
-  while it holds a function: a top-level `function`, and one declared in a
-  script of executable content, which runs as a sloppy block and so makes
-  a var of the global (Annex B) that the script fills again at each run
-  (found at `chart_attach` as the names a strict instantiation of the
-  scripts, in a second scratch context, does not make). A script of
-  executable content that starts with a `'use strict'` directive runs as a
-  strict block (`'use strict';{ ... }`), since a block takes no
-  directive. `deserialize` makes a new scope, or for a
-  declaring chart a new context in which every script of the chart is
-  instantiated again without running a statement (`throw 0;` ahead, the
-  probe `chart_attach` already compiles, kept in the chart's record), so
-  its function declarations exist again before the variables are copied
-  in with the context's constructors. A chart whose scripts declare with
-  `let`, `const` or `class` refuses (`TA_ERROR_UNSUPPORTED`): a new
-  context cannot be given those bindings again (a binding instantiated
-  and never run stays in its TDZ). A value outside the table (a function,
+  frozen `_event`. A session's variables are its scope's own names but
+  `_event`; the chart's helpers are the chart's, on its prototype, and
+  never written. `deserialize` makes a new scope and copies the blob's
+  variables its chart declares into it with the context's constructors.
+  A value outside the table (a function,
   a `Map`, a `Date`, a class's instance, an XML document) refuses too, and
   the datamodel keeps why (the variable's name and the value table's
   message) for `host.hibernate`'s error, as quickjs's `last_error` does.
@@ -634,12 +718,10 @@ d-dom, d-separate):
   spawn's params wait, until the first event or `migrate` takes it, as
   Python's `row->extra` holds them (no field in the session's row: the
   link is the session's already). `migrate` answers them, exactly the old
-  chart's variables, as one payload copied into the shared context; on a
-  declaring session's global it also deletes the names the blob added
-  that the new chart's declarations did not make (`restore` keeps them on
-  the link as `added`). The new chart's scripts are instantiated in the
-  new context, not run: a `var` they declare is there, `undefined`, and
-  core initializes the new chart's added `<data>`.
+  chart's variables, as one payload copied into the shared context. The
+  new scope has the new chart's names and helpers; no script runs: a
+  `var` the new chart's scripts declare is there, `undefined`, and core
+  initializes the new chart's added `<data>`.
 - **Snapshots write every row out** (decided 2026-10-16, as the Python
   binding's "Snapshots of the datamodel"; docs/plan.xml, p2-snapshot).
   `host.snapshot()` checks quiescence first (`ta_host_snapshot` with an
@@ -654,7 +736,7 @@ d-dom, d-separate):
   (`ta_datamodel_chart.segment`, kept in the chart's row: two segments may
   run one image), its variables as hibernation writes them, its `_event`
   with core's ids, its link's `_sessionid`, `_name` and processors, its
-  params and the names a wake added, a payload's value and references, a
+  params, a payload's value and references, a
   `<foreach>`'s items, each value as CBOR bytes of its own so a value
   nests as deep as in a send. What hibernation refuses the snapshot
   refuses (`TA_ERROR_UNSUPPORTED`, the message naming the variable), and
@@ -672,10 +754,7 @@ d-dom, d-separate):
   effective config's `systemID` the pack's (`TA_ERROR_INVALID`). The
   clock goes on from the snapshot's time: the ticks it reads carry an
   offset (`ticks_offset`, mod 2^64) set at the restore, whatever clock
-  reads them. A declaring session's globals are read by their names
-  (`(0, eval)(name)` in its context), for hibernation, migration and
-  snapshots alike: bun's vm context leaves a global's property stale after
-  a function writes its `var` (spike, bun 1.4.1, 2026-10-16).
+  reads them.
 - **Measured cost per session** (`mise run measure`, 2026-10-17: x86_64
   Linux 6.18, Intel Xeon @ 2.10GHz, 4 CPUs, 16 GiB; node 22.23.3 with V8
   12.4, bun 1.4.1; 10,000 actors of a chart with three `<data>`, one of
@@ -762,6 +841,30 @@ file.
   Tests: `test/datamodel.test.mjs: 'the scope refuses an undeclared
   assignment, a system variable and _event'` and `'a syntax error is its
   own evaluation's error.execution: the chart's other expressions run'`.
+- **A script's top-level declarations are the session's or the chart's,
+  never a context of their own:** a chart-level script's functions are
+  its chart's helpers, made once and on its prototype only, seeing no
+  session variable by name; a top-level `var` is a variable of the
+  session, kept between runs and hibernated; a top-level `let`, `const` or
+  `class` is the script's `error.execution`, and the compile call reports
+  each at the script's line. Tests: `test/datamodel.test.mjs: 'a
+  chart-level script's functions are the chart's helpers (W3C 452), its
+  top-level var the session's'`, `'a script's top-level var is a variable
+  of the session, kept between its runs (W3C 303)'`, `'the native
+  datamodel refuses a script's top-level let, const and class:
+  error.execution, naming <data>'`, `'the native datamodel: helpers see no
+  session variable, and are their chart's alone'` and `'the native
+  datamodel: a function a script of executable content declares is that
+  run's'`; `test/compile.test.mjs: 'compileCharts reports a script's
+  top-level declarations at the script's line: let, const and class
+  refused, var a variable, both naming <data>'`;
+  `test/hibernation.test.mjs: 'a chart with helpers: its var comes back
+  with the blob, its helpers with the chart'` and `'a script's let: native
+  refuses the script and hibernates the actor, quickjs keeps the
+  binding'`; `test/snapshot.test.mjs: 'a chart with a var and a helper:
+  the var comes back with the snapshot, the helper with the chart'`;
+  `test/migration.test.mjs: 'native: a chart with a var and a helper
+  migrates: its old names go, the new chart's var is declared'`.
 - **One handle scope per vtable entry:** a run is one native call, so
   handles opened by the entries would pile up until it returns
   (`napi_open_handle_scope` around each entry). No test: handles live
@@ -889,6 +992,24 @@ file.
 - **Sweep and wake refuse numbers out of range**, never wrapped. Test:
   `test/hibernation.test.mjs: 'sweep, hibernate and wake refuse numbers out
   of range'`.
+- **An ask is a row of the pending table, and its reply never reaches
+  the application's transport;** an aborted or stale ask's reply is
+  dropped, and an ask pending at `close()` never settles. Test:
+  `test/actors.test.mjs: 'ask: the reply to _event.origin settles the
+  promise with [event, data], past the application's transport'`.
+- **The store never loses an actor:** a save that throws or rejects wakes
+  the actor back from its blob, and an actor terminated while hibernated
+  is woken to end, its blob deleted. (A load that comes while the
+  session's save is pending waits for it: `loaded` in
+  `lib/convenience.mjs`; no test makes the two meet.) Tests: `test/actors.test.mjs: 'a store whose save throws
+  wakes the actor back; one whose methods return promises is awaited'`
+  and `'a store and a resident bound: the surplus hibernated after a
+  turn, a WAKE loads, wakes and deletes'`.
+- **The application layer refuses what it replaced:** `wake`, a
+  `systemID` or `ioProcessors` in `config`, a processor that is a plain
+  function. Test: `test/actors.test.mjs: 'the options are the API's:
+  removed ones refused, config never holds the system id or the
+  processors'`.
 - **Pending handlers are dropped at `ta_host_free`**, never called.
   Tests: `test/methods.test.mjs: 'pending handlers are never called after
   close; a method on a closed host throws'`; `test/rules.test.mjs: 'a
@@ -908,7 +1029,7 @@ file.
   given, where a safe integer is CBOR's integer as a bigint is. 0, 0n, a
   negative, a fraction, a number past 2^53-1, a bigint past 64 bits or
   another type is a `TypeError`, and a value's bigint past 64 bits
-  `TA_ERROR_INVALID`. What the API gives back (`spawn`, `actorByName`,
+  `TA_ERROR_INVALID`. What the API gives back (`Actor.id`,
   `sweep`, a view's `session`) stays a bigint. Tests:
   `test/rules.test.mjs: 'sessions are bigints from 1 to 2^64-1 or safe
   integers from 1, never a number that saturates'` (a value's bigints
@@ -929,10 +1050,11 @@ file.
   deadline keeps the process alive while the host is open (bindings.md,
   section 11), that a handler's error ends the process by default, and
   that `using` needs a runtime that parses it (bun 1.4 does, node 22 does
-  not); and (decided 2026-10-17, l-coord-decisions) that a chart whose
-  scripts declare with `let`, `const` or `class` keeps its sessions
-  resident, that the charts of a host share the builtins of its shared
-  context; and its services guide (`docs/guide/services.md`) that a
+  not); and (decided 2026-10-17, l-coord-decisions; 2026-11-19) that a
+  chart-level script's functions are the chart's helpers, a script's
+  top-level `var` a variable of the session and its top-level `let`,
+  `const` or `class` refused, that the charts of a host share the builtins
+  of its shared context; and its services guide (`docs/guide/services.md`) that a
   service handler returns the service or a promise of it, with the
   pattern of a service whose methods await its own start.
   Tests: `test/rules.test.mjs: 'the README says what no test can
@@ -956,10 +1078,13 @@ file.
 - No handle table, status table, arena or image rows of our own
   (`ta_table`, `ta_status_name`, `ta_growable_arena`, `ta_host_add_image`
   copies).
-- No application callback for `DONE` or `ERROR`; no subscription.
-- No defaults, limits, methods, events or messages of our own (the one
-  exception, the maintainer's: a host that names no datamodel gets the
-  native one); nothing C
+- No subscription; `DONE` and `ERROR` reach the application only as an
+  actor's end (`onDone`, `onError`, `actor.done`).
+- No defaults, limits, methods, events or messages of our own (the
+  exceptions, the maintainer's: a host that names no datamodel gets the
+  native one; and step 8.6's, as the Python binding's: the reserved system
+  `tinyactors-ask` of `actor.ask`, the `Spawner`'s `spawned` answer, and
+  the resident trim's sweep of 1024 sessions at a time); nothing C
   does done again in JavaScript (bindings.md section 2); no JavaScript
   above the addon but the convenience layer, over the addon's exports
   only ("Layers and the resolver").
@@ -1010,8 +1135,8 @@ manages its development dependencies; the C toolchain is the root's.
 - `mise run migration [--actors N] [--resident R] [--events E]`: the
   migration gate (`tools/migration.mjs`): the same population of a
   counter's version 1, at most R resident, moved to version 2 with
-  `migrate({wake: true})` while E events come, the migration's WAKEs woken
-  a batch at a time; every sampled count and version checked, none left
+  `migrate({wake: true})` while E events come, the migration's WAKEs
+  loaded by the host as its `resident` bound allows; every sampled count and version checked, none left
   behind, version 1's segment retired. `mise run test` runs it as
   `stress`'s fast and full sizes.
 - `mise run snapshot [--actors N] [--resident R] [--events E]`: the
@@ -1121,7 +1246,9 @@ manages its development dependencies; the C toolchain is the root's.
   bun and in Chromium) and, with Docker, the addon in Node.js
   (Debian, Alpine) and Bun containers of each Linux architecture,
   `SHA256SUMS`, into `build/dist/<version>/`; with `--publish`, `npm
-  publish` with fnox's `NPM_TOKEN` (platform packages first), then the
+  stage publish` (npm 12, through `npx`) with fnox's `NPM_TOKEN`, read from
+  1Password (root `fnox.toml`), platform packages first, each public once the
+  maintainer approves it on npmjs.com, then the
   root's `Release.push_and_release!`: the push, a snapshot of
   `tinyactors-napi/` pushed to tinyactors-dev/tinyactors-napi tagged
   `v<version>`, and the GitHub release there (root `docs/adr/0016`).
@@ -1201,7 +1328,9 @@ tools/smoke-wasm*.mjs  @tinyactors/wasm's: node and bun, and Chromium (a page, a
 examples/            applications over the package, each with a README and a test (mise run examples);
                      order-fulfillment/: payment and shipping as invoked services, timeouts, retries, cancels
                      http-gateway/: node:http sessions as actors, rate limits, an async I/O processor, OTLP export
-                     chat-rooms/: rooms and users as actors, most hibernated in a file store, a bounded resident set
+                     chat-rooms/: the chat the application API was designed against: workspaces, rooms and connections,
+                       a processor per external system, Spawner, a file store and a resident bound,
+                       the three ways of a send to an actor that is not there
                      subscription-billing/: a live population migrated to a new chart version while it bills
                      turn-game/: a game server snapshotted to disk, killed, restored, its journal replayed
                      iot-rules/: customers' alert rules in the quickjs sandbox, one host per rule, hostile uploads reported

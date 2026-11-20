@@ -34,14 +34,14 @@ const parent = scxml('parent', `
  * 'hello', and the sink spawned. */
 function world() {
   const got = [];
-  const host = hostWith({ sink, src, fanout, parent }, { log: (h, entry) => { if (entry.label === 'got') got.push(entry.text); } });
-  host.spawnChart('sink', { name: 'sink' });
+  const host = hostWith({ sink, src, fanout, parent }, { log: (entry) => { if (entry.label === 'got') got.push(entry.text); } });
+  host.spawn('sink', { name: 'sink' });
   return { host, got };
 }
 
 test('200 actors that each send one event at entry to one actor', async () => {
   const { host, got } = world();
-  for (let i = 0; i < 200; i++) host.spawnChart('src');
+  for (let i = 0; i < 200; i++) host.spawn('src');
   await host.idle();
   equal(got.length, 200, 'events delivered');
   host.close();
@@ -49,7 +49,7 @@ test('200 actors that each send one event at entry to one actor', async () => {
 
 test('2000 actors that each send one event at entry to one actor', async () => {
   const { host, got } = world();
-  for (let i = 0; i < 2000; i++) host.spawnChart('src');
+  for (let i = 0; i < 2000; i++) host.spawn('src');
   await host.idle();
   equal(got.length, 2000, 'events delivered');
   host.close();
@@ -57,7 +57,7 @@ test('2000 actors that each send one event at entry to one actor', async () => {
 
 test('1000 sends from one <foreach>', async () => {
   const { host, got } = world();
-  host.spawnChart('fanout');
+  host.spawn('fanout');
   await host.idle();
   equal(got.length, 1000, 'events delivered');
   host.close();
@@ -65,7 +65,7 @@ test('1000 sends from one <foreach>', async () => {
 
 test('300 invokes at entry, each with its done.invoke', async () => {
   const { host, got } = world();
-  for (let i = 0; i < 300; i++) host.spawnChart('parent');
+  for (let i = 0; i < 300; i++) host.spawn('parent');
   await host.idle();
   equal(got.length, 300, 'done events delivered');
   host.close();

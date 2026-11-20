@@ -102,7 +102,7 @@ text in it, which does not parse either.
   clock, so a process that shares its CPUs with others still finds it.
   The counters answer while the host is busy.
 - **Named actors and spawn params**: a rule's actor for a device is named
-  by the device, found with `actorByName`, and spawned at the device's
+  by the device, found with `host.actor(device)`, and spawned at the device's
   first reading with `{ device, sustain }`.
 - **Delayed sends and `<cancel>`** for the device's watchdog, re-armed by
   every sample; a `SimulatedClock` in the test moves 30 s at once.
@@ -143,7 +143,7 @@ device, 2000 devices, from `hostStats` and the process:
 | quickjs, the template | 283 B | 115 B | 1.4 to 2.5 KB, 3.8 to 4.3 KB |
 | quickjs, the template plus `<script>var unit = 'C';</script>` | 283 B | 115 B | 63 KB, 62 KB |
 | native, the template | 283 B | 115 B | 1.0 to 2.2 KB, 4.1 to 4.6 KB |
-| native, plus the same script | 283 B | 115 B | 196 KB, 206 KB |
+| native, plus the same script | 287 B | 115 B | the template's (2.4 KB, 0.9 KB in one run, 2026-11-19): `unit` is a variable of the session |
 
 The region is what `hostStats` counts (`regionBytes` of a host sized
 for the devices, less one sized for one actor; `slabBytes.used`), and it
@@ -151,7 +151,8 @@ is the same for both datamodels: the rule's state and strings in core.
 The engine's own heap is not in core's counters (`host.quickjsHeapBytes`
 reads it), so resident is the process's growth, which varies between
 runs. A rule whose script declares a name gets an engine
-context per device: 62 KB on quickjs, so a rule with that one `var` over
+context per device on quickjs, 62 KB (the native datamodel makes a
+top-level `var` a variable of the session, which costs no context), so a rule with that one `var` over
 130 devices fills an 8 MB `memoryLimit` by itself. The platform's limit
 is per rule, so it is the customer's rule that fails, but the customer
 pays a context for every device their rule watches.

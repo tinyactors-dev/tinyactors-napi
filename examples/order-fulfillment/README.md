@@ -64,8 +64,8 @@ gateway's ledger at the end of a run.
   gateway's failure and calls `send.fail()`, so the chart gets
   `error.communication` and retries. The notifications to the customer are
   sends with no answer.
-- **Named actors** (`spawnChart('order', { name: id })`,
-  `host.actorByName`): the shop finds an order by its id to cancel it, and
+- **Named actors** (`host.spawn('order', { name: id })`,
+  `host.actor(id)`): the shop finds an order by its id to cancel it, and
   an order that reached a final state is gone, so a late cancel finds
   nothing.
 - **Spawn params** set the order, its items and its timings.

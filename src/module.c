@@ -63,14 +63,14 @@ napi_status ta_napi_arities(napi_env env, napi_value object, const ta_napi_arity
  * prototype methods (the typed methods' are methods.c's), and of the
  * views' (effects.c). */
 static const ta_napi_arity ta_napi_exported_arities[] = {
-    {"encode", 1},         {"decode", 1}, {"compileCharts", 3}, {"compileSystem", 3}, {"encodeHTTPPost", 1},
+    {"encode", 1},         {"decode", 1}, {"decodeTraces", 1}, {"compileCharts", 2}, {"compileSystem", 2}, {"encodeHTTPPost", 1},
     {"parseHTTPRequest", 1}, {"Host", 2},   {"Address", 1},       {NULL, 0},
 };
 static const ta_napi_arity ta_napi_host_static_arities[] = {{"restore", 3}, {NULL, 0}};
 static const ta_napi_arity ta_napi_host_arities[] = {
     {"addImage", 1}, {"chart", 1},     {"boot", 1},  {"spawn", 2},     {"send", 4},  {"fail", 2},
     {"sendMany", 1}, {"terminate", 1}, {"actorByName", 1}, {"sweep", 2}, {"hibernate", 1}, {"wake", 2},
-    {"migrate", 1},  {NULL, 0},
+    {"migrate", 1},  {"holdsImage", 1}, {"actorInfo", 1}, {"askOpen", 1}, {"askClose", 1}, {NULL, 0},
 };
 static const ta_napi_arity ta_napi_address_static_arities[] = {{"fromSession", 2}, {"fromName", 2}, {NULL, 0}};
 static const ta_napi_arity ta_napi_clock_arities[] = {{"increment", 1}, {NULL, 0}};
@@ -92,27 +92,59 @@ static napi_status ta_napi_module_arities(napi_env env, napi_value exports) {
 
 /* ---- TinyactorsError ------------------------------------------------------ */
 
-/* The class index.d.ts declares, an Error subclass with read-only `code`,
- * `reason`, `path` and `status` (undefined when not given). It is defined
- * by a script, once per environment: a class made with napi_define_class
- * is not an Error (no stack, no [[ErrorData]]), and extending Error is
- * the language's own `class ... extends`. */
+/* The classes index.d.ts declares: TinyactorsError, an Error subclass
+ * with read-only `code`, `reason`, `path` and `status` (undefined when not
+ * given), and one subclass per status an application branches on
+ * (StaleError, StateError, InvalidError, UnsupportedError). `new
+ * TinyactorsError(message, {status})` makes the subclass of that status
+ * itself, and a typed method's error the subclass of its code (-32001
+ * stale, -32002 state, any other invalid), so no call that throws chooses
+ * a class. They are defined by a script, once per environment: a class
+ * made with napi_define_class is not an Error (no stack, no
+ * [[ErrorData]]), and extending Error is the language's own `class ...
+ * extends`. The script's value is the classes, TinyactorsError first. */
 static const char ta_napi_error_source[] =
-    "(class TinyactorsError extends Error {\n"
-    "  constructor(message, options) {\n"
-    "    super(message);\n"
-    "    const given = options ?? {};\n"
-    "    Object.defineProperties(this, {\n"
-    "      code: { value: given.code, enumerable: true },\n"
-    "      reason: { value: given.reason, enumerable: true },\n"
-    "      path: { value: given.path, enumerable: true },\n"
-    "      status: { value: given.status, enumerable: true },\n"
-    "    });\n"
+    "(() => {\n"
+    "  let byStatus, byCode;\n"
+    "  class TinyactorsError extends Error {\n"
+    "    constructor(message, options) {\n"
+    "      const given = options ?? {};\n"
+    "      if (new.target === TinyactorsError) {\n"
+    "        const subclass = byStatus[given.status] ?? (given.code === undefined ? undefined : byCode(given.code));\n"
+    "        if (subclass !== undefined) return new subclass(message, options);\n"
+    "      }\n"
+    "      super(message);\n"
+    "      Object.defineProperties(this, {\n"
+    "        code: { value: given.code, enumerable: true },\n"
+    "        reason: { value: given.reason, enumerable: true },\n"
+    "        path: { value: given.path, enumerable: true },\n"
+    "        status: { value: given.status, enumerable: true },\n"
+    "      });\n"
+    "    }\n"
+    "    get name() { return 'TinyactorsError'; }\n"
     "  }\n"
-    "  get name() { return 'TinyactorsError'; }\n"
-    "})";
+    "  const of = (name, status) => ({ [name]: class extends TinyactorsError {\n"
+    "    constructor(message, options) {\n"
+    "      const given = options ?? {};\n"
+    "      super(message, given.code === undefined ? { ...given, status: given.status ?? status } : given);\n"
+    "    }\n"
+    "    get name() { return name; }\n"
+    "  } })[name];\n"
+    "  const StaleError = of('StaleError', 'TA_ERROR_STALE');\n"
+    "  const StateError = of('StateError', 'TA_ERROR_STATE');\n"
+    "  const InvalidError = of('InvalidError', 'TA_ERROR_INVALID');\n"
+    "  const UnsupportedError = of('UnsupportedError', 'TA_ERROR_UNSUPPORTED');\n"
+    "  byStatus = { __proto__: null, TA_ERROR_STALE: StaleError, TA_ERROR_STATE: StateError,\n"
+    "    TA_ERROR_INVALID: InvalidError, TA_ERROR_UNSUPPORTED: UnsupportedError };\n"
+    "  byCode = (code) => code === -32001 ? StaleError : code === -32002 ? StateError : InvalidError;\n"
+    "  return [TinyactorsError, StaleError, StateError, InvalidError, UnsupportedError];\n"
+    "})()";
 
-static napi_status ta_napi_error_class(napi_env env, napi_value *out) {
+/* The names of the classes the script gives, in its order. */
+static const char *const ta_napi_error_names[] = {"TinyactorsError", "StaleError", "StateError", "InvalidError",
+                                                  "UnsupportedError"};
+
+static napi_status ta_napi_error_classes(napi_env env, napi_value *out) {
     napi_value source;
     napi_status status = napi_create_string_utf8(env, ta_napi_error_source, sizeof ta_napi_error_source - 1, &source);
     if (status != napi_ok) return status;
@@ -192,6 +224,7 @@ static void ta_napi_instance_finalize(napi_env env, void *data, void *hint) {
     ta_napi_instance *instance = (ta_napi_instance *)data;
     (void)hint;
     if (instance->error != NULL) napi_delete_reference(env, instance->error);
+    if (instance->errors != NULL) napi_delete_reference(env, instance->errors);
     if (instance->object != NULL) napi_delete_reference(env, instance->object);
     if (instance->keys != NULL) napi_delete_reference(env, instance->keys);
     if (instance->turn != NULL) napi_delete_reference(env, instance->turn);
@@ -230,8 +263,10 @@ static ta_napi_instance *ta_napi_instance_new(napi_env env) {
         napi_throw_error(env, NULL, "@tinyactors/node: napi_set_instance_data failed");
         return NULL;
     }
-    napi_value class, global, object, prototype, keys, handlers;
-    if (ta_napi_error_class(env, &class) != napi_ok ||
+    napi_value classes, class, global, object, prototype, keys, handlers;
+    if (ta_napi_error_classes(env, &classes) != napi_ok ||
+        napi_create_reference(env, classes, 1, &instance->errors) != napi_ok ||
+        napi_get_element(env, classes, 0, &class) != napi_ok ||
         napi_create_reference(env, class, 1, &instance->error) != napi_ok ||
         napi_get_global(env, &global) != napi_ok ||
         napi_get_named_property(env, global, "Object", &object) != napi_ok ||
@@ -253,13 +288,19 @@ static ta_napi_instance *ta_napi_instance_new(napi_env env) {
 static napi_value ta_napi_module_init(napi_env env, napi_value exports) {
     ta_napi_instance *instance = ta_napi_instance_new(env);
     if (instance == NULL) return NULL;
-    napi_value class;
-    if (napi_get_reference_value(env, instance->error, &class) != napi_ok) return NULL;
+    napi_value classes;
+    if (napi_get_reference_value(env, instance->errors, &classes) != napi_ok) return NULL;
     napi_property_descriptor properties[] = {
         {"encode", NULL, ta_napi_encode, NULL, NULL, NULL, napi_enumerable, NULL},
         {"decode", NULL, ta_napi_decode, NULL, NULL, NULL, napi_enumerable, NULL},
-        {"TinyactorsError", NULL, NULL, NULL, NULL, class, napi_enumerable, NULL},
+        {"decodeTraces", NULL, ta_napi_decode_traces, NULL, NULL, NULL, napi_enumerable, NULL},
     };
+    for (uint32_t i = 0; i < sizeof ta_napi_error_names / sizeof ta_napi_error_names[0]; i++) {
+        napi_value class;
+        if (napi_get_element(env, classes, i, &class) != napi_ok ||
+            napi_set_named_property(env, exports, ta_napi_error_names[i], class) != napi_ok)
+            return NULL;
+    }
     if (napi_define_properties(env, exports, sizeof properties / sizeof properties[0], properties) != napi_ok ||
         ta_napi_host_define(env, exports) != napi_ok || ta_napi_loop_define(env, exports) != napi_ok ||
         ta_napi_compile_define(env, exports) != napi_ok || ta_napi_address_define(env, exports) != napi_ok ||

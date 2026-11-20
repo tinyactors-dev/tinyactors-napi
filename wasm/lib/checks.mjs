@@ -5,10 +5,12 @@
 // A session an input takes: a bigint from 1 to 2^64-1, or a number that is
 // a safe integer from 1; as a bigint.
 export function sessionOf(value) {
+  // an Actor (the application layer's): its id, a bigint
+  if (value !== null && typeof value === 'object' && typeof value.id === 'bigint') value = value.id;
   if (typeof value === 'bigint') {
     if (value >= 1n && value < 1n << 64n) return value;
   } else if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1) return BigInt(value);
-  throw new TypeError('a session is a bigint from 1 to 2^64-1 or a safe integer from 1');
+  throw new TypeError('a session is an Actor, a bigint from 1 to 2^64-1 or a safe integer from 1');
 }
 
 // A non-negative integer at most `limit` (2^32-1 unless said).

@@ -3,7 +3,7 @@
 // the payment and shipping services it invokes, the refunds it sends, and
 // the notifications it sends to the customer.
 import { readFileSync } from 'node:fs';
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, StaleError, TinyactorsError } from '@tinyactors/node';
 import { OutOfStock } from './world.mjs';
 
 const ORDER_CHART = readFileSync(new URL('./charts/order.scxml', import.meta.url), 'utf8');
@@ -32,32 +32,31 @@ export class Shop {
     /** order id -> { promise, resolve } of its last notification */
     this.endings = new Map();
 
-    this.host = new Host(
-      { systemID: 'shop', ioProcessors: [{ type: 'urn:shop:notify' }, { type: 'urn:shop:refunds' }] },
-      {
+    const compiled = compileCharts([{ name: 'order.scxml', text: ORDER_CHART }]);
+    this.host = new Host(compiled, {
+        system: 'shop',
         clock,
         datamodel,
         services: {
-          'urn:shop:payment': (host, invocation) => this.payment(invocation),
-          'urn:shop:shipping': (host, invocation) => this.shipping(invocation),
+          'urn:shop:payment': (invocation) => this.payment(invocation),
+          'urn:shop:shipping': (invocation) => this.shipping(invocation),
         },
         ioProcessors: {
-          'urn:shop:notify': (host, send) => this.notify(send.event, send.data),
-          // An async handler: its send stays readable after the await. It
+          'urn:shop:notify': { receive: (send) => this.notify(send.event, send.data) },
+          // An async receive: its send stays readable after the await. It
           // catches its own failure and fails the send, so the chart gets
           // error.communication and retries, and no error leaves the turn.
-          'urn:shop:refunds': async (host, send) => {
+          'urn:shop:refunds': { receive: async (send) => {
             try {
               send.answer('refunded', { amount: await this.gateway.refund(send.data.order) });
             } catch {
               send.fail();
             }
-          },
+          } },
         },
-        log: (host, entry) => this.logs.push(entry.text),
-      },
-    );
-    this.host.addCharts({ 'order.scxml': ORDER_CHART });
+        log: (entry) => this.logs.push(entry.text),
+      });
+    compiled.close();
   }
 
   /** Places an order: an actor named by the order's id. Resolves, through
@@ -66,20 +65,18 @@ export class Shop {
     let resolve;
     const promise = new Promise((r) => { resolve = r; });
     this.endings.set(id, { promise, resolve });
-    return this.host.spawnChart('order', { name: id, params: { order: id, items, address, ...this.timing } });
+    return this.host.spawn('order', { name: id, params: { order: id, items, address, ...this.timing } });
   }
 
   /** The customer asks to cancel. Answers `'requested'` when the order is
    * still running (the chart decides whether it can), or `'unknown'` when
    * there is no such order any more: it ended, or never was. */
   cancel(id) {
-    const session = this.host.actorByName(id);
-    if (session === undefined) return 'unknown';
     try {
-      this.host.send(session, 'cancel');
+      this.host.actor(id).send('cancel');
     } catch (error) {
-      // the actor ended between the lookup and the send
-      if (error instanceof TinyactorsError && error.status === 'TA_ERROR_STALE') return 'unknown';
+      // no such order, or it ended between the lookup and the send
+      if (error instanceof StaleError) return 'unknown';
       throw error;
     }
     return 'requested';
@@ -140,7 +137,7 @@ export class Shop {
       if (!ended && invocation.running) invocation.done({ trackingID });
     })().catch((error) => tell('shipping.error', { reason: error.message }));
     return {
-      receive(host, send) {
+      receive(send) {
         if (send.event === 'cancel' && warehouse.release(order)) tell('shipping.cancelled');
       },
       stop() {

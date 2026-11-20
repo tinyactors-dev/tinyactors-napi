@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A workspace: the collection of its rooms, and who may make them.
+
+     It decides which rooms exist: a connection asks it for one
+     (room.create), it checks the asker and the name, and asks the
+     application's Spawner (type "spawn") for the room. A room tells its
+     workspace it has started (room.started), so the workspace learns of
+     every room the same way, made here or brought back by the
+     application after a restart.
+
+     A workspace never ends. When it is idle, the host hibernates it into
+     the store; a send to its name (tinyactors://chat/@workspace.<id>)
+     wakes it. Its helpers are in workspace.js: functions that take the
+     variables they read as arguments. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="workspace" initial="ready">
+  <script src="workspace.js"/>
+  <datamodel>
+    <data id="id"/>                       <!-- given at spawn -->
+    <data id="owners" expr="[]"/>         <!-- given at spawn: who may make rooms -->
+    <data id="rooms" expr="({})"/>        <!-- room name -> the room's address -->
+    <data id="creating" expr="({})"/>     <!-- spawn sendid -> {name, by}: the connection that asked -->
+    <data id="sendid"/>
+  </datamodel>
+  <state id="ready">
+    <transition event="room.create" cond="refusal(owners, rooms, creating, _event) === null">
+      <send type="spawn" event="room" idlocation="sendid">
+        <content expr="roomSpawn(id, _event)"/>
+      </send>
+      <assign location="creating" expr="withEntry(creating, sendid, { name: _event.data.name, by: _event.origin })"/>
+    </transition>
+    <transition event="room.create">
+      <send targetexpr="_event.origin" event="room.refused">
+        <content expr="{ name: _event.data.name, reason: refusal(owners, rooms, creating, _event) }"/>
+      </send>
+    </transition>
+
+    <!-- the Spawner's answer, by the sendid of the spawn -->
+    <transition event="spawned" cond="_event.sendid in creating">
+      <send targetexpr="creating[_event.sendid].by" event="room.created">
+        <content expr="{ room: creating[_event.sendid].name }"/>
+      </send>
+      <assign location="creating" expr="withoutEntry(creating, _event.sendid)"/>
+    </transition>
+    <transition event="error.communication" cond="_event.sendid in creating">
+      <send targetexpr="creating[_event.sendid].by" event="room.refused">
+        <content expr="{ name: creating[_event.sendid].name, reason: 'spawn failed' }"/>
+      </send>
+      <assign location="creating" expr="withoutEntry(creating, _event.sendid)"/>
+    </transition>
+
+    <!-- a room that started: made here, or by the application at a restart -->
+    <transition event="room.started">
+      <assign location="rooms" expr="withEntry(rooms, _event.data.name, _event.origin)"/>
+    </transition>
+
+    <!-- the application's ask: the rooms' names -->
+    <transition event="rooms.list">
+      <send targetexpr="_event.origin" event="rooms">
+        <content expr="{ rooms: Object.keys(rooms).sort() }"/>
+      </send>
+    </transition>
+  </state>
+</scxml>

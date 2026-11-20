@@ -82,7 +82,8 @@ typedef struct ta_napi_instance {
     napi_env env;
     ta_allocator allocator;
     ta_growable_arena arena;
-    napi_ref error;
+    napi_ref error;  /* TinyactorsError */
+    napi_ref errors; /* the error classes, TinyactorsError first (module.c) */
     napi_ref object;
     napi_ref keys;
     napi_ref turn;
@@ -258,6 +259,7 @@ bool ta_napi_bytes_of(napi_env env, napi_value value, ta_napi_bytes *bytes);
 /* The exports encode(value) and decode(bytes). */
 napi_value ta_napi_encode(napi_env env, napi_callback_info info);
 napi_value ta_napi_decode(napi_env env, napi_callback_info info);
+napi_value ta_napi_decode_traces(napi_env env, napi_callback_info info);
 
 /* ---- host.c: the Host (AGENTS.md, "The binding's memory") ------------- */
 
@@ -285,7 +287,6 @@ typedef struct ta_napi_chart_row {
     napi_ref functions;   /* its record (datamodel/datamodel.h) */
     const ta_image *image; /* the image it is attached from, until chart_detach */
     uint32_t chart;       /* its index in the image */
-    uint32_t flags;       /* TA_NAPI_CHART_* */
     uint32_t segment;     /* the segment that attached it (ta_datamodel_chart.segment): with
                              `chart`, what names a session's chart in a snapshot, since two
                              segments may run one image */
@@ -499,6 +500,11 @@ napi_value ta_napi_native_value(ta_napi_native *native, ta_payload payload);
  * node as its XML text; a primitive as it is. NULL with an exception
  * pending. */
 napi_value ta_napi_native_exported(ta_napi_native *native, ta_payload payload);
+/* The kit of the realm's script run in the application's realm, made once
+ * per environment: what it makes is the application's (instanceof Array
+ * holds there), and the compile call asks it what a script declares. NULL
+ * with an exception pending. */
+napi_value ta_napi_realm_application(napi_env env);
 /* The drops let go: after the outer call into core returns. */
 void ta_napi_native_flush(ta_napi_native *native);
 /* After ta_host_free: the datamodel's own references and output, with
@@ -593,6 +599,20 @@ void ta_napi_drain(napi_env env, ta_napi_drain_state *state);
 
 /* Keeps the pending exception as the host's error, unless one is kept
  * already (the first is reported); the exception is cleared. */
+/* A handler's error: given to the host's handlerError hook, called with
+ * (error, effect) where `effect` is the view or record the handler got
+ * (NULL: undefined), or else kept for the turn (the first one kept). A
+ * throw of the hook's own is kept. ta_napi_handler_failed takes the
+ * pending exception (nothing when none is); ta_napi_handler_rejected a
+ * promise's rejection, answering whether a hook took it (the exception
+ * pending before it is cleared). ta_napi_keep_error is handler_failed with
+ * no effect. */
+typedef struct ta_napi_handler_error {
+    ta_napi_host *host;
+    napi_value effect;
+} ta_napi_handler_error;
+void ta_napi_handler_failed(napi_env env, const ta_napi_handler_error *failure);
+bool ta_napi_handler_rejected(napi_env env, const ta_napi_handler_error *failure, napi_value error);
 void ta_napi_keep_error(napi_env env, ta_napi_host *host);
 /* Throws the kept error, cleared; false when none was kept. */
 bool ta_napi_throw_kept(napi_env env, ta_napi_host *host);

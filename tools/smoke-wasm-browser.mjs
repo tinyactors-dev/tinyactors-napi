@@ -22,7 +22,7 @@ const IMPORT_MAP = JSON.stringify({ imports: { '@tinyactors/wasm': `${PACKAGE}/i
 const hash = createHash('sha256').update(IMPORT_MAP).digest('base64');
 // the guide's policy, and the import map's hash
 const POLICY = `script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' 'sha256-${hash}'`;
-const TYPES = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.html': 'text/html' };
+const TYPES = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.html': 'text/html' };
 
 const report = (where) => `.then((failures) => report(failures), (error) => report([String(error?.stack ?? error)]));
 function report(failures) { ${where} }`;

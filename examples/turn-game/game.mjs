@@ -6,17 +6,25 @@
 // crash it restores the last checkpoint with Host.restore and replays the
 // journal on top of it, or drops it, as its recovery policy says.
 import { readFileSync } from 'node:fs';
-import { Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, SimulatedClock, StaleError, TinyactorsError } from '@tinyactors/node';
 
 const chart = (name) => readFileSync(new URL(`./charts/${name}`, import.meta.url), 'utf8');
-const CHARTS = { 'lobby.scxml': chart('lobby.scxml'), 'match.scxml': chart('match.scxml'), 'player.scxml': chart('player.scxml') };
+const CHARTS = ['lobby.scxml', 'match.scxml', 'player.scxml'].map((name) => ({ name, text: chart(name) }));
 
-/** The host's config: the same for `new Host` and for `Host.restore`, which
- * checks its systemID; the I/O processors are not in the snapshot. */
-export const CONFIG = {
-  systemID: 'game',
-  ioProcessors: [{ type: 'urn:game:spectators' }, { type: 'urn:game:control' }],
-};
+/** The charts' image, compiled once: what `new Host` runs, and what
+ * `Host.restore` finds its snapshot holds already. */
+const IMAGE = (() => {
+  const compiled = compileCharts(CHARTS);
+  try {
+    return compiled.image;
+  } finally {
+    compiled.close();
+  }
+})();
+
+/** The system id: the same for `new Host` and for `Host.restore`, which
+ * checks it; the I/O processors are not in the snapshot. */
+export const SYSTEM = 'game';
 
 /** An actor's address: inputs reach the players and the matches by name. */
 const address = (name) => `tinyactors://game/@${name}`;
@@ -36,7 +44,7 @@ class Matchmaker {
     this.queue = [];
   }
 
-  receive(host, send) {
+  receive(send) {
     const { event, data } = send;
     if (event === 'enqueue') this.queue.push({ player: data.player, rating: data.rating });
     else if (event === 'dequeue') this.queue = this.queue.filter((w) => w.player !== data.player);
@@ -113,25 +121,25 @@ export class GameServer {
 
   #options(clock) {
     return {
+      system: SYSTEM,
       clock,
       datamodel: this.datamodel,
       ioProcessors: {
-        'urn:game:spectators': (host, send) => this.#spectate(host, send),
-        'urn:game:control': (host, send) => this.#control(host, send),
+        'urn:game:spectators': { receive: (send) => this.#spectate(send.host, send) },
+        'urn:game:control': { receive: (send) => this.#control(send.host, send) },
       },
       services: {
-        'urn:game:matchmaking': (host, invocation) => this.#matchmaking(host, invocation),
+        'urn:game:matchmaking': (invocation) => this.#matchmaking(invocation.host, invocation),
       },
-      log: (host, entry) => {
-        if (host === this.host) this.logs.push(`${entry.label}: ${entry.text}`);
+      log: (entry) => {
+        if (entry.host === this.host) this.logs.push(`${entry.label}: ${entry.text}`);
       },
     };
   }
 
   async #create() {
-    this.host = new Host(CONFIG, this.#options(this.clock));
-    this.host.addCharts(CHARTS);
-    this.host.spawnChart('lobby', { name: 'lobby', params: this.rules });
+    this.host = new Host(IMAGE, this.#options(this.clock));
+    this.host.spawn('lobby', { name: 'lobby', params: this.rules });
     await this.host.idle();
     this.store.truncateJournal();
     await this.checkpoint();
@@ -159,7 +167,7 @@ export class GameServer {
     if (!this.#mine(host)) return;
     if (send.event !== 'match.create') return send.fail();
     const { match, players, turnMs, maxTimeouts } = send.data;
-    host.spawnChart('match', { name: match, params: { match, players: [...players], turnMs, maxTimeouts } });
+    host.spawn('match', { name: match, params: { match, players: [...players], turnMs, maxTimeouts } });
   }
 
   #matchmaking(host, invocation) {
@@ -211,9 +219,14 @@ export class GameServer {
   #apply(host, entry) {
     try {
       switch (entry.op) {
-        case 'register':
-          return host.actorByName(`player-${entry.name}`)
-            ?? host.spawnChart('player', { name: `player-${entry.name}`, params: { name: entry.name, rating: entry.rating } });
+        case 'register': {
+          try {
+            return host.actor(`player-${entry.name}`).id;
+          } catch (error) {
+            if (!(error instanceof StaleError)) throw error;
+          }
+          return host.spawn('player', { name: `player-${entry.name}`, params: { name: entry.name, rating: entry.rating } }).id;
+        }
         case 'queue':
           host.send(address(`player-${entry.name}`), 'queue', { ticket: entry.ticket });
           return true;
@@ -297,9 +310,9 @@ export class GameServer {
       this.stats.lost += entries.length;
       if (entries.length > 0) this.seq = entries.at(-1).seq;
     }
-    this.host = Host.restore(snapshot, CONFIG, this.#options(this.clock));
+    this.host = Host.restore(snapshot, IMAGE, this.#options(this.clock));
     await this.host.idle(); // the matchmaker announced, restarted and given the waiting players
-    this.host.send(this.host.actorByName('lobby'), 'sync');
+    this.host.actor('lobby').send('sync');
     await this.host.idle();
     await this.checkpoint();
     this.stats.recoveries++;
@@ -308,7 +321,7 @@ export class GameServer {
   async #replay(snapshot, entries) {
     const clock = new SimulatedClock(); // reads the snapshot's time
     this.replaying = true;
-    const host = this.host = Host.restore(snapshot, CONFIG, this.#options(clock));
+    const host = this.host = Host.restore(snapshot, IMAGE, this.#options(clock));
     try {
       await host.idle();
       for (const entry of entries) {
@@ -336,26 +349,34 @@ export class GameServer {
 
   /** A player's record: its variables and its state. */
   async player(name) {
-    const session = this.host.actorByName(`player-${name}`);
-    if (session === undefined) return undefined;
-    const [{ variables }, { value }] = await Promise.all([
-      this.host.actorContext({ session }), this.host.actorState({ session }),
-    ]);
-    return { session, state: value, ...variables };
+    const actor = this.#named(`player-${name}`);
+    if (actor === undefined) return undefined;
+    const [{ variables }, { value }] = await Promise.all([actor.context(), actor.state()]);
+    return { session: actor.id, state: value, ...variables };
   }
 
   /** The lobby's variables. */
   async lobby() {
-    const { variables } = await this.host.actorContext({ session: this.host.actorByName('lobby') });
+    const { variables } = await this.host.actor('lobby').context();
     return variables;
   }
 
   /** A match's variables, or undefined once it is over. */
   async match(name) {
-    const session = this.host.actorByName(name);
-    if (session === undefined) return undefined;
-    const { variables } = await this.host.actorContext({ session });
-    return { session, ...variables };
+    const actor = this.#named(name);
+    if (actor === undefined) return undefined;
+    const { variables } = await actor.context();
+    return { session: actor.id, ...variables };
+  }
+
+  /** The live actor named `name`, or undefined. */
+  #named(name) {
+    try {
+      return this.host.actor(name);
+    } catch (error) {
+      if (error instanceof StaleError) return undefined;
+      throw error;
+    }
   }
 
   close() {

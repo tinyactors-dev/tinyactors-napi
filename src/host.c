@@ -321,7 +321,8 @@ static bool ta_napi_quickjs_config(napi_env env, napi_value given, ta_datamodel_
  * `handlers`, the object the wrapper holds, with the Map of the invoked
  * services that run (`invocations`). */
 static bool ta_napi_handlers_read(napi_env env, const ta_napi_options *options, napi_value handlers) {
-    static const char *const functions[] = {"log", "transport", "telemetry", "wake", "migrated", "migrationDone"};
+    static const char *const functions[] = {"log",  "transport", "telemetry",    "wake", "migrated",
+                                            "migrationDone", "done", "error", "handlerError", "idle"};
     static const char *const maps[] = {"ioProcessors", "services"};
     for (size_t i = 0; i < sizeof functions / sizeof functions[0]; i++) {
         napi_value value = ta_napi_option(env, options, functions[i]);
@@ -342,10 +343,14 @@ static bool ta_napi_handlers_read(napi_env env, const ta_napi_options *options, 
             return false;
         }
         for (uint32_t j = 0; j < count; j++) {
+            napi_value receive = NULL;
             if (napi_get_element(env, names, j, &name) != napi_ok || napi_get_property(env, value, name, &handler) != napi_ok)
                 return false;
-            if (!ta_napi_is(env, handler, napi_function)) {
-                napi_throw_type_error(env, NULL, "ioProcessors and services are objects of a type -> its handler");
+            if (i == 0 ? !ta_napi_is(env, handler, napi_object) || napi_get_named_property(env, handler, "receive", &receive) != napi_ok ||
+                             !ta_napi_is(env, receive, napi_function)
+                       : !ta_napi_is(env, handler, napi_function)) {
+                napi_throw_type_error(env, NULL, i == 0 ? "ioProcessors is an object of a type -> its processor, an object with receive(send)"
+                                                        : "services is an object of a type -> its handler, a function");
                 return false;
             }
         }
@@ -802,7 +807,8 @@ static bool ta_napi_host_keep(napi_env env, napi_value self, napi_value handlers
 /* new Host(config, options) */
 static napi_value ta_napi_host_new(napi_env env, napi_callback_info info) {
     static const char *const known[] = {"ioProcessors", "transport", "log", "clock", "telemetry", "wake",
-                                        "migrated", "migrationDone", "services", "datamodel", "quickjs"};
+                                        "migrated", "migrationDone", "services", "datamodel", "quickjs",
+                                        "done", "error", "handlerError", "idle"};
     size_t argc = 2;
     napi_value argv[2] = {NULL, NULL}, self, target, handlers, undefined;
     /* Host.restore's snapshot, taken before any JavaScript runs: a Host made
@@ -813,7 +819,7 @@ static napi_value ta_napi_host_new(napi_env env, napi_callback_info info) {
     if (napi_get_cb_info(env, info, &argc, argv, &self, NULL) != napi_ok || napi_get_new_target(env, info, &target) != napi_ok)
         return NULL;
     if (target == NULL) {
-        napi_throw_type_error(env, NULL, "Host is a class: new Host(config, options)");
+        napi_throw_type_error(env, NULL, "Host is a class: new Host(charts, options)");
         return NULL;
     }
     if (napi_get_undefined(env, &undefined) != napi_ok) return NULL;
@@ -1082,6 +1088,11 @@ bool ta_napi_session_of(napi_env env, napi_value value, uint64_t *session) {
     double number = 0;
     napi_valuetype type = napi_undefined;
     bool ok = napi_typeof(env, value, &type) == napi_ok;
+    napi_value id;
+    /* an Actor (the application layer's): its id, a bigint */
+    if (ok && type == napi_object && napi_get_named_property(env, value, "id", &id) == napi_ok &&
+        napi_typeof(env, id, &type) == napi_ok && type == napi_bigint)
+        value = id;
     if (ok && type == napi_bigint)
         ok = napi_get_value_bigint_uint64(env, value, session, &lossless) == napi_ok && lossless;
     else if (ok && type == napi_number) {
@@ -1090,7 +1101,7 @@ bool ta_napi_session_of(napi_env env, napi_value value, uint64_t *session) {
         if (ok) *session = (uint64_t)number;
     } else ok = false;
     if (!ok || *session == 0) { /* 0 is core's "no session" (ta_host_actor_by_name) */
-        napi_throw_type_error(env, NULL, "a session is a bigint from 1 to 2^64-1 or a safe integer from 1");
+        napi_throw_type_error(env, NULL, "a session is an Actor, a bigint from 1 to 2^64-1 or a safe integer from 1");
         return false;
     }
     return true;
@@ -1174,6 +1185,91 @@ static napi_value ta_napi_host_actor_by_name(napi_env env, napi_callback_info in
         if (session == 0) napi_get_undefined(env, &result);
         else napi_create_bigint_uint64(env, session, &result);
     }
+    ta_napi_leave(&call);
+    return result;
+}
+
+/* host.holdsImage(image) -> boolean: whether a live segment runs an image
+ * of these bytes (ta_image_bytes); the application layer adds a restored
+ * host only the images its snapshot does not hold. */
+static napi_value ta_napi_host_holds_image(napi_env env, napi_callback_info info) {
+    ta_napi_arguments arguments = {1, {NULL}, NULL};
+    ta_napi_call call;
+    if (!ta_napi_arguments_of(env, info, &arguments) || !ta_napi_enter(env, arguments.self, &call)) return NULL;
+    napi_value result = NULL;
+    ta_napi_bytes image = {"holdsImage takes the image's bytes: a Uint8Array or an ArrayBuffer", {NULL, 0}};
+    if (ta_napi_bytes_of(env, arguments.argv[0], &image)) {
+        bool held = false;
+        uint32_t count = ta_host_segment_count(call.host->host);
+        for (uint32_t segment = 0; segment < count && !held; segment++) {
+            ta_host_segment_info segment_info;
+            memset(&segment_info, 0, sizeof segment_info);
+            segment_info.size = sizeof segment_info;
+            if (ta_host_segment_info_get(call.host->host, segment, &segment_info) != TA_OK || segment_info.image == NULL) continue;
+            ta_bytes bytes = ta_image_bytes(segment_info.image);
+            held = bytes.length == image.view.length && memcmp(bytes.pointer, image.view.pointer, bytes.length) == 0;
+        }
+        napi_get_boolean(env, held, &result);
+    }
+    ta_napi_leave(&call);
+    return result;
+}
+
+/* host.residentCount() -> number: the actors in memory now, every live
+ * segment's actors less its hibernated ones (ta_system_stats_get); the
+ * application layer's bound of resident actors. */
+static napi_value ta_napi_host_resident_count(napi_env env, napi_callback_info info) {
+    ta_napi_arguments arguments = {0, {NULL}, NULL};
+    ta_napi_call call;
+    if (!ta_napi_arguments_of(env, info, &arguments) || !ta_napi_enter(env, arguments.self, &call)) return NULL;
+    uint64_t resident = 0;
+    uint32_t count = ta_host_segment_count(call.host->host);
+    for (uint32_t segment = 0; segment < count; segment++) {
+        ta_system *system = ta_host_system(call.host->host, segment);
+        if (system == NULL) continue; /* freed */
+        ta_system_stats stats;
+        memset(&stats, 0, sizeof stats);
+        stats.size = sizeof stats;
+        ta_system_stats_get(system, &stats);
+        resident += stats.actors - stats.hibernated;
+    }
+    napi_value result = NULL;
+    napi_create_double(env, (double)resident, &result);
+    ta_napi_leave(&call);
+    return result;
+}
+
+/* host.actorInfo(session) -> {chart, hibernated} | undefined: a live
+ * actor's chart (its name, ta_image_chart_name) and whether it is
+ * hibernated now (ta_host_locate, ta_actor_info_get); undefined when the
+ * session names no live actor. */
+static napi_value ta_napi_host_actor_info(napi_env env, napi_callback_info info) {
+    ta_napi_arguments arguments = {1, {NULL}, NULL};
+    ta_napi_call call;
+    uint64_t session = 0;
+    if (!ta_napi_arguments_of(env, info, &arguments) || !ta_napi_session_of(env, arguments.argv[0], &session) ||
+        !ta_napi_enter(env, arguments.self, &call))
+        return NULL;
+    napi_value result = NULL, chart, hibernated;
+    ta_host_location location;
+    ta_system *system = ta_host_locate(call.host->host, session, &location) == TA_OK ? ta_host_system(call.host->host, location.segment)
+                                                                                      : NULL;
+    ta_actor_info actor;
+    memset(&actor, 0, sizeof actor);
+    actor.size = sizeof actor;
+    ta_host_segment_info segment;
+    memset(&segment, 0, sizeof segment);
+    segment.size = sizeof segment;
+    if (system != NULL && ta_actor_info_get(system, location.actor, &actor) == TA_OK &&
+        ta_host_segment_info_get(call.host->host, location.segment, &segment) == TA_OK && segment.image != NULL) {
+        ta_string_view name = ta_image_chart_name(segment.image, actor.chart);
+        if (napi_create_object(env, &result) != napi_ok ||
+            napi_create_string_utf8(env, name.pointer != NULL ? name.pointer : "", name.length, &chart) != napi_ok ||
+            napi_get_boolean(env, actor.state == TA_ACTOR_HIBERNATED, &hibernated) != napi_ok ||
+            napi_set_named_property(env, result, "chart", chart) != napi_ok ||
+            napi_set_named_property(env, result, "hibernated", hibernated) != napi_ok)
+            result = NULL;
+    } else napi_get_undefined(env, &result);
     ta_napi_leave(&call);
     return result;
 }
@@ -1459,8 +1555,9 @@ static bool ta_napi_target_of(napi_env env, const ta_napi_call *call, ta_napi_ev
     napi_value value = ta_napi_address_text(env, event->target);
     uint64_t *session = &event->in.session;
     if (!ta_napi_is(env, value, napi_string)) {
-        if (ta_napi_is(env, value, napi_bigint) || ta_napi_is(env, value, napi_number)) return ta_napi_session_of(env, value, session);
-        napi_throw_type_error(env, NULL, "a target is a session (a bigint or a safe integer) or a local address (a string or an Address)");
+        if (ta_napi_is(env, value, napi_bigint) || ta_napi_is(env, value, napi_number) || ta_napi_is(env, value, napi_object))
+            return ta_napi_session_of(env, value, session);
+        napi_throw_type_error(env, NULL, "a target is an Actor, a session (a bigint or a safe integer) or a local address (a string or an Address)");
         return false;
     }
     ta_napi_text address = {&call->host->arena, "an address is a string", {NULL, 0}};
@@ -1751,7 +1848,7 @@ static napi_value ta_napi_host_restore(napi_env env, napi_callback_info info) {
     ta_napi_bytes check = {"restore takes the snapshot's bytes first: a Uint8Array or an ArrayBuffer", {NULL, 0}};
     if (!ta_napi_bytes_of(env, argc >= 1 ? argv[0] : NULL, &check)) return NULL;
     if (self == NULL || !ta_napi_is(env, self, napi_function)) {
-        napi_throw_type_error(env, NULL, "restore is called on Host: Host.restore(snapshot, config, options)");
+        napi_throw_type_error(env, NULL, "restore is called on Host: Host.restore(snapshot, charts, options)");
         return NULL;
     }
     ta_napi_instance *instance = ta_napi_instance_of(env);
@@ -1799,6 +1896,9 @@ napi_status ta_napi_host_define(napi_env env, napi_value exports) {
         {"sendMany", NULL, ta_napi_host_send_many, NULL, NULL, NULL, napi_default_method, NULL},
         {"terminate", NULL, ta_napi_host_terminate, NULL, NULL, NULL, napi_default_method, NULL},
         {"actorByName", NULL, ta_napi_host_actor_by_name, NULL, NULL, NULL, napi_default_method, NULL},
+        {"holdsImage", NULL, ta_napi_host_holds_image, NULL, NULL, NULL, napi_default_method, NULL},
+        {"residentCount", NULL, ta_napi_host_resident_count, NULL, NULL, NULL, napi_default_method, NULL},
+        {"actorInfo", NULL, ta_napi_host_actor_info, NULL, NULL, NULL, napi_default_method, NULL},
         {"metrics", NULL, ta_napi_host_metrics, NULL, NULL, NULL, napi_default_method, NULL},
         {"sweep", NULL, ta_napi_host_sweep, NULL, NULL, NULL, napi_default_method, NULL},
         {"hibernate", NULL, ta_napi_host_hibernate, NULL, NULL, NULL, napi_default_method, NULL},

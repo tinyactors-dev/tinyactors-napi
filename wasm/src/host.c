@@ -457,6 +457,61 @@ TA_WEB_EXPORT int32_t ta_web_host_resolve(ta_web_host *host) {
     return status;
 }
 
+/* Record: words 0-1 an image's bytes. Answers 1 when a live segment runs
+ * an image of these bytes (ta_image_bytes), 0 when none does: the
+ * application layer adds a restored host only what its snapshot lacks. */
+TA_WEB_EXPORT uint32_t ta_web_host_holds_image(ta_web_host *host) {
+    ta_bytes image = ta_web_bytes_at(host->env->record.word, 0);
+    uint32_t count = ta_host_segment_count(host->host);
+    for (uint32_t segment = 0; segment < count; segment++) {
+        ta_host_segment_info info;
+        memset(&info, 0, sizeof info);
+        info.size = sizeof info;
+        if (ta_host_segment_info_get(host->host, segment, &info) != TA_OK || info.image == NULL) continue;
+        ta_bytes bytes = ta_image_bytes(info.image);
+        if (bytes.length == image.length && memcmp(bytes.pointer, image.pointer, bytes.length) == 0) return 1;
+    }
+    return 0;
+}
+
+/* The actors in memory now, every live segment's actors less its
+ * hibernated ones (ta_system_stats_get), into record words 0-1. */
+TA_WEB_EXPORT void ta_web_host_resident(ta_web_host *host) {
+    uint64_t resident = 0;
+    uint32_t count = ta_host_segment_count(host->host);
+    for (uint32_t segment = 0; segment < count; segment++) {
+        ta_system *system = ta_host_system(host->host, segment);
+        if (system == NULL) continue; /* freed */
+        ta_system_stats stats;
+        memset(&stats, 0, sizeof stats);
+        stats.size = sizeof stats;
+        ta_system_stats_get(system, &stats);
+        resident += stats.actors - stats.hibernated;
+    }
+    ta_web_set_word64(host->env->record.word, 0, resident);
+}
+
+/* A live actor's chart (its name, into record words 0-1) and whether it
+ * is hibernated: answers 1 hibernated, 0 resident, -1 when the session
+ * names no live actor. */
+TA_WEB_EXPORT int32_t ta_web_host_actor_info(ta_web_host *host, uint32_t low, uint32_t high) {
+    ta_host_location location;
+    ta_system *system = ta_host_locate(host->host, (uint64_t)low | (uint64_t)high << 32, &location) == TA_OK
+                            ? ta_host_system(host->host, location.segment)
+                            : NULL;
+    ta_actor_info actor;
+    memset(&actor, 0, sizeof actor);
+    actor.size = sizeof actor;
+    ta_host_segment_info segment;
+    memset(&segment, 0, sizeof segment);
+    segment.size = sizeof segment;
+    if (system == NULL || ta_actor_info_get(system, location.actor, &actor) != TA_OK ||
+        ta_host_segment_info_get(host->host, location.segment, &segment) != TA_OK || segment.image == NULL)
+        return -1;
+    ta_web_set_text(host->env->record.word, 0, ta_image_chart_name(segment.image, actor.chart));
+    return actor.state == TA_ACTOR_HIBERNATED ? 1 : 0;
+}
+
 /* ---- the control plane ------------------------------------------------------------------- */
 
 /* A typed method's row in the pending table, whose handle is the message's
@@ -474,6 +529,16 @@ TA_WEB_EXPORT uint32_t ta_web_pending_add(ta_web_host *host) {
  * written): it goes. */
 TA_WEB_EXPORT void ta_web_pending_remove(ta_web_host *host, uint32_t low, uint32_t high) {
     ta_table_remove(&host->pending, (uint64_t)low | (uint64_t)high << 32);
+}
+
+/* An ask's pending row (the application layer's Actor.ask), by its
+ * handle: removed, answering its slot + 1; 0 when no row has that handle
+ * (the generation refuses a stale one). */
+TA_WEB_EXPORT uint32_t ta_web_pending_take(ta_web_host *host, uint32_t low, uint32_t high) {
+    uint64_t handle = (uint64_t)low | (uint64_t)high << 32;
+    if (ta_table_get(&host->pending, handle) == NULL) return 0;
+    ta_table_remove(&host->pending, handle);
+    return low;
 }
 
 /* Record: words 0-1 the message's CBOR, 2-3 its pending row's handle (0:

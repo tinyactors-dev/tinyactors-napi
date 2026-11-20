@@ -71,16 +71,15 @@ version that was approved, and that no other document is.
   final state, which does not leave the region. Leaving a stage for any
   reason (an escalation, a change request, a withdrawal) cancels its
   timer, and coming back arms a new one.
-- **`<script>` declarations:** the chart's helpers are `function`s
-  declared in a chart-level `<script>`: `ms()` turns the SLA's
-  milliseconds into a delay, `legalFirst()` holds the threshold rule, and
-  `metadataXML()` writes the archive's record, escaping what it puts in.
-  A chart that declares functions gives each actor a `vm` context of its
-  own (about 143 KB on Node.js, 60 KB on Bun), which a desk of documents
-  can afford; they declare with `var` and `function`, so the documents
-  could still be hibernated.
+- **Chart helpers:** the chart's helpers are `function`s declared in a
+  chart-level `<script>`: `ms()` turns the SLA's milliseconds into a
+  delay, `legalFirst(amount, threshold)` holds the threshold rule, and
+  `metadataXML(document)` writes the archive's record, escaping what it
+  puts in. They are made once for the chart, not per document, so they
+  see no document's variables by name: each takes what it reads as
+  arguments, and the documents stay small enough to hibernate.
 - **XML in sends:** the archive I/O processor gets `<content
-  expr="metadataXML()"/>`, the record as XML text, which the application
+  expr="metadataXML({...})"/>`, the record as XML text, which the application
   parses (`xml.mjs`) and stores as a file. Inline XML `<content>` is
   static, so it cannot hold a document's values; and inline XML sent to
   the application differs between the datamodels (below, "Surprises").
@@ -90,8 +89,8 @@ version that was approved, and that no other document is.
   stays readable while it writes the file, and it calls `send.fail()` when
   the archive is down, which the chart turns into a retry.
 - **Named actors:** a document is spawned with its id as its name, so the
-  desk finds it with `host.actorByName`, and a document that ended is not
-  found.
+  desk finds it with `host.actor(id)`, and a document that ended is not
+  found (`StaleError`).
 - **The typed methods, as promises** (no handler given), in `admin.mjs`:
   `actorList` pages through the sessions, and for each one
   `actorGet` (its chart, its mailbox, and its pending delayed sends,
@@ -125,8 +124,8 @@ It cannot see:
 
 - **What is in the mailbox**, beyond the count, and the event the actor
   handled last (`_event`).
-- **Anything but `<data>`:** the functions and `var`s the chart's scripts
-  declare are not variables to `actorContext`.
+- **Anything but `<data>`:** the chart's helpers, and the `var`s its
+  scripts declare, are not variables to `actorContext`.
 - **A new document's data before its first turn:** an actor asked about
   before it first runs reads `undefined` for every variable, its spawn
   params included, since they are bound when it starts.

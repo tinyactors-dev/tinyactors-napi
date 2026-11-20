@@ -23,7 +23,7 @@
 //   host busy, is suspended: its host is closed, which frees everything it
 //   held.
 import { readFileSync } from 'node:fs';
-import { compileCharts, CompileError, Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, CompileError, Host, StaleError, TinyactorsError } from '@tinyactors/node';
 import { chartName, fillTemplate, formatDiagnostic, syntaxError } from './check.mjs';
 
 const DEVICE_CHART = readFileSync(new URL('./charts/device.scxml', import.meta.url), 'utf8');
@@ -69,11 +69,11 @@ export class Platform {
     this.customers = new Map();
     /** device id -> { id, customer, session } */
     this.devices = new Map();
-    this.fleet = new Host(
-      { systemID: 'fleet', ioProcessors: [{ type: 'urn:iot:telemetry' }] },
-      { clock, ioProcessors: { 'urn:iot:telemetry': (host, send) => this.#telemetry(send.event, send.data) } },
-    );
-    this.fleet.addCharts({ 'device.scxml': DEVICE_CHART });
+    const compiled = compileCharts([{ name: 'device.scxml', text: DEVICE_CHART }]);
+    this.fleet = new Host(compiled, {
+      system: 'fleet', clock, ioProcessors: { 'urn:iot:telemetry': { receive: (send) => this.#telemetry(send.event, send.data) } },
+    });
+    compiled.close();
   }
 
   addCustomer(id) {
@@ -85,7 +85,7 @@ export class Platform {
   addDevice({ id, customer, deadband = 0, silenceAfter = '30s' }) {
     if (!ID.test(id)) throw new TypeError(`not a device id: ${id}`);
     if (!this.customers.has(customer)) throw new TypeError(`no customer ${customer}`);
-    const session = this.fleet.spawnChart('device', { name: id, params: { deviceID: id, customer, deadband, silenceAfter } });
+    const session = this.fleet.spawn('device', { name: id, params: { deviceID: id, customer, deadband, silenceAfter } });
     this.devices.set(id, { id, customer, session });
   }
 
@@ -146,7 +146,7 @@ export class Platform {
     try {
       // no resolver: a `src` is a compile error; warningsAsErrors: a syntax
       // error in the chart's JavaScript, which compileCharts parses, too
-      compiled = compileCharts([{ name: file, text }], undefined, { warningsAsErrors: true });
+      compiled = compileCharts([{ name: file, text }], { warningsAsErrors: true });
     } catch (error) {
       if (!(error instanceof CompileError)) throw error;
       return this.#refuse(owner, id, error.diagnostics.filter((d) => d.severity === 'error').map(formatDiagnostic));
@@ -161,31 +161,28 @@ export class Platform {
       /** the fuel and the process's CPU time (ms) where the current measure began */
       window: { fuel: 0, cpu: cpuTime() },
     };
-    rule.host = new Host(
-      { systemID: `rule-${owner.id}-${id}`, ioProcessors: [{ type: 'urn:iot:alert' }] },
-      {
+    rule.host = new Host(compiled, {
+        system: `rule-${owner.id}-${id}`,
         clock: this.clock,
         datamodel: 'quickjs',
         quickjs: this.sandbox,
         ioProcessors: {
           // the customer's alert channel; whatever `target` the rule names,
           // the alert goes to its own customer
-          'urn:iot:alert': (host, send) => owner.inbox.push({
+          'urn:iot:alert': { receive: (send) => owner.inbox.push({
             type: 'alert', rule: id, device: rule.sessions.get(send.session), event: send.event, data: send.data,
-          }),
+          }) },
         },
         // every send to another system: the fleet's devices, another
         // customer's rules, another of this customer's
-        transport: (host, send) => {
+        transport: (send) => {
           this.#violation(rule, `sent ${send.event} to ${send.target}`, rule.sessions.get(send.session));
           send.fail();
         },
-        log: (host, entry) => {
+        log: (entry) => {
           if (++rule.logs <= this.maxLogs) owner.inbox.push({ type: 'rule.log', rule: id, device: rule.sessions.get(entry.session), text: entry.text });
         },
-      },
-    );
-    rule.host.addImage(compiled.image);
+      });
     compiled.close();
     owner.rules.set(id, rule);
     owner.inbox.push({ type: 'rule.installed', rule: id, warnings: compiled.diagnostics.map(formatDiagnostic) });
@@ -204,14 +201,17 @@ export class Platform {
     for (const rule of owner.rules.values()) {
       if (rule.status !== 'active' || (rule.devices !== '*' && !rule.devices.has(reading.device))) continue;
       try {
-        let session = rule.host.actorByName(reading.device);
-        if (session === undefined) {
-          session = rule.host.spawn(rule.host.chart(rule.id), {
+        let actor;
+        try {
+          actor = rule.host.actor(reading.device);
+        } catch (error) {
+          if (!(error instanceof StaleError)) throw error;
+          actor = rule.host.spawn(rule.id, {
             name: reading.device, params: { device: reading.device, ...(rule.sustain ? { sustain: rule.sustain } : {}) },
           });
-          rule.sessions.set(session, reading.device);
+          rule.sessions.set(actor.id, reading.device);
         }
-        rule.host.send(session, 'reading', reading);
+        actor.send('reading', reading);
       } catch (error) {
         // the rule's actor for this device ended (a <final>, which a
         // customer's chart may reach): it is spawned again at the next

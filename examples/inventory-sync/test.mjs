@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { SimulatedClock } from '@tinyactors/node';
+import { SimulatedClock, StaleError } from '@tinyactors/node';
 import { Storefront } from './storefront.mjs';
 import { Warehouse } from './warehouse.mjs';
 
@@ -93,7 +93,7 @@ for (const datamodel of ['native', 'quickjs']) {
       const levels = await inventory(w.warehouse);
       assert.deepEqual(levels.tea, { stock: 8, held: 0, sold: 2 });
       assert.deepEqual(levels.cups, { stock: 3, held: 0, sold: 1 });
-      assert.equal(w.shop.host.actorByName('ann'), undefined, 'the cart ended with its order');
+      assert.throws(() => w.shop.host.actor('ann'), StaleError, 'the cart ended with its order');
       assert.equal(w.shop.host.nextDeadline, undefined, 'no timer is left');
     } finally {
       close(w);

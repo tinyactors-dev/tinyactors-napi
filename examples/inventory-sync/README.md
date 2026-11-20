@@ -83,7 +83,7 @@ frame waits for the delayed acknowledgement.
 
 ## The tinyactors features it uses, and why
 
-- **Two systems and a transport** (`systemID`, `transport`, `send.message`,
+- **Two systems and a transport** (`system`, `transport`, `send.message`,
   `host.send(message)`, `host.fail`): the warehouse and the storefront are
   separate applications, and an actor of one addresses an actor of the
   other as `tinyactors://warehouse/@sku-tea`. The host decides which
@@ -92,8 +92,8 @@ frame waits for the delayed acknowledgement.
 - **`Address`** for the transport's `target` and `origin`: `target.system`
   picks the connection, and `encode` writes it as tag 32, which `decode`
   reads back as an `Address`.
-- **Named actors** (`spawnChart('sku', { name: 'sku-tea' })`,
-  `host.actorByName`): a SKU's address is its name, and the storefront
+- **Named actors** (`host.spawn('sku', { name: 'sku-tea' })`,
+  `host.actor(name)`): a SKU's address is its name, and the storefront
   finds a cart by the customer's cart id.
 - **`error.communication`** from `send.fail()` (no connection) and from
   `host.fail()` (the other side refused the message), which the cart's

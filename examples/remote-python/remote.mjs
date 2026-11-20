@@ -108,12 +108,14 @@ export async function startPython({ python = process.env.PYTHON ?? 'python3', en
 export async function startNode({ port, datamodel = 'native', app = () => {} }) {
   const lines = new Lines();
   let socket;
-  const host = new Host({ systemID: SYSTEM, ioProcessors: [{ type: 'urn:example:app' }] }, {
+  const compiled = compileCharts([{ name: 'ping.scxml', text: readFileSync(new URL('charts/ping.scxml', HERE), 'utf8') }]);
+  const host = new Host(compiled, {
+    system: SYSTEM,
     datamodel,
-    log: (host, entry) => lines.add({ label: entry.label, text: entry.text }),
-    ioProcessors: { 'urn:example:app': app },
+    log: (entry) => lines.add({ label: entry.label, text: entry.text }),
+    ioProcessors: { 'urn:example:app': { receive: app } },
     // Every send to another system: the message goes to the peer, or fails.
-    transport: (host, send) => {
+    transport: (send) => {
       if (socket === undefined || !socket.writable || send.target.system !== PEER) {
         send.fail(); // no connection to that system: the sender gets error.communication
         return;
@@ -124,13 +126,8 @@ export async function startNode({ port, datamodel = 'native', app = () => {} }) 
       });
     },
   });
-  const compiled = compileCharts([{ name: 'ping.scxml', text: readFileSync(new URL('charts/ping.scxml', HERE), 'utf8') }]);
-  try {
-    host.addImage(compiled.image);
-  } finally {
-    compiled.close();
-  }
-  const ping = host.spawn(host.chart('ping'), { name: 'ping' });
+  compiled.close();
+  const ping = host.spawn('ping', { name: 'ping' }).id;
 
   const receive = (notification) => {
     const params = notification?.params;

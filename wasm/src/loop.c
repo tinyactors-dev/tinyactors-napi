@@ -178,6 +178,8 @@ static void ta_web_dispatch(ta_web_host *host, uint32_t index) {
     }
     case TA_HOST_EFFECT_TRACES: ta_web_take(host, true); break;
     case TA_HOST_EFFECT_LOGS: ta_web_take(host, false); break;
+    case TA_EFFECT_DONE:
+    case TA_EFFECT_ERROR:
     case TA_EFFECT_SEND:
     case TA_EFFECT_LOG:
     case TA_EFFECT_WAKE:

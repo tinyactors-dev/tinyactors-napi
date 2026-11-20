@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { SimulatedClock } from '@tinyactors/node';
+import { SimulatedClock, StaleError } from '@tinyactors/node';
 import { run } from './main.mjs';
 import { Shop } from './shop.mjs';
 import { PaymentGateway, Warehouse } from './world.mjs';
@@ -57,7 +57,7 @@ const events = (shop) => shop.outbox.map((message) => message.event);
 
 /** The state the order's actor is in. */
 async function state(shop, id) {
-  const { value } = await shop.host.actorState({ session: shop.host.actorByName(id) });
+  const { value } = await shop.host.actor(id).state();
   return JSON.stringify(value);
 }
 
@@ -71,7 +71,7 @@ for (const datamodel of ['native', 'quickjs']) {
       assert.deepEqual(await shop.ending('A'), { event: 'order.delivered', order: 'A', trackingID: 'TRK-0001' });
       assert.equal(gateway.net('A'), 8);
       assert.equal(warehouse.stock.tea, 8);
-      assert.equal(shop.host.actorByName('A'), undefined, 'a final state ends the actor');
+      assert.throws(() => shop.host.actor('A'), StaleError, 'a final state ends the actor');
     } finally {
       shop.close();
     }

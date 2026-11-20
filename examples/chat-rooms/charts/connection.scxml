@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A connection: one per open socket. It turns what the client sends
+     (client.<event>) into sends to the right actor, and what actors send
+     back into frames for the client (chat:gateway, deliver). It closes the
+     socket when the client misses its heartbeat, and leaves its rooms when
+     it ends.
+
+     It sends to rooms and workspaces by name, by the naming convention of
+     connection.js. A room keys its members by the fragment of the
+     origin of their sends (#_scxml_<session>), so a send to it by name
+     or by session is one member.
+
+     A join of a room that does not exist gets error.communication at
+     once (the sender handles a miss), which the connection turns into an
+     error frame. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="connection" initial="connected">
+  <script src="connection.js"/>
+  <datamodel>
+    <data id="user"/>                     <!-- given at spawn -->
+    <data id="workspace"/>                <!-- given at spawn -->
+    <data id="rooms" expr="[]"/>          <!-- the names of the rooms joined -->
+  </datamodel>
+  <state id="connected" initial="alive">
+    <onexit>
+      <foreach array="rooms" item="room"><send targetexpr="roomAddress(workspace, room)" event="leave"/></foreach>
+    </onexit>
+    <state id="alive">
+      <onentry><send id="heartbeat" event="heartbeat.missed" delay="60s"/></onentry>
+      <onexit><cancel sendid="heartbeat"/></onexit>
+      <transition event="client.heartbeat" target="alive"/>
+    </state>
+
+    <transition event="client.join">
+      <send id="join" targetexpr="roomAddress(workspace, _event.data.room)" event="join">
+        <content expr="{ user: user }"/>
+      </send>
+    </transition>
+    <transition event="room.joined">
+      <assign location="rooms" expr="added(rooms, _event.data.room)"/>
+      <send type="chat:gateway" event="deliver"><content expr="frame('room.joined', _event.data)"/></send>
+    </transition>
+    <transition event="error.communication" cond="_event.sendid === 'join'">
+      <send type="chat:gateway" event="deliver"><content expr="frame('error', { reason: 'no such room' })"/></send>
+    </transition>
+    <transition event="client.leave">
+      <send targetexpr="roomAddress(workspace, _event.data.room)" event="leave"/>
+      <assign location="rooms" expr="removed(rooms, _event.data.room)"/>
+    </transition>
+    <transition event="client.post">
+      <send targetexpr="roomAddress(workspace, _event.data.room)" event="post">
+        <content expr="{ text: _event.data.text }"/>
+      </send>
+    </transition>
+    <transition event="client.create">
+      <send id="create" targetexpr="workspaceAddress(workspace)" event="room.create">
+        <content expr="{ user: user, name: _event.data.name }"/>
+      </send>
+    </transition>
+    <transition event="error.communication" cond="_event.sendid === 'create'">
+      <send type="chat:gateway" event="deliver"><content expr="frame('error', { reason: 'no such workspace' })"/></send>
+    </transition>
+    <transition event="room.created room.refused">
+      <send type="chat:gateway" event="deliver"><content expr="frame(_event.name, _event.data)"/></send>
+    </transition>
+    <transition event="client.dm">
+      <send type="chat:inbox" event="dm">
+        <content expr="{ from: user, to: _event.data.to, text: _event.data.text }"/>
+      </send>
+    </transition>
+    <transition event="dm">                <!-- the inbox found this user online -->
+      <send type="chat:gateway" event="deliver"><content expr="frame('dm', _event.data)"/></send>
+    </transition>
+
+    <transition event="heartbeat.missed" target="closed">
+      <send type="chat:gateway" event="close"><content expr="{ reason: 'timeout' }"/></send>
+    </transition>
+    <transition event="socket.closed" target="closed"/>
+  </state>
+  <final id="closed"/>
+</scxml>

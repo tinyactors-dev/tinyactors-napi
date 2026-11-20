@@ -15,10 +15,9 @@ const compiled = compileCharts([{ name: 'hello.scxml', text: `
        datamodel="ecmascript" name="hello" initial="s">
   <state id="s"><onentry><log expr="'hello from ' + _ioprocessors.scxml.location"/></onentry></state>
 </scxml>` }]);
-const host = new Host({ systemID: 'web' }, { log: (host, entry) => console.log(entry.text) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'web', log: (entry) => console.log(entry.text) });
 compiled.close();
-host.spawn(host.chart('hello'));
+host.spawn('hello');
 await host.idle();
 host.close();
 ```
@@ -61,12 +60,12 @@ none. Until it settles, every call throws `TA_ERROR_STATE`:
 import { Host, init } from '@tinyactors/wasm/init';
 
 try {
-  new Host({ systemID: 'early' });
+  new Host([], { system: 'early' });
 } catch (error) {
   console.log('before init:', error.status);
 }
 await init(); // or init(new URL('/assets/tinyactors.wasm', location.href)), wherever your build put it
-const host = new Host({ systemID: 'ready' });
+const host = new Host([], { system: 'ready' });
 console.log('after init: closed', host.closed);
 host.close();
 ```
@@ -143,7 +142,7 @@ not trust.
 ```js
 import { Host } from '@tinyactors/wasm';
 
-const host = new Host({ systemID: 'rules' }, { datamodel: 'quickjs', quickjs: { maxOps: 10000 } });
+const host = new Host([], { system: 'rules', datamodel: 'quickjs', quickjs: { maxOps: 10000 } });
 console.log(host.quickjsHeapBytes > 0);
 host.close();
 ```
@@ -172,25 +171,14 @@ sandbox. Its realm is the host's own, made at its first chart:
 | a Worker | the worker's own global (a Worker has no `document`) |
 | Node.js, Bun | a `node:vm` context, as in `@tinyactors/node` |
 
-A chart whose scripts declare nothing has a scope object per session in
-that realm, as in `@tinyactors/node`. A chart whose scripts declare
-(`var`, `function`, `let`, `const`, `class`) gets one function per chart,
-which each session calls: its declarations are the session's own and its
-functions close over them, for a few hundred bytes a session where
-`@tinyactors/node` makes a `vm` context of 60 to 143 KB. Two things differ
-from `@tinyactors/node`, and both are found, never silent:
-
-- **An assignment to a name nobody declared**, in a chart-level
-  `<script>` (`visits = 0` with no `var`), puts the name on the host's
-  realm, shared by every session and chart of the host, where
-  `@tinyactors/node` gives it to the session. The host then refuses to
-  hibernate or snapshot the sessions of declaring charts, naming the
-  variable, rather than lose it. Declare every variable: a `<data>`, or
-  `var` in a chart-level script.
-- **A function declared inside a block** of a transition's script (`if
-  (x) { function f() {} }`) is a variable of the session only once that
-  script ran, and hibernation does not keep it. Declare functions at the
-  top of a chart-level script.
+Each session is a scope object in that realm, as in `@tinyactors/node`,
+and a script's top-level declarations mean what they mean there
+([Writing charts](charts.md#scripts)): a chart-level script's
+`function`s are the chart's helpers, made once, a top-level `var` is a
+variable of the session, and `let`, `const` and `class` at a script's top
+level are refused. Scripts and expressions run as strict code, so an
+assignment to a name nobody declared is the script's `error.execution`,
+never a variable of the realm:
 
 ```js
 import { compileCharts, Host } from '@tinyactors/wasm';
@@ -199,48 +187,35 @@ const chart = (name, script) => `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
        datamodel="ecmascript" name="${name}" initial="s">
   <script>${script}</script>
-  <state id="s"><transition event="visit"><script>visit()</script><log expr="'${name}: ' + visits"/></transition></state>
+  <state id="s">
+    <transition event="visit"><script>visits = next(visits)</script><log expr="'${name}: ' + visits"/></transition>
+    <transition event="error.execution"><log expr="'${name}: ' + _event.data.message.split(':')[0]"/></transition>
+  </state>
 </scxml>`;
 const compiled = compileCharts([
-  { name: 'declared.scxml', text: chart('declared', 'var visits = 0; function visit() { visits += 1; }') },
-  { name: 'undeclared.scxml', text: chart('undeclared', 'visits = 0; function visit() { visits += 1; }') },
+  { name: 'declared.scxml', text: chart('declared', 'var visits = 0; function next(n) { return n + 1; }') },
+  { name: 'undeclared.scxml', text: chart('undeclared', 'visits = 0; function next(n) { return n + 1; }') },
 ]);
-const host = new Host({ systemID: 'web' }, { log: (host, entry) => console.log(entry.text) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'web', log: (entry) => console.log(entry.text) });
 compiled.close();
 
-const declared = host.spawn(host.chart('declared'));
-host.send(declared, 'visit');
+const declared = host.spawn('declared');
+declared.send('visit');
 await host.idle();
 host.wake(declared, host.hibernate(declared)); // out of memory and back, its visits with it
-host.send(declared, 'visit');
+declared.send('visit');
 await host.idle();
 
-const undeclared = host.spawn(host.chart('undeclared'));
-host.send(undeclared, 'visit');
+host.spawn('undeclared');
 await host.idle();
-try {
-  host.hibernate(undeclared);
-} catch (error) {
-  console.log('stays resident:', error.status, /'visits'.*declare it/.test(error.message));
-}
 host.close();
 ```
 
 ```output
 declared: 1
 declared: 2
-undeclared: 1
-stays resident: TA_ERROR_UNSUPPORTED true
+undeclared: ReferenceError
 ```
-
-The rest of [Writing charts](charts.md#scripts) holds as it is: a chart
-whose chart-level scripts declare with `let`, `const` or `class` keeps its
-sessions resident, and a chart-level script that starts with
-`'use strict'`, or a strict transition script that declares a `var`, is
-refused when the image is added (one function cannot keep it). A
-chart-level script that throws ends that session's chart-level scripts:
-its `error.execution` says the later ones did not run.
 
 ## A dedicated Worker
 
@@ -289,18 +264,18 @@ const compiled = compileCharts([{ name: 'counter.scxml', text: `
   </state>
 </scxml>` }]);
 let answer = null; // the page's pending question
-const host = new Host({ systemID: 'worker', ioProcessors: [{ type: 'urn:page' }] }, {
-  ioProcessors: { 'urn:page': (host, send) => answer?.(`${host.actorByName('ada') === send.session ? 'ada' : '?'}: ${send.data.visits}`) },
+const host = new Host(compiled, {
+  system: 'worker',
+  ioProcessors: { 'urn:page': { receive: (send) => answer?.(`${send.host.actor('ada').equals(send.sender) ? 'ada' : '?'}: ${send.data.visits}`) } },
 });
-host.addImage(compiled.image);
 compiled.close();
 
 self.onmessage = async ({ data }) => {
   const reply = new Promise((resolve) => { answer = resolve; });
   if (data.op === 'spawn') {
-    host.spawn(host.chart('counter'), { name: data.name });
+    host.spawn('counter', { name: data.name });
     answer(`spawned ${data.name}`);
-  } else host.send(host.actorByName(data.name), 'visit');
+  } else host.actor(data.name).send('visit');
   await host.idle();
   postMessage(await reply);
 };
@@ -315,9 +290,11 @@ imports the package's `index.mjs` by its URL.
 
 The host does no I/O, in a browser as on a server: where hibernated
 actors and snapshots live is yours. Node.js programs use a database or
-files ([Hibernation](hibernation.md) uses SQLite); a page has IndexedDB,
-which stores a `Uint8Array` as it is. Here a counter is hibernated into
-it, and woken from it when an event comes:
+files ([Hibernation](hibernation.md): `SQLiteStore`, which a browser
+refuses, having no SQLite); a page has IndexedDB, which stores a
+`Uint8Array` as it is. A store's methods may return promises, which the
+host follows, so IndexedDB is a host's `store` as it is. Here a counter
+is hibernated into it, and loaded from it when an event comes:
 
 ```js browser
 import { compileCharts, Host } from '@tinyactors/wasm';
@@ -332,12 +309,9 @@ opening.onupgradeneeded = () => opening.result.createObjectStore('blobs');
 const db = await done(opening);
 const blobs = (mode) => db.transaction('blobs', mode).objectStore('blobs');
 const store = {
-  put: (session, blob) => done(blobs('readwrite').put(blob, String(session))),
-  take: async (session) => {
-    const blob = await done(blobs('readonly').get(String(session)));
-    await done(blobs('readwrite').delete(String(session)));
-    return blob;
-  },
+  save: (session, blob) => done(blobs('readwrite').put(blob, String(session))),
+  load: (session) => done(blobs('readonly').get(String(session))),
+  delete: (session) => done(blobs('readwrite').delete(String(session))),
 };
 
 const compiled = compileCharts([{ name: 'counter.scxml', text: `
@@ -349,22 +323,22 @@ const compiled = compileCharts([{ name: 'counter.scxml', text: `
     <transition event="report"><log expr="'count ' + count"/></transition>
   </state>
 </scxml>` }]);
-const host = new Host({ systemID: 'web' }, {
-  log: (host, entry) => console.log(entry.text),
-  wake: async (host, session) => host.wake(session, await store.take(session)), // idle() waits for it
+const host = new Host(compiled, {
+  system: 'web',
+  store, // with resident: n, the host would also hibernate into it after each turn
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-const counter = host.spawn(host.chart('counter'));
-host.send(counter, 'inc');
+const counter = host.spawn('counter');
+counter.send('inc');
 await host.idle();
 host.sweep(100, 100); // a first sweep marks; the actor has not run since
-for (const session of host.sweep(100, 100)) await store.put(session, host.hibernate(session));
+for (const session of host.sweep(100, 100)) await store.save(session, host.hibernate(session));
 console.log('stored:', await done(blobs('readonly').count()));
 
-host.send(counter, 'inc'); // it is woken from the store first
-host.send(counter, 'report');
+counter.send('inc'); // it is loaded from the store first; idle() waits for the load
+counter.send('report');
 await host.idle();
 host.close();
 db.close();
@@ -407,8 +381,7 @@ opening.onupgradeneeded = () => opening.result.createObjectStore('hosts');
 const db = await done(opening);
 const hosts = (mode) => db.transaction('hosts', mode).objectStore('hosts');
 
-const config = { systemID: 'web' };
-const options = () => ({ clock: new SimulatedClock(), log: (host, entry) => console.log(entry.text) });
+const options = () => ({ system: 'web', clock: new SimulatedClock(), log: (entry) => console.log(entry.text) });
 const compiled = compileCharts([{ name: 'cart.scxml', text: `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
        datamodel="ecmascript" name="cart" initial="open">
@@ -422,10 +395,9 @@ const compiled = compileCharts([{ name: 'cart.scxml', text: `
 // at load: the host as the page left it, else a new one
 async function load() {
   const saved = await done(hosts('readonly').get('host'));
-  if (saved !== undefined) return Host.restore(saved, config, options());
-  const host = new Host(config, options());
-  host.addImage(compiled.image);
-  host.spawn(host.chart('cart'), { name: 'cart' });
+  if (saved !== undefined) return Host.restore(saved, compiled, options());
+  const host = new Host(compiled, options());
+  host.spawn('cart', { name: 'cart' });
   return host;
 }
 // when the page is hidden: a snapshot needs a quiescent host, so after idle()
@@ -438,13 +410,13 @@ const host = await load();
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') save(host);
 });
-host.send(host.actorByName('cart'), 'add', 'tea');
+host.actor('cart').send('add', 'tea');
 await save(host); // what the event would do, here at once
 host.close();
 
 const again = await load(); // the page loaded again
-again.send(again.actorByName('cart'), 'add', 'cake');
-again.send(again.actorByName('cart'), 'show');
+again.actor('cart').send('add', 'cake');
+again.actor('cart').send('show');
 await again.idle();
 again.close();
 compiled.close();

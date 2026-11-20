@@ -5,11 +5,11 @@
 // waiting in a mailbox and a delayed send due on a new clock that starts
 // at 0; its own snapshot is the same bytes; what is not quiescent, or not
 // in the value table, is refused.
-import { Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
-import { DATAMODEL, ENGINE, equal, image, indexOfBytes, LABEL, sameBytes, scxml, status, throws, typeError } from './charts.mjs';
+import { Host, MemoryStore, SimulatedClock, TinyactorsError } from '@tinyactors/node';
+import { DATAMODEL, ENGINE, equal, image, indexOfBytes, LABEL, named, sameBytes, scxml, status, throws, typeError } from './charts.mjs';
 import { run, test } from './harness.mjs';
 
-const CONFIG = { systemID: 't', system: { ticksPerSecond: 1000 } };
+const CONFIG = { system: 't', config: { system: { ticksPerSecond: 1000 } } };
 
 /** tinyactors-cpython/tests/fixtures/test_snapshot/counter.ecmascript.scxml,
  * with `odd` (a function: outside the table) and `stop` added. */
@@ -47,7 +47,7 @@ const COUNTER = counter();
 class Logs {
   constructor() {
     this.lines = [];
-    this.handler = (host, entry) => this.lines.push([entry.label, entry.text]);
+    this.handler = (entry) => this.lines.push([entry.label, entry.text]);
   }
   labelled(label) {
     return this.lines.filter(([l]) => l === label).map(([, text]) => text);
@@ -55,12 +55,12 @@ class Logs {
 }
 
 function hostOf(document, options = {}) {
-  const host = new Host(CONFIG, { ...ENGINE, clock: new SimulatedClock(), ...options });
+  const host = new Host([], { ...CONFIG, ...ENGINE, clock: new SimulatedClock(), ...options });
   host.addImage(image({ counter: document }));
   return host;
 }
 
-const restore = (blob, options = {}) => Host.restore(blob, CONFIG, { ...ENGINE, ...options });
+const restore = (blob, options = {}) => Host.restore(blob, [], { ...CONFIG, ...ENGINE, ...options });
 
 const same = sameBytes;
 
@@ -80,7 +80,7 @@ test('a host goes on after a restore: variables, _event, a waiting payload, a de
   logs = new Logs();
   const clock = new SimulatedClock();
   host = restore(blob, { log: logs.handler, clock });
-  host.send(session, 'report', String(session));
+  host.send(session, 'report', String(session.id));
   await host.idle();
   equal(logs.labelled('late').length, 0, 'no late yet');
   clock.increment(999);
@@ -114,19 +114,15 @@ test('the snapshot of a restored host is the same bytes', async () => {
 
 test('a hibernated actor wakes after a restore', async () => {
   const logs = new Logs();
-  const blobs = new Map();
-  const wake = (host, session) => {
-    host.wake(session, blobs.get(session));
-    blobs.delete(session);
-  };
-  let host = hostOf(COUNTER);
+  const store = new MemoryStore();
+  let host = hostOf(COUNTER, { store });
   const session = host.spawn(host.chart('counter'));
   host.send(session, 'inc', 1);
   await host.idle();
-  blobs.set(session, host.hibernate(session));
+  store.save(session.id, host.hibernate(session));
   const blob = host.snapshot();
   host.close();
-  host = restore(blob, { log: logs.handler, wake, clock: new SimulatedClock() });
+  host = restore(blob, { log: logs.handler, store, clock: new SimulatedClock() });
   host.send(session, 'report', 0);
   await host.idle();
   host.close();
@@ -152,7 +148,7 @@ test('a value outside the table refuses the snapshot, and the host goes on', asy
 
 test('a snapshot from a handler is refused', async () => {
   const refused = [];
-  const log = (host) => {
+  const log = () => {
     try {
       host.snapshot();
     } catch (error) {
@@ -217,7 +213,7 @@ test('one image in two segments keeps each session its own chart', async () => {
   const logs = new Logs();
   const clock = new SimulatedClock();
   const bytes = image({ counter: counter({ more: '<transition event="stop" target="f"/>' }).replace('</scxml>', '<final id="f"/>\n</scxml>') });
-  let host = new Host(CONFIG, { ...ENGINE, clock });
+  let host = new Host([], { ...CONFIG, ...ENGINE, clock });
   host.addImage(bytes);
   const first = host.spawn(host.chart('counter'));
   host.addImage(bytes); // the same image again: another segment
@@ -282,12 +278,12 @@ test('restore refuses another system\'s config, another datamodel, another progr
   const host = hostOf(COUNTER);
   const blob = host.snapshot();
   host.close();
-  throws(() => Host.restore(blob, { systemID: 'other' }, ENGINE), (error) => {
+  throws(() => Host.restore(blob, [], { system: 'other', ...ENGINE }), (error) => {
     status('TA_ERROR_INVALID')(error);
     if (!/system t/.test(error.message)) throw new Error(`the message: ${error.message}`);
   }, 'another system');
   const otherModel = DATAMODEL === 'native' ? 'quickjs' : 'native';
-  throws(() => Host.restore(blob, CONFIG, { datamodel: otherModel }), status('TA_ERROR_INVALID'), 'another datamodel');
+  throws(() => Host.restore(blob, [], { ...CONFIG, datamodel: otherModel }), status('TA_ERROR_INVALID'), 'another datamodel');
   // the label: a byte of the package's label changed in the pack
   const label = new TextEncoder().encode(LABEL);
   const at = indexOfBytes(blob, label);
@@ -297,15 +293,15 @@ test('restore refuses another system\'s config, another datamodel, another progr
   throws(() => restore(relabelled), status('TA_ERROR_INVALID'), "another program's label");
 });
 
-test('a declaring chart: its var and function come back after a restore', async () => {
+test('a chart with a var and a helper: the var comes back with the snapshot, the helper with the chart', async () => {
   const logs = new Logs();
   const declaring = scxml('decl', `
-  <script>var total = 0; function bump(k) { total += k; return total; }</script>
+  <script>var total = 0; function bump(t, k) { return t + k; }</script>
   <state id="s">
-    <transition event="add"><script>bump(_event.data)</script></transition>
-    <transition event="report"><log label="total" expr="total + ' ' + bump(0) + ' ' + _event.name"/></transition>
+    <transition event="add"><script>total = bump(total, _event.data)</script></transition>
+    <transition event="report"><log label="total" expr="total + ' ' + bump(total, 0) + ' ' + _event.name"/></transition>
   </state>`);
-  let host = new Host(CONFIG, { ...ENGINE, clock: new SimulatedClock() });
+  let host = new Host([], { ...CONFIG, ...ENGINE, clock: new SimulatedClock() });
   host.addImage(image({ decl: declaring }));
   const session = host.spawn(host.chart('decl'));
   host.send(session, 'add', 2);
@@ -319,7 +315,7 @@ test('a declaring chart: its var and function come back after a restore', async 
   await host.idle();
   const again = host.snapshot();
   host.close();
-  equal(logs.labelled('total').join('|'), '9 9 report', 'its var and function');
+  equal(logs.labelled('total').join('|'), '9 9 report', 'its var and its helper');
   if (again.length === 0) throw new Error('no snapshot of the restored host');
 });
 
@@ -328,7 +324,7 @@ test('a snapshot holds the time of its call, and host.now() reads that clock on 
     <state id="s"><onentry><send event="ring" delay="300ms"/></onentry>
       <transition event="ring" target="done"/></state>
     <final id="done"/>`);
-  const host = new Host(CONFIG, { ...ENGINE });
+  const host = new Host([], { ...CONFIG, ...ENGINE });
   host.addImage(image({ timer: chart }));
   host.spawn(host.chart('timer'), { name: 'timer' });
   await host.idle();
@@ -339,7 +335,7 @@ test('a snapshot holds the time of its call, and host.now() reads that clock on 
   if (!(after >= before)) throw new Error(`now() went back: ${before} then ${after}`);
   host.close();
   const clock = new SimulatedClock();
-  const restored = Host.restore(snapshot, CONFIG, { ...ENGINE, clock });
+  const restored = Host.restore(snapshot, [], { ...CONFIG, ...ENGINE, clock });
   const at = restored.now();
   if (!(at >= before && at <= after)) throw new Error(`the restored clock reads ${at}, the snapshot was taken between ${before} and ${after}`);
   await restored.idle();
@@ -349,7 +345,7 @@ test('a snapshot holds the time of its call, and host.now() reads that clock on 
   equal(restored.now(), at + 50, 'now() moves with the simulated clock');
   clock.increment(left);
   await restored.idle();
-  equal(restored.actorByName('timer'), undefined, 'it rang');
+  equal(named(restored, 'timer'), undefined, 'it rang');
   restored.close();
   let closed;
   try { restored.now(); } catch (error) { closed = error.status; }

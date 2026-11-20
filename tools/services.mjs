@@ -114,7 +114,7 @@ class Counter {
     this.world = world;
   }
 
-  receive(host, send) {
+  receive(send) {
     if (send.event === 'ping') {
       this.count++;
       if (send.data.n > this.count - 1) // never more pongs counted than sent (some may be on their way)
@@ -126,7 +126,7 @@ class Counter {
     }
   }
 
-  stop(host) {
+  stop() {
     const session = this.invocation.session;
     if (this.world.stopped.has(session)) this.world.failures.push(`session ${session} stopped twice`);
     this.world.stopped.add(session);
@@ -141,7 +141,7 @@ class World {
     this.stopped = new Set();
     this.reports = new Map();
     this.alive = []; // weak references to every service: the host holds the running ones only
-    this.start = (host, invocation) => {
+    this.start = (invocation) => {
       if (this.started.has(invocation.session)) this.failures.push(`session ${invocation.session} invoked twice`);
       if (invocation.type !== COUNTER || invocation.src !== 'counter://local' || invocation.invokeid !== 'counter')
         this.failures.push(`an invocation of ${invocation.type} ${invocation.src} ${invocation.invokeid}`);
@@ -150,7 +150,7 @@ class World {
       this.alive.push(new WeakRef(service));
       return service;
     };
-    this.log = (host, entry) => {
+    this.log = (entry) => {
       const [session, pongs, total, state] = entry.text.split(' ');
       this.reports.set(BigInt(session), `${pongs} ${total} ${state}`);
     };
@@ -169,10 +169,9 @@ async function main() {
   // tracing off (nobody exports the traces here).
   const events = 16384 + (o.datamodel === 'quickjs' ? room : 0);
   const config = {
-    systemID: 'services',
     system: { maxActors: room, maxRequests: room, maxEvents: events, instanceBytes: 128 * room, stringBytes: 16384 + 16 * room, tracing: false },
   };
-  const host = new Host(config, { ...engine(o.datamodel), log: world.log, services: { [COUNTER]: world.start } });
+  const host = new Host([], { system: 'services', config, ...engine(o.datamodel), log: world.log, services: { [COUNTER]: world.start } });
   const compiled = compileCharts([{ name: 'client.scxml', text: CLIENT }]);
   host.addImage(compiled.image);
   compiled.close();
@@ -182,7 +181,7 @@ async function main() {
   let started = performance.now();
   const sessions = new BigUint64Array(o.actors);
   for (let i = 0; i < o.actors; i++) {
-    sessions[i] = host.spawn(chart, { params: { seed: i } });
+    sessions[i] = host.spawn(chart, { params: { seed: i } }).id;
     if (i % BATCH === BATCH - 1) await host.idle();
   }
   await host.idle();
@@ -252,7 +251,7 @@ async function main() {
   const expectedRunning = o.actors - finishing.size - leaving.size;
   if (running !== expectedRunning) world.failures.push(`the host holds ${running} services, ${expectedRunning} still run`);
   let got;
-  host.hostStats(undefined, (h, result) => (got = result.host));
+  host.hostStats(undefined, (result) => (got = result.host));
   await host.idle();
   const region = Number(got.regionBytes);
   host.close();

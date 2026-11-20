@@ -43,7 +43,7 @@ export class Link {
   }
 
   /** The host's `transport` handler: every send to another system. */
-  transport = (host, send) => {
+  transport = (send) => {
     if (send.target.system !== this.peer || !this.#write('message.send', send.message)) {
       send.fail(); // no route, or no connection: the sender gets error.communication
     }

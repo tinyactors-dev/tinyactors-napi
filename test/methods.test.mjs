@@ -11,19 +11,19 @@ import { run, test } from './harness.mjs';
 /** A host running WAITER as one session `w`. */
 function waiting(options = {}) {
   const host = hostWith({ waiter: WAITER }, options);
-  const session = host.spawn(host.chart('waiter'), { name: 'w' });
+  const session = host.spawn(host.chart('waiter'), { name: 'w' }).id;
   return { host, session };
 }
 
 /** Calls host[method](params, ...) and records what answers it. */
 function ask(host, method, params) {
-  const answer = { result: undefined, error: undefined, calls: 0, host: undefined };
-  host[method](params, (h, result) => { answer.calls++; answer.host = h; answer.result = result; },
-    (h, error) => { answer.calls++; answer.host = h; answer.error = error; });
+  const answer = { result: undefined, error: undefined, calls: 0 };
+  host[method](params, (result) => { answer.calls++; answer.result = result; },
+    (error) => { answer.calls++; answer.error = error; });
   return answer;
 }
 
-test('each typed method is answered once, at a later drain, with the host and the result', async () => {
+test('each typed method is answered once, at a later drain, with the result', async () => {
   const { host, session } = waiting();
   await host.idle(); // the session ran: it is in state s
   const answers = {
@@ -43,7 +43,6 @@ test('each typed method is answered once, at a later drain, with the host and th
   await host.idle();
   for (const [method, answer] of Object.entries(answers)) {
     equal(answer.calls, 1, `${method}: answered once`);
-    equal(answer.host, host, `${method}: the handler gets the host`);
   }
   equal(answers.actorState.result.value, 's', 'actor.state: the configuration');
   equal(JSON.stringify(answers.actorContext.result), '{"variables":{}}', 'actor.context');
@@ -98,9 +97,9 @@ test('a typed method called from a handler is answered in a later take, after th
   const order = [];
   let entry;
   const host = hostWith({ logger: LOGGER }, {
-    log: (h, line) => {
+    log: (line) => {
       entry = line;
-      h.hostStats(undefined, (h2, result) => {
+      line.host.hostStats(undefined, (result) => {
         order.push('answered');
         throws(() => entry.label, status('TA_ERROR_STALE'), 'the handler\'s view, at the answer');
         order.push(result.host.actors);
@@ -118,9 +117,9 @@ test('a typed method answers its own handle: a second method from onResult is an
   const { host, session } = waiting();
   await host.idle(); // the session ran: it is in state s
   const seen = [];
-  host.actorGet({ session }, (h, result) => {
+  host.actorGet({ session }, (result) => {
     seen.push(result.chart);
-    h.actorState({ session }, (h2, state) => seen.push(JSON.stringify(state.value)));
+    host.actorState({ session }, (state) => seen.push(JSON.stringify(state.value)));
   });
   await host.idle();
   equal(seen.join(), 'waiter,"s"', 'both answered, in order');
@@ -210,11 +209,11 @@ test('a getter of params may call the host again: both methods are answered', as
   const seen = [];
   const params = {
     get session() {
-      host.actorGet({ session }, (h, result) => seen.push(`get ${result.chart}`));
+      host.actorGet({ session }, (result) => seen.push(`get ${result.chart}`));
       return session;
     },
   };
-  host.actorState(params, (h, result) => seen.push(`state ${JSON.stringify(result.value)}`));
+  host.actorState(params, (result) => seen.push(`state ${JSON.stringify(result.value)}`));
   await host.idle();
   equal(seen.sort().join(), 'get waiter,state "s"', 'the nested and the outer method');
   host.close();
@@ -235,10 +234,10 @@ test('close from a handler waits for the end of the turn: a reply the turn takes
   const LOGGER = scxml('logger', `<state id="s"><onentry><log label="hi" expr="1"/></onentry></state>`);
   const seen = [];
   const host = hostWith({ logger: LOGGER }, {
-    log: (h) => {
-      h.hostStats(undefined, (h2, result) => seen.push(`answered, closed ${h2.closed}`));
-      h.close();
-      seen.push(`asked, closed ${h.closed}`);
+    log: (entry) => {
+      entry.host.hostStats(undefined, (result) => seen.push(`answered, closed ${host.closed}`));
+      entry.host.close();
+      seen.push(`asked, closed ${entry.host.closed}`);
     },
   });
   host.spawn(host.chart('logger'));

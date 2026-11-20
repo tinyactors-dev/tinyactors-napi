@@ -6,7 +6,7 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Host, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, StaleError } from '@tinyactors/node';
 import { readRecord } from './xml.mjs';
 
 const DOCUMENT_CHART = readFileSync(new URL('./charts/document.scxml', import.meta.url), 'utf8');
@@ -43,22 +43,21 @@ export class ApprovalDesk {
     this.endings = new Map();
     this.receipts = 0;
 
-    this.host = new Host(
-      { systemID: 'approvals', ioProcessors: [{ type: 'urn:approval:notify' }, { type: 'urn:approval:archive' }] },
-      {
-        clock,
-        datamodel,
-        ioProcessors: {
-          'urn:approval:notify': (host, send) => this.notify(send.event, send.data),
-          // The archive is a slow system: the handler is async, so its
-          // send stays readable after the await, and answers later. A
-          // failure fails the send: the chart gets error.communication and
-          // retries.
-          'urn:approval:archive': (host, send) => this.track(this.archive(send)),
-        },
+    const compiled = compileCharts([{ name: 'document.scxml', text: DOCUMENT_CHART }]);
+    this.host = new Host(compiled, {
+      system: 'approvals',
+      clock,
+      datamodel,
+      ioProcessors: {
+        'urn:approval:notify': { receive: (send) => this.notify(send.event, send.data) },
+        // The archive is a slow system: receive returns a promise, so its
+        // send stays readable after the await, and answers later. A
+        // failure fails the send: the chart gets error.communication and
+        // retries.
+        'urn:approval:archive': { receive: (send) => this.track(this.archive(send)) },
       },
-    );
-    this.host.addCharts({ 'document.scxml': DOCUMENT_CHART });
+    });
+    compiled.close();
   }
 
   /** Keeps `promise` in `pending` until it settles, and returns it. */
@@ -98,7 +97,7 @@ export class ApprovalDesk {
     const params = { docID: id, title, author, amount };
     if (this.slaMs) params.slaMs = { legal: 172800000, finance: 172800000, signoff: 86400000, ...this.slaMs };
     if (this.legalFirstAt !== undefined) params.legalFirstAt = this.legalFirstAt;
-    return this.host.spawnChart('document', { name: id, params });
+    return this.host.spawn('document', { name: id, params });
   }
 
   /** Creates a document and submits it for review. */
@@ -111,13 +110,11 @@ export class ApprovalDesk {
    * no such document any more (it ended, or never was). Whether the event
    * does anything is the chart's to decide. */
   act(id, event, data) {
-    const session = this.host.actorByName(id);
-    if (session === undefined) return 'unknown';
     try {
-      this.host.send(session, event, data);
+      this.host.actor(id).send(event, data);
     } catch (error) {
-      // It ended between the lookup and the send.
-      if (error instanceof TinyactorsError && error.status === 'TA_ERROR_STALE') return 'unknown';
+      // No live actor of that name, or it ended between the lookup and the send.
+      if (error instanceof StaleError) return 'unknown';
       throw error;
     }
     return 'sent';

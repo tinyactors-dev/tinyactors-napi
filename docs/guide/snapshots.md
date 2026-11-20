@@ -1,10 +1,14 @@
 # Snapshots
 
+This guide is part of operating a host (the README's [Operating a
+host](../../README.md#operating-a-host)).
+
 `host.snapshot()` copies the whole host into one `Buffer`: every
 segment's memory (actors, queues, timers, the hibernated actors'
 records), the datamodel's sessions and values, the images, the system id
-and the host's time, read when you call it. `Host.restore(snapshot, config, options)` makes a
-new host running it, in this process or another.
+and the host's time, read when you call it. `Host.restore(snapshot,
+charts, options)` makes a new host running it, in this process or
+another.
 
 Uses: rehearse a deploy on a copy (add the new image, migrate, run the
 clock ahead, look); capture a host when something goes wrong and step
@@ -28,16 +32,15 @@ const compiled = compileCharts([{ name: 'reminder.scxml', text: `
   <final id="done"><onentry><log expr="'reminder: ' + note"/></onentry></final>
 </scxml>` }]);
 
-const config = { systemID: 'demo' };
-const log = (host, entry) => console.log(entry.text);
+const image = compiled.image;
+compiled.close();
+const log = (entry) => console.log(entry.text);
 
 const clock = new SimulatedClock();
-const host = new Host(config, { clock, log });
-host.addImage(compiled.image);
-compiled.close();
+const host = new Host(image, { system: 'demo', clock, log });
 
-const reminder = host.spawn(host.chart('reminder'), { name: 'plants' });
-host.send(reminder, 'set', 'water the plants');
+const reminder = host.spawn('reminder', { name: 'plants' });
+reminder.send('set', 'water the plants');
 await host.idle();
 clock.increment(30 * 60_000);      // half an hour passes
 await host.idle();
@@ -46,8 +49,8 @@ const snapshot = host.snapshot();  // bytes: write them to a file, send them els
 host.close();
 
 const later = new SimulatedClock(); // a clock that reads 0
-const copy = Host.restore(snapshot, config, { clock: later, log });
-console.log('same session:', copy.actorByName('plants') === reminder);
+const copy = Host.restore(snapshot, image, { system: 'demo', clock: later, log });
+console.log('same session:', copy.actor('plants').id === reminder.id);
 await copy.idle();
 console.log('due in', copy.nextDeadline / 60_000, 'minutes');
 later.increment(30 * 60_000);
@@ -73,11 +76,15 @@ on a restored host on a `SimulatedClock` moves the clock to each reading
 
 ## Restoring
 
-Pass `Host.restore` the config the snapshot was taken with (its
-`systemID` is checked, and the I/O processors and the tick rate are not
-in the snapshot), the snapshot's `datamodel` (`'quickjs'` for a quickjs
-host), and the handlers `new Host` takes. The host's handlers are not in
-the snapshot either: give the restored host its own.
+Pass `Host.restore` the charts, and the options the snapshot was taken
+with: its `system` is checked, and the I/O processors, the config's tick
+rate and the snapshot's `datamodel` (`'quickjs'` for a quickjs host) are
+not in the snapshot. The snapshot holds its images, so the charts are
+only those it does not hold: an image whose bytes are one of the
+snapshot's is not added again, and a new one (the next version of a
+chart, for a rehearsed deploy) is added as `new Host` adds it. The
+host's handlers are not in the snapshot either: give the restored host
+its own.
 
 - **A snapshot is valid only for the same build of the package.** It
   holds raw memory, with a version of its layout: a snapshot of a build
@@ -96,9 +103,9 @@ the snapshot either: give the restored host its own.
   no handler gives its invokers `error.communication`, and nothing is
   thrown.
 - **Hibernated actors stay in your store.** The snapshot holds their
-  records, not their blobs, and the restored host asks for them through
-  `wake` as before. A copy that hibernates actors needs its own copy of
-  the store, since it writes blobs too.
+  records, not their blobs, and the restored host loads them from the
+  `store` you pass it as before. A copy that hibernates actors needs its
+  own copy of the store, since it writes and deletes blobs too.
 - **Values are written through the value table**, so two variables of
   one actor that shared one object no longer share it after a restore.
 
@@ -109,8 +116,7 @@ The host must be quiescent. `snapshot()` throws a `TinyactorsError` with
 typed method's reply has not been handled yet (`await host.idle()`
 first), and while a migration runs. It throws `TA_ERROR_UNSUPPORTED` when
 an actor holds what hibernation cannot store (on the native datamodel a
-function, a `Map`, a `Date`, ..., or an actor of a chart whose scripts
-declare with `let`, `const` or `class`); the message names the variable.
+function, a `Map`, a `Date`, ...); the message names the variable.
 The host goes on either way.
 
 ```js
@@ -121,8 +127,9 @@ const compiled = compileCharts([{ name: 'c.scxml', text: `
        datamodel="ecmascript" name="c" initial="s">
   <state id="s"><onentry><log expr="'hello'"/></onentry></state>
 </scxml>` }]);
-const host = new Host({ systemID: 'demo' }, {
-  log: (host, entry) => {
+const host = new Host(compiled, {
+  system: 'demo',
+  log: (entry) => {
     try {
       host.snapshot();
     } catch (error) {
@@ -130,10 +137,9 @@ const host = new Host({ systemID: 'demo' }, {
     }
   },
 });
-host.addImage(compiled.image);
 compiled.close();
 
-host.spawn(host.chart('c'));
+host.spawn('c');
 await host.idle();
 console.log('after idle():', host.snapshot().length > 0);
 host.close();
@@ -147,8 +153,8 @@ after idle(): true
 ## At scale
 
 `tools/snapshot.mjs` (`mise run snapshot` in the repository) rehearses a
-deploy on a copy. The live host has two million actors, at most 1000
-resident and the rest in SQLite. Each resident actor has a delayed send
+deploy on a copy. The live host has two million actors, `resident: 1000`
+and the rest in a store over SQLite. Each resident actor has a delayed send
 pending, and half of them are paying through an invoked payment service
 that has not answered. The tool writes the host's snapshot to a file and
 copies the store. It restores the copy with its own store and clock and

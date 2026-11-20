@@ -9,6 +9,6 @@ await init(fetch('/tinyactors.wasm'));
 await init(new Uint8Array(8));
 // @ts-expect-error: null is no module (WebAssembly.Module is an empty interface, so any object is one to tsc)
 await init(null);
-const host: Host = new Host({ systemID: 'init' });
+const host: Host = new Host([], { system: 'init' });
 host.close();
 export const refused = (error: unknown): boolean => error instanceof TinyactorsError && error.status === 'TA_ERROR_STATE';

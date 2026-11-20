@@ -33,6 +33,7 @@ require_relative '../pack'
 PREFIX = NodeAPI::Pack::TAG_PREFIX
 TITLE = ->(version) { "@tinyactors/node and @tinyactors/wasm #{version}" }
 PACKAGE_JSON = NodeAPI::Pack::PACKAGE_JSON
+VERSION_MODULE = NodeAPI::ROOT.join('lib/version.mjs')
 
 def fail!(message) = Release.fail!(message)
 
@@ -75,7 +76,11 @@ publish_npm = lambda do |tarballs|
     Release.npm_published?(name, version).tap { |has| puts "release: npm has #{name}@#{version}; skipped" if has }
   end
   published, failed = Release.npm_publish!(left, dist_tag: dist_tag)
-  return true unless failed
+  unless failed
+    puts 'release: staged on npm; approve each package on npmjs.com (2FA) to make it public. ' \
+         "The release repository's workflow waits up to two hours for npm to serve them."
+    return true
+  end
 
   warn "release: npm publish #{failed.basename} failed; published: " \
        "#{published.empty? ? 'none' : published.map { |t| t.basename.to_s }.join(', ')}"
@@ -146,7 +151,8 @@ begin
     text = PACKAGE_JSON.read
     fail!('package.json has no version field') unless text.match?(/^  "version": "[^"]*"/)
     PACKAGE_JSON.write(text.sub(/^  "version": "[^"]*"/, "  \"version\": \"#{version}\""))
-    Release.commit_and_tag!(paths: [PACKAGE_JSON], subject: subject, tag: tag, notes_file: notes)
+    NodeAPI::Pack.write_version!(VERSION_MODULE, version)
+    Release.commit_and_tag!(paths: [PACKAGE_JSON, VERSION_MODULE], subject: subject, tag: tag, notes_file: notes)
     committed = true
   end
 

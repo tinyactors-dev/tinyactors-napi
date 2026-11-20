@@ -206,7 +206,15 @@ export function nullChart(module) {
 // catches, the stack and the depths are where they were.
 export function throwingImports(module, count) {
   const { image } = compile(module, [['hello.scxml', HELLO]]);
-  const host = new RawHost(module, { config: CONFIG, effect() { throw new Error('a handler that throws'); } });
+  // the sends' handler throws (each actor's end, TA_EFFECT_DONE, reaches
+  // the import too, and is answered)
+  const host = new RawHost(module, {
+    config: CONFIG,
+    effect(record) {
+      if (record.kind === EFFECT_SEND) throw new Error('a handler that throws');
+      return 0;
+    },
+  });
   host.addImage(image);
   const ref = host.chart('hello');
   const before = module.call('ta_web_stack');

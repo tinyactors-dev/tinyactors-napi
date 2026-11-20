@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { Host, SimulatedClock } from '@tinyactors/node';
-import { escapeXML } from './check.mjs';
+import { escapeXML, image } from './check.mjs';
 import { costPerDevice, holdTimes, nativeEscape, nativeRule, neighbourDelay } from './measure.mjs';
 import { run } from './main.mjs';
 import { Platform, SANDBOX } from './platform.mjs';
@@ -158,14 +158,12 @@ test('a rule that loops forever is stopped by maxOps, reported and suspended; th
 
 test('one engine for two rules: a rule that hoards memory makes its neighbour fail, so each rule has a host of its own', async () => {
   // what the platform avoids: two rules' actors in one quickjs host
-  const host = new Host({ systemID: 'shared', ioProcessors: [{ type: 'urn:iot:alert' }] }, {
-    datamodel: 'quickjs', quickjs: SANDBOX, ioProcessors: { 'urn:iot:alert': () => {} },
+  const host = new Host([image({ 'hoard.scxml': upload('hoard.scxml') }), image({ 'rolling-average.scxml': upload('rolling-average.scxml') })], {
+    system: 'shared', datamodel: 'quickjs', quickjs: SANDBOX, ioProcessors: { 'urn:iot:alert': { receive: () => {} } },
   });
   try {
-    host.addCharts({ 'hoard.scxml': upload('hoard.scxml') });
-    host.addCharts({ 'rolling-average.scxml': upload('rolling-average.scxml') });
-    const hoard = host.spawnChart('hoard');
-    const average = host.spawnChart('rolling-average', { params: { device: 'd' } });
+    const hoard = host.spawn('hoard');
+    const average = host.spawn('rolling-average', { params: { device: 'd' } });
     const reading = { device: 'd', metric: 'temp', value: 90, seq: 1 };
     host.send(average, 'reading', reading);
     await host.idle();

@@ -10,8 +10,9 @@
 // would write it to try a new chart version on a copy of production before
 // deploying it:
 //
-// 1. live: N order actors of version 1, at most R resident, the rest
-//    hibernated into SQLite (tools/store.mjs); E events to actors drawn at
+// 1. live: N order actors of version 1, at most R resident after a turn,
+//    the rest hibernated into SQLite by the host (new Host(charts, {store,
+//    resident: R}), tools/store.mjs's store); E events to actors drawn at
 //    random; every resident actor gets a delayed send due in 10 s, and half
 //    of them start paying: each invokes the payment service (<invoke
 //    type="urn:example:payment">, its amount as a param), which the live
@@ -26,9 +27,9 @@
 //    that was in flight; the stand-in gets each (invocation.restored, the
 //    same amount) and declines it;
 // 4. rehearse: the copy adds version 2 and migrates every actor to it
-//    (host.migrate, waking the hibernated ones a batch at a time from the
-//    copy's store, as tools/migration.mjs does), with E more events, then
-//    runs its clock past the delayed sends;
+//    (host.migrate({wake: true}): the copy's host loads the hibernated ones
+//    from the copy's store as room allows, as in tools/migration.mjs), with
+//    E more events, then runs its clock past the delayed sends;
 // 5. verify the copy: the migration migrated every actor, none failed; a
 //    sample (all up to 25,000) reports its count (every event, before and
 //    after the snapshot), its delayed send, its payment (declined for the
@@ -38,8 +39,8 @@
 //    reports version 1, its own counts, payments still in flight; the real
 //    service was started once per payer and never stopped, and every blob
 //    in the live store is the last one the live host wrote for its session
-//    (the copy wrote into its own). After every eviction, on both hosts, at
-//    most R actors are resident (plus two batches while migrating).
+//    (the copy wrote into its own). After every turn, on both hosts, at
+//    most R actors are resident (plus a batch while migrating).
 //
 // With R = N every actor stays resident, so the datamodel's own state is
 // most of the snapshot. Exits with status 1 when a check fails. Prints the
@@ -50,7 +51,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { compileCharts, Host, SimulatedClock, TinyactorsError } from '@tinyactors/node';
+import { compileCharts, Host, SimulatedClock } from '@tinyactors/node';
 import { BATCH, engine, random, Store } from './store.mjs';
 
 // tinyactors-cpython/tools/charts/order-v1.ecmascript.scxml and -v2.
@@ -143,7 +144,7 @@ class Payments {
     this.stopped = new Set();
     this.twice = 0; // stopped more than once
     this.restored = 0;
-    this.start = (host, invocation) => {
+    this.start = (invocation) => {
       const session = invocation.session;
       this.started.set(session, (this.started.get(session) ?? 0) + 1);
       this.amounts.set(session, invocation.data.amount);
@@ -166,90 +167,55 @@ class Payments {
 
 const index = (session) => Number(BigInt(session) & 0xffffffffn) - 1; // segment 0 numbers its sessions 1, 2, ...
 
-// One host's actors: its store, the resident ones (least recently used
-// first), the migration's wake queue, the reports; as tools/migration.mjs.
+// A host's store that remembers, per actor, the fingerprint of the last
+// blob it saved (0 once deleted: the actor is resident).
+class Written extends Store {
+  static async open(file, written) {
+    const store = await Store.open(file);
+    Object.setPrototypeOf(store, Written.prototype);
+    store.written = written;
+    return store;
+  }
+
+  save(session, blob) {
+    this.written[index(session)] = fingerprint(blob);
+    super.save(session, blob);
+  }
+
+  delete(session) {
+    this.written[index(session)] = 0;
+    super.delete(session);
+  }
+}
+
+// One host's actors: its store, the reports, the migration's moves.
 class Population {
   constructor(name, store, o, failures) {
-    this.name = name;
-    this.store = store;
-    this.o = o;
-    this.failures = failures;
-    this.resident = new Map();
+    Object.assign(this, { name, store, o, failures });
     this.moved = new Uint8Array(o.actors); // 1: migrated (the MIGRATED effect)
-    this.queued = new Uint8Array(o.actors); // 1: the migration asked for it, waiting in `asked`
-    this.asked = [];
-    this.head = 0;
     this.reports = new Map();
-    this.wakes = 0;
     this.moves = 0;
     this.peak = 0;
     this.migrating = false;
-    this.done = undefined; // migrationDone's result
-    this.written = new Uint32Array(o.actors); // the fingerprint of the last blob it put, per actor
-    this.wake = (host, session, migration) => {
-      if (migration !== undefined) { // the migration asks: in its order, a batch at a time
-        if (!this.queued[index(session)]) {
-          this.queued[index(session)] = 1;
-          this.asked.push(session);
-        }
-        return;
-      }
-      this.wakeNow(host, session); // an event's or a timer's: at once
-    };
-    this.migrated = (host, entry) => {
+    this.migrationDone = undefined;
+    this.migrated = (entry) => {
       if (this.moved[index(entry.session)]) failures.push(`${name}: actor ${entry.session} moved twice`);
       this.moved[index(entry.session)] = 1;
       this.moves++;
     };
-    this.migrationDone = (host, result) => {
-      this.done = result;
-    };
-    this.log = (host, entry) => {
-      const [session, n, late, paid, version] = entry.text.split(' ');
-      this.reports.set(BigInt(session), [Number(n), Number(late), Number(paid), Number(version)].join(' '));
+    this.log = (entry) => {
+      const [session, ...numbers] = entry.text.split(' ');
+      this.reports.set(BigInt(session), numbers.join(' '));
     };
   }
 
-  wakeNow(host, session) {
-    host.wake(session, this.store.get(session));
-    this.resident.set(session, true);
-    this.wakes++;
-  }
-
-  hibernate(host, session) {
-    let blob;
-    try {
-      blob = host.hibernate(session);
-    } catch (error) {
-      if (!(error instanceof TinyactorsError) || error.status !== 'TA_ERROR_STATE') throw error; // a bug: the run fails
-      return false; // not at rest now: it stays
-    }
-    this.written[index(session)] = fingerprint(blob);
-    this.store.put(session, blob);
-    this.resident.delete(session);
-    return true;
-  }
-
-  // Down to R resident: cold actors first, then the least recently used;
-  // while migrating, only the actors that moved already.
-  evict(host) {
-    const may = (session) => !this.migrating || this.moved[index(session)];
-    while (this.resident.size > this.o.resident) {
-      const cold = host.sweep(1 << 20, this.resident.size - this.o.resident).filter(may);
-      let went = 0;
-      for (const session of cold) went += this.hibernate(host, session) ? 1 : 0;
-      if (!went) break;
-    }
-    for (const session of [...this.resident.keys()]) { // payers stay (an invocation keeps an actor in memory)
-      if (this.resident.size <= this.o.resident) break;
-      if (may(session)) this.hibernate(host, session);
-    }
+  // The sessions of `sessions` in memory: those without a blob in the store.
+  resident(sessions) {
+    return sessions.filter((session) => !this.store.written[index(session)]);
   }
 
   async checkResident(host, slack = 0) {
-    let got;
-    host.hostStats(undefined, (h, result) => (got = result.host));
-    await host.idle();
+    const got = (await host.hostStats()).host;
     const live = Number(got.actors) - Number(got.hibernated);
     this.peak = Math.max(this.peak, live);
     if (live > this.o.resident + slack) this.failures.push(`${this.name}: ${live} actors resident, more than ${this.o.resident} + ${slack}`);
@@ -257,37 +223,35 @@ class Population {
   }
 }
 
+const seconds = (since) => ((performance.now() - since) / 1000).toFixed(2);
+
 async function main() {
   const o = options(process.argv.slice(2));
   const draw = random(o.seed);
   const failures = [];
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tinyactors-snapshot-'));
-  const seconds = (since) => ((performance.now() - since) / 1000).toFixed(2);
 
-  // sized as tools/migration.mjs's (instance 128 B and strings 16 B per resident actor, tracing off);
-  // a delayed send per resident actor: events and timers for each
   const room = Math.min(o.resident, o.actors) + 4 * BATCH;
+  // sized as tools/stress.mjs's (instance 128 B and strings 16 B per resident actor, tracing off);
+  // events: a delayed send per resident actor, and after the restore the stand-in's declines
+  // (quickjs keeps each actor's last event too)
   const config = {
-    systemID: 'orders',
     system: {
-      ticksPerSecond: 1000,
-      maxActors: o.actors + 4 * BATCH,
-      maxEvents: 4096 + 3 * room,
-      maxTimers: room,
-      maxRequests: room,
-      instanceBytes: 128 * room,
-      stringBytes: 16384 + 16 * room,
-      tracing: false,
+      ticksPerSecond: 1000, maxActors: o.actors + 4 * BATCH, maxEvents: 4096 + 3 * room, maxTimers: room, maxRequests: room,
+      instanceBytes: 128 * room, stringBytes: 16384 + 16 * room, tracing: false,
     },
   };
-  const liveStore = await Store.open(path.join(directory, 'live.db'));
+  const liveStore = await Written.open(path.join(directory, 'live.db'), new Uint32Array(o.actors));
   const live = new Population('live', liveStore, o, failures);
   const real = new Payments(false);
   const liveClock = new SimulatedClock();
-  const host = new Host(config, { ...engine(o.datamodel), wake: live.wake, log: live.log, clock: liveClock, services: { [PAYMENT]: real.start } });
-  add(host, ORDER(1));
-  const chart = host.chart('order');
-  const sessions = new BigUint64Array(o.actors);
+  const v1 = compileCharts([{ name: 'order.scxml', text: ORDER(1) }]);
+  const host = new Host(v1, {
+    system: 'orders', config, ...engine(o.datamodel), log: live.log, clock: liveClock, services: { [PAYMENT]: real.start },
+    store: liveStore, resident: o.resident,
+  });
+  v1.close();
+  const sessions = [];
   const sent = new Uint32Array(o.actors); // events before the snapshot
   const sentLive = new Uint32Array(o.actors); // the live host's after it
   const sentCopy = new Uint32Array(o.actors); // the copy's after it
@@ -299,43 +263,28 @@ async function main() {
         const i = Math.floor(draw() * o.actors);
         counts[i]++;
         items.push({ target: sessions[i], event: 'inc', data: { k: i } });
-        if (population.resident.has(sessions[i])) { // most recently used now
-          population.resident.delete(sessions[i]);
-          population.resident.set(sessions[i], true);
-        }
       }
       if (h.sendMany(items) !== items.length) failures.push(`${population.name}: sendMany refused events`);
       await h.idle();
-      if (!population.migrating) {
-        population.evict(h);
-        await population.checkResident(h);
-      }
+      await population.checkResident(h, population.migrating ? BATCH : 0);
     }
   };
 
   // 1. live: populate, events, delayed sends, payments in flight
   let started = performance.now();
   for (let i = 0; i < o.actors; i++) {
-    const session = host.spawn(chart);
-    sessions[i] = session;
-    live.resident.set(session, true);
-    if (live.resident.size >= o.resident + BATCH) {
-      await host.idle();
-      live.evict(host);
-    }
-    if (i && i % 500_000 === 0) console.log(`  populate: ${i} actors, ${seconds(started)} s`);
+    sessions.push(host.spawn('order').id);
+    if (i % BATCH === BATCH - 1) await host.idle();
   }
   await host.idle();
-  live.evict(host);
-  if (o.actors && sessions[o.actors - 1] !== sessions[0] + BigInt(o.actors - 1))
-    failures.push('the sessions are not numbered 1..N in segment 0: index() is wrong');
+  if (o.actors && sessions[o.actors - 1] !== sessions[0] + BigInt(o.actors - 1)) failures.push('the sessions are not numbered 1..N in segment 0: index() is wrong');
   await traffic(live, host, sent, o.events);
-  const waiting = [...live.resident.keys()];
+  const waiting = live.resident(sessions);
   const payers = waiting.filter((_, i) => i % 2 === 0);
   for (let first = 0; first < waiting.length; first += BATCH) {
-    const batch = waiting.slice(first, first + BATCH);
-    host.sendMany(batch.map((target) => ({ target, event: 'wait' })));
-    host.sendMany(batch.filter((_, i) => i % 2 === 0).map((target) => ({ target, event: 'pay' })));
+    const slice = waiting.slice(first, first + BATCH);
+    host.sendMany(slice.map((target) => ({ target, event: 'wait' })));
+    host.sendMany(slice.filter((_, i) => i % 2 === 0).map((target) => ({ target, event: 'pay' })));
     await host.idle();
   }
   liveStore.flush();
@@ -351,11 +300,9 @@ async function main() {
   const taken = seconds(started);
   const file = path.join(directory, 'orders.snapshot');
   writeFileSync(file, blob);
-  const inMemory = [...live.resident.keys()]; // resident at the snapshot: resident in the copy too
-  const copyFile = path.join(directory, 'copy.db');
-  liveStore.copyTo(copyFile);
-  const copyStore = await Store.open(copyFile);
   const size = blob.length;
+  liveStore.copyTo(path.join(directory, 'copy.db'));
+  const copyStore = await Written.open(path.join(directory, 'copy.db'), new Uint32Array(liveStore.written));
   console.log(`snapshot: ${(size / 1e6).toFixed(1)} MB in ${taken} s (${Math.round(size / o.actors)} B an actor); the store copied`);
   const digest = createHash('sha256').update(blob).digest('hex'); // one snapshot in memory at a time
   blob = undefined;
@@ -366,22 +313,15 @@ async function main() {
   const standIn = new Payments(true);
   const copyClock = new SimulatedClock(); // a clock of its own: the copy's time is not the live host's
   started = performance.now();
-  const rehearsal = Host.restore(blob, config, {
-    ...engine(o.datamodel),
-    wake: copy.wake,
-    log: copy.log,
-    migrated: copy.migrated,
-    migrationDone: copy.migrationDone,
-    clock: copyClock,
-    services: { [PAYMENT]: standIn.start },
+  const rehearsal = Host.restore(blob, [], {
+    system: 'orders', config, ...engine(o.datamodel), log: copy.log, migrated: copy.migrated, clock: copyClock,
+    services: { [PAYMENT]: standIn.start }, migrationDone: (result) => { copy.migrationDone = result; },
+    store: copyStore, resident: o.resident,
   });
   const restored = seconds(started);
   blob = undefined;
-  let again = rehearsal.snapshot();
-  if (createHash('sha256').update(again).digest('hex') !== digest)
+  if (createHash('sha256').update(rehearsal.snapshot()).digest('hex') !== digest)
     failures.push("the copy's snapshot differs from the one it was restored from");
-  again = undefined;
-  for (const session of inMemory) copy.resident.set(session, true);
   await rehearsal.idle(); // the payments in flight, announced again: the stand-in declines them
   if (!standIn.onceFor(payers) || standIn.restored !== payers.length)
     failures.push(`copy: the stand-in started ${standIn.started.size} payments (${standIn.restored} restored) for ${payers.length} payers`);
@@ -389,115 +329,95 @@ async function main() {
   console.log(`restore: in ${restored} s; the copy's snapshot compared; ${standIn.restored} payments in flight started again ` +
     'on the stand-in');
 
-  // 4. rehearse the deploy: version 2, migrate everyone with events meanwhile
+  // 4. rehearse the deploy: version 2, migrate everyone with events meanwhile, the clock past the sends
   started = performance.now();
   add(rehearsal, ORDER(2));
   copy.migrating = true;
   const migration = rehearsal.migrate({ wake: true });
-  let copyEvents = 0;
-  let stalled = 0;
-  let before = -1;
-  while (copy.done === undefined) {
-    stalled = copy.moves === before && copy.head === copy.asked.length ? stalled + 1 : 0;
+  const gets = copyStore.gets;
+  let copyEvents = 0, stalled = 0, before = -1;
+  while (copy.migrationDone === undefined) {
+    stalled = copy.moves === before ? stalled + 1 : 0;
     before = copy.moves;
     if (stalled > 100) {
       failures.push(`copy: the migration stalled with ${before} actors moved`);
       break;
     }
-    let woken = 0;
-    while (copy.head < copy.asked.length && woken < BATCH) {
-      const session = copy.asked[copy.head++];
-      copy.queued[index(session)] = 0;
-      if (!copy.resident.has(session) && !copy.moved[index(session)]) {
-        copy.wakeNow(rehearsal, session);
-        woken++;
-      }
-    }
-    if (copy.head === copy.asked.length) {
-      copy.asked.length = 0;
-      copy.head = 0;
-    }
     if (copyEvents < o.events) {
-      const count = Math.min(BATCH, o.events - copyEvents);
-      await traffic(copy, rehearsal, sentCopy, count);
-      copyEvents += count;
+      const n = Math.min(BATCH, o.events - copyEvents);
+      await traffic(copy, rehearsal, sentCopy, n);
+      copyEvents += n;
     }
     await rehearsal.idle();
-    copy.evict(rehearsal);
-    await copy.checkResident(rehearsal, 2 * BATCH);
+    await copy.checkResident(rehearsal, BATCH);
   }
   copy.migrating = false;
   await traffic(copy, rehearsal, sentCopy, o.events - copyEvents);
-  const result = copy.done ?? { migration: undefined, migrated: 0, failed: [], pending: undefined };
+  const result = copy.migrationDone ?? { migration: undefined, migrated: 0, failed: [], pending: undefined };
   if (result.migration !== migration || result.migrated !== o.actors || result.failed.length || result.pending?.length !== 0)
-    failures.push(`copy: the migration ended ${JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? `${v}` : v))}, ` +
-      `not ${o.actors} migrated`);
+    failures.push(`copy: the migration ended ${JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? `${v}` : v))}, not ${o.actors} migrated`);
   console.log(`rehearse: ${copy.moves} actors to version 2 in ${seconds(started)} s, ${o.events} events meanwhile, ` +
-    `${copy.wakes} woken from the copy's store`);
+    `${copyStore.gets - gets} loaded from the copy's store`);
 
-  // the sample: every actor up to S, and the first resident ones
+  // the sample: every actor up to S, and the first payers and waiting ones
   let sample;
   if (o.actors <= o.sample) sample = Array.from({ length: o.actors }, (_, i) => i);
   else {
-    const chosen = new Set([...payers.slice(0, 50), ...waiting.filter((_, i) => i % 2 === 1).slice(0, 50)].map(index));
+    const chosen = new Set();
     while (chosen.size < o.sample) chosen.add(Math.floor(draw() * o.actors));
-    sample = [...chosen].sort((a, b) => a - b);
+    sample = [...chosen];
   }
-  const late = new Uint8Array(o.actors);
-  for (const session of waiting) late[index(session)] = 1;
-  const paying = new Uint8Array(o.actors);
-  for (const session of payers) paying[index(session)] = 1;
+  sample = [...new Set([...sample, ...payers.slice(0, 50).map(index), ...waiting.filter((_, i) => i % 2 === 1).slice(0, 50).map(index)])]
+    .sort((a, b) => a - b);
+  const paying = new Set(payers), late = new Set(waiting);
   const report = async (population, h) => {
     population.reports.clear();
     for (let chunk = 0; chunk < sample.length; chunk += BATCH) {
       h.sendMany(sample.slice(chunk, chunk + BATCH).map((i) => ({ target: sessions[i], event: 'report' })));
       await h.idle();
-      population.evict(h);
       await population.checkResident(h);
     }
   };
-  const verify = (population, expected) => {
-    const wrong = sample.filter((i) => population.reports.get(sessions[i]) !== expected(i));
-    if (wrong.length)
-      failures.push(`${population.name}: ${wrong.length} of ${sample.length} actors wrong, e.g. actor ${wrong[0]}: ` +
-        `${population.reports.get(sessions[wrong[0]])}, expected ${expected(wrong[0])}`);
-    return wrong.length;
-  };
 
   // 5. the copy: the clock past the delayed sends, then every count, send, payment and version
-  started = performance.now();
   copyClock.increment(10_000);
   await rehearsal.idle();
-  copy.evict(rehearsal);
   const copyRegion = Number((await copy.checkResident(rehearsal)).regionBytes);
   await report(copy, rehearsal);
-  const wrongCopy = verify(copy, (i) => `${sent[i] + sentCopy[i]} ${late[i]} ${paying[i] ? 0 : -1} 2`);
+  const wrong = sample.filter((i) => copy.reports.get(sessions[i]) !==
+    `${sent[i] + sentCopy[i]} ${late.has(sessions[i]) ? 1 : 0} ${paying.has(sessions[i]) ? 0 : -1} 2`);
+  if (wrong.length) {
+    failures.push(`copy: ${wrong.length} of ${sample.length} actors wrong, e.g. actor ${wrong[0]}: ${copy.reports.get(sessions[wrong[0]])}, ` +
+      `expected ${sent[wrong[0]] + sentCopy[wrong[0]]} ${late.has(sessions[wrong[0]]) ? 1 : 0} ${paying.has(sessions[wrong[0]]) ? 0 : -1} 2`);
+  }
   rehearsal.close();
 
   // 6. the live host goes on: its own events, the clock past its delayed sends; payments still in flight
   await traffic(live, host, sentLive, o.events);
   liveClock.increment(10_000);
   await host.idle();
-  live.evict(host);
   await report(live, host);
-  const wrongLive = verify(live, (i) => `${sent[i] + sentLive[i]} ${late[i]} -1 1`);
+  const wrongLive = sample.filter((i) => live.reports.get(sessions[i]) !==
+    `${sent[i] + sentLive[i]} ${late.has(sessions[i]) ? 1 : 0} -1 1`);
+  if (wrongLive.length) {
+    failures.push(`live: ${wrongLive.length} of ${sample.length} actors wrong, e.g. actor ${wrongLive[0]}: ` +
+      `${live.reports.get(sessions[wrongLive[0]])}`);
+  }
   if (!real.onceFor(payers) || real.restored || real.stopped.size)
-    failures.push(`live: the real payment service was started ${[...real.started.values()].reduce((a, b) => a + b, 0)} times ` +
+    failures.push(`live: the real payment service was started ${real.started.size} times ` +
       `for ${payers.length} payers (${real.restored} restored), stopped ${real.stopped.size} times`);
   if (standIn.stopped.size !== payers.length || standIn.twice || payers.some((s) => !standIn.stopped.has(s)))
-    failures.push(`copy: ${standIn.stopped.size} stand-in payments cancelled after their decline (${standIn.twice} twice), ` +
-      `${payers.length} payers`);
+    failures.push(`copy: ${standIn.stopped.size} stand-in payments cancelled after their decline, ${payers.length} payers`);
   const liveRegion = Number((await live.checkResident(host)).regionBytes);
   host.close();
   let foreign = 0;
-  for (const [session, stored] of liveStore.rows()) if (live.written[index(session)] !== fingerprint(stored)) foreign++;
+  for (const [session, stored] of liveStore.rows()) if (liveStore.written[index(session)] !== fingerprint(stored)) foreign++;
   if (foreign) failures.push(`live: ${foreign} blobs in the live store are not the live host's last`);
   const peakRSS = process.resourceUsage().maxRSS * 1024; // maxRSS: kilobytes (node, and bun's process.resourceUsage)
-  console.log(`verify: ${sample.length} actors on each host in ${seconds(started)} s, ${wrongCopy} wrong on the copy, ` +
-    `${wrongLive} on the live host`);
+  console.log(`verify: ${sample.length} actors on each host, ${wrong.length} wrong on the copy, ${wrongLive.length} on the live host`);
   console.log(`memory: peak resident ${Math.round(peakRSS / 1e6)} MB (${Math.round(peakRSS / o.actors)} B an actor, both hosts); ` +
     `region ${(liveRegion / 1e6).toFixed(1)} MB live, ${(copyRegion / 1e6).toFixed(1)} MB the copy ` +
-    `(${Math.round(liveRegion / o.actors)} B an actor); at most ${Math.max(live.peak, copy.peak)} actors resident after an eviction`);
+    `(${Math.round(liveRegion / o.actors)} B an actor); at most ${Math.max(live.peak, copy.peak)} actors resident after a turn`);
   rmSync(directory, { recursive: true, force: true });
   for (const failure of failures.slice(0, 20)) console.log(`FAIL ${failure}`);
   process.exitCode = failures.length ? 1 : 0;

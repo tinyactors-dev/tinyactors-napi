@@ -7,7 +7,7 @@
 // timers included) and listens again.
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { Host } from '@tinyactors/node';
+import { compileCharts, Host } from '@tinyactors/node';
 import { Link } from './link.mjs';
 
 const SKU_CHART = readFileSync(new URL('./charts/sku.scxml', import.meta.url), 'utf8');
@@ -15,8 +15,16 @@ const SKU_CHART = readFileSync(new URL('./charts/sku.scxml', import.meta.url), '
 export const WAREHOUSE = 'warehouse';
 export const STOREFRONT = 'storefront';
 
-/** The host's config: the same for `new Host` and `Host.restore`. */
-const CONFIG = { systemID: WAREHOUSE, ioProcessors: [{ type: 'urn:warehouse:stock' }] };
+/** The SKUs' image, compiled once: what `new Host` runs, and what
+ * `Host.restore` finds its snapshot holds already. */
+const IMAGE = (() => {
+  const compiled = compileCharts([{ name: 'sku.scxml', text: SKU_CHART }]);
+  try {
+    return compiled.image;
+  } finally {
+    compiled.close();
+  }
+})();
 
 export class Warehouse {
   /** every stock change the SKUs reported, in order: {event, sku, reservation, qty, stock} */
@@ -39,29 +47,29 @@ export class Warehouse {
   constructor({ catalog = {}, holdFor = '900s', snapshot, clock, datamodel, fault, trace, onReport = () => {}, onLog = () => {} } = {}) {
     this.link = new Link({ system: WAREHOUSE, peer: STOREFRONT, fault, trace });
     const options = {
+      system: WAREHOUSE,
       clock,
       datamodel,
       transport: this.link.transport,
       ioProcessors: {
-        'urn:warehouse:stock': (host, send) => {
+        'urn:warehouse:stock': { receive: (send) => {
           const entry = { event: send.event, ...send.data };
           this.ledger.push(entry);
           onReport(entry);
-        },
+        } },
       },
-      log: (host, entry) => {
+      log: (entry) => {
         const line = `${entry.label}: ${entry.text}`;
         this.logs.push(line);
         onLog(line);
       },
     };
     if (snapshot !== undefined) {
-      this.host = Host.restore(snapshot, CONFIG, options);
+      this.host = Host.restore(snapshot, IMAGE, options);
     } else {
-      this.host = new Host(CONFIG, options);
-      this.host.addCharts({ 'sku.scxml': SKU_CHART });
+      this.host = new Host(IMAGE, options);
       for (const [sku, stock] of Object.entries(catalog)) {
-        this.host.spawnChart('sku', { name: `sku-${sku}`, params: { sku, stock, holdFor } });
+        this.host.spawn('sku', { name: `sku-${sku}`, params: { sku, stock, holdFor } });
       }
     }
     this.link.host = this.host;

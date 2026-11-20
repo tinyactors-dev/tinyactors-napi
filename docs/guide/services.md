@@ -14,13 +14,13 @@ those.
 
 Register a handler per `<invoke type>` in the host's options:
 `services: { [type]: handler }`. When an invocation starts, the handler
-gets the host and an **invocation**, and returns the **service**, any
+gets an **invocation** (its `host` among its fields), and returns the **service**, any
 object. The host keeps the service until the invocation ends and calls
 its methods:
 
-- `receive(host, send)` gets each `<send target="#_<invokeid>">` of the
+- `receive(send)` gets each `<send target="#_<invokeid>">` of the
   invoker (and each event it forwards, with `autoforward="true"`);
-- `stop(host)` is called when the invoker leaves the state, which cancels
+- `stop()` is called when the invoker leaves the state, which cancels
   the invocation.
 
 Both are optional. The invocation is how the service talks back:
@@ -54,28 +54,28 @@ class Counter {
     this.count = invocation.data.start;
     console.log(`started ${invocation.type} ${invocation.src} for session ${invocation.session}`);
   }
-  receive(host, send) {
+  receive(send) {
     this.count++;
     if (send.event === 'finish') this.invocation.done({ total: this.count });
     else this.invocation.sendBack('pong', { n: this.count });
   }
-  stop(host) {
+  stop() {
     console.log('stopped');
   }
 }
 
 const compiled = compileCharts([{ name: 'player.scxml', text: chart }]);
-const host = new Host({ systemID: 'demo' }, {
-  services: { 'urn:example:counter': (host, invocation) => new Counter(invocation) },
-  log: (host, entry) => console.log(entry.text),
+const host = new Host(compiled, {
+  system: 'demo',
+  services: { 'urn:example:counter': (invocation) => new Counter(invocation) },
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-const player = host.spawn(host.chart('player'));
-host.send(player, 'go');
-host.send(player, 'go');
-host.send(player, 'finish');
+const player = host.spawn('player');
+player.send('go');
+player.send('go');
+player.send('finish');
 await host.idle();
 host.close();
 ```
@@ -139,26 +139,26 @@ const chart = `
 </scxml>`;
 
 const compiled = compileCharts([{ name: 'client.scxml', text: chart }]);
-const host = new Host({ systemID: 'demo' }, {
+const host = new Host(compiled, {
+  system: 'demo',
   services: {
-    'urn:example:db': async (host, invocation) => {
+    'urn:example:db': async (invocation) => {
       invocation.sendBack('status', 'connecting');
       const connection = await connect(invocation.src);
       return {
-        async receive(host, send) {
+        async receive(send) {
           invocation.sendBack('answer', await connection.ask(send.data));
         },
       };
     },
   },
-  log: (host, entry) => console.log(entry.text),
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-const client = host.spawn(host.chart('client'));
-host.send(client, 'query', 'first');  // both reach the service once it is connected
-host.send(client, 'query', 'second');
+const client = host.spawn('client');
+client.send('query', 'first');  // both reach the service once it is connected
+client.send('query', 'second');
 await new Promise((resolve) => setTimeout(resolve, 100));
 await host.idle();
 host.close();
@@ -196,7 +196,7 @@ class Connection {
     this.ready = connect(invocation.src); // a promise, started now
     this.ready.catch(() => {});           // its failure is answered in receive
   }
-  async receive(host, send) {             // send was filled before the host moved on
+  async receive(send) {             // send was filled before the host moved on
     const connection = await this.ready;
     this.invocation.sendBack('answer', await connection.ask(send.data));
   }
@@ -211,14 +211,14 @@ const compiled = compileCharts([{ name: 'client.scxml', text: `
     <transition event="answer"><log expr="_event.data"/></transition>
   </state>
 </scxml>` }]);
-const host = new Host({ systemID: 'demo' }, {
-  services: { 'urn:example:db': (host, invocation) => new Connection(invocation) },
-  log: (host, entry) => console.log(entry.text),
+const host = new Host(compiled, {
+  system: 'demo',
+  services: { 'urn:example:db': (invocation) => new Connection(invocation) },
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-host.send(host.spawn(host.chart('client')), 'query', 'ping');
+host.spawn('client').send('query', 'ping');
 await new Promise((resolve) => setTimeout(resolve, 100));
 await host.idle();
 host.close();
@@ -243,7 +243,7 @@ without `stop`), or no handler for a restored invocation. Each later send
 to that invocation gets one too, until the invoker leaves the state. The
 invoker gets none when it cancelled the invocation in the same step that
 started it. A handler's error is reported after the turn, as any
-handler's. A type with no handler throws nothing: the chart chose the
+handler's: to `onHandlerError(error, invocation)`, or out of `idle()`. A type with no handler throws nothing: the chart chose the
 type, and a chart (an untrusted one on quickjs, say) must not be able to
 end your process by naming one you do not serve.
 
@@ -258,14 +258,14 @@ const compiled = compileCharts([{ name: 'c.scxml', text: `
     <transition event="error.communication"><log expr="'the mail service failed'"/></transition>
   </state>
 </scxml>` }]);
-const host = new Host({ systemID: 'demo' }, {
+const host = new Host(compiled, {
+  system: 'demo',
   services: { 'urn:example:mail': () => { throw new Error('no SMTP server'); } },
-  log: (host, entry) => console.log(entry.text),
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-host.spawn(host.chart('c'));
+host.spawn('c');
 try {
   await host.idle();
 } catch (error) {

@@ -3,9 +3,20 @@
 // `status` (core's name of a status, ta_status_name), each undefined when
 // not given; CompileError and ResolveError, its subclasses. A poisoned
 // module's error carries what poisoned it as its `cause`.
+// One subclass per status an application branches on (StaleError,
+// StateError, InvalidError, UnsupportedError): `new TinyactorsError(message,
+// {status})` makes the subclass of that status itself, and a typed method's
+// error the subclass of its code (-32001 stale, -32002 state, any other
+// invalid), so no call that throws chooses a class.
+let byStatus, byCode;
+
 export class TinyactorsError extends Error {
   constructor(message, options) {
     const given = options ?? {};
+    if (new.target === TinyactorsError) {
+      const subclass = byStatus[given.status] ?? (given.code === undefined ? undefined : byCode(given.code));
+      if (subclass !== undefined) return new subclass(message, options);
+    }
     super(message, given.cause !== undefined ? { cause: given.cause } : undefined);
     Object.defineProperties(this, {
       code: { value: given.code, enumerable: true },
@@ -17,6 +28,23 @@ export class TinyactorsError extends Error {
 
   get name() { return 'TinyactorsError'; }
 }
+
+const of = (name, status) => ({ [name]: class extends TinyactorsError {
+  constructor(message, options) {
+    const given = options ?? {};
+    super(message, given.code === undefined ? { ...given, status: given.status ?? status } : given);
+  }
+
+  get name() { return name; }
+} })[name];
+
+export const StaleError = of('StaleError', 'TA_ERROR_STALE');
+export const StateError = of('StateError', 'TA_ERROR_STATE');
+export const InvalidError = of('InvalidError', 'TA_ERROR_INVALID');
+export const UnsupportedError = of('UnsupportedError', 'TA_ERROR_UNSUPPORTED');
+byStatus = { __proto__: null, TA_ERROR_STALE: StaleError, TA_ERROR_STATE: StateError,
+  TA_ERROR_INVALID: InvalidError, TA_ERROR_UNSUPPORTED: UnsupportedError };
+byCode = (code) => code === -32001 ? StaleError : code === -32002 ? StateError : InvalidError;
 
 // A compilation with an error: every diagnostic, the message the first
 // error's as a compiler prints it.

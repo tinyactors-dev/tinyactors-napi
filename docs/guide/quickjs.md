@@ -30,18 +30,18 @@ const compiled = compileCharts([{ name: 'uploaded.scxml', text: `
   </state>
 </scxml>` }]);
 
-const host = new Host({ systemID: 'sandbox' }, {
+const host = new Host(compiled, {
+  system: 'sandbox',
   datamodel: 'quickjs',
   quickjs: { maxOps: 1000, memoryLimit: 16 * 1024 * 1024 },
-  log: (host, entry) => console.log(entry.text),
+  log: (entry) => console.log(entry.text),
 });
-host.addImage(compiled.image);
 compiled.close();
 
-const actor = host.spawn(host.chart('uploaded'));
-host.send(actor, 'spin');
-host.send(actor, 'hog');
-host.send(actor, 'peek');
+const actor = host.spawn('uploaded');
+actor.send('spin');
+actor.send('hog');
+actor.send('peek');
 await host.idle();
 host.close();
 ```

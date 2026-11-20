@@ -2,9 +2,9 @@
  * node:vm, reached with process.getBuiltinModule (a JavaScript call made
  * with Node-API, not V8's C++ API), its contexts, and the realm's script
  * (realm.js, embedded by the build) every context runs for its kit. One
- * context per host is shared by the charts that declare nothing at the top
- * of their scripts; a declaring chart's session gets one of its own. Which
- * charts declare is asked of the engine: the addon parses no JavaScript.
+ * context per host holds every chart and session of its native datamodel.
+ * What a chart's scripts declare is asked of the engine, through the kit:
+ * the addon parses no JavaScript.
  * In() is one function per environment that reads the evaluating
  * datamodel from the instance, so it holds no pointer that could outlive
  * a host. */
@@ -136,7 +136,9 @@ napi_value ta_napi_run_in(napi_env env, napi_value script, napi_value context) {
     return ta_napi_call_method(env, &(ta_napi_method){script, "runInContext", 1, &context});
 }
 
-napi_value ta_napi_realm_new(ta_napi_native *native) {
+/* A new context and its kit: its record, or NULL with an exception
+ * pending. Its Object.prototype joins the instance's `realms`. */
+static napi_value ta_napi_realm_new(ta_napi_native *native) {
     napi_env env = native->host->env;
     ta_napi_instance *instance = ta_napi_realm_module(env);
     if (instance == NULL) return NULL;
@@ -158,10 +160,7 @@ napi_value ta_napi_realm_new(ta_napi_native *native) {
     return record;
 }
 
-/* The kit of the realm's script run in the application's realm, made once
- * per environment: what it makes is the application's (instanceof Array
- * holds there). */
-static napi_value ta_napi_realm_application(napi_env env) {
+napi_value ta_napi_realm_application(napi_env env) {
     ta_napi_instance *instance = ta_napi_realm_module(env);
     napi_value kit = NULL, realm, made, args[2], global;
     if (instance == NULL) return NULL;
@@ -234,128 +233,4 @@ napi_value ta_napi_script(ta_napi_native *native, const ta_napi_script_of *of) {
         (options = ta_napi_script_options(env, name)) == NULL)
         return NULL;
     return ta_napi_compile_script(env, &(ta_napi_compiling){vm, source, options});
-}
-
-/* ---- which charts declare ------------------------------------------------------------ */
-
-/* The number of the global object's own names in `context`. */
-static bool ta_napi_global_names(ta_napi_native *native, napi_value context, uint32_t *count) {
-    napi_env env = native->host->env;
-    static const char counting[] = "Object.getOwnPropertyNames(globalThis).length";
-    napi_value script = ta_napi_script(native, &(ta_napi_script_of){{counting, sizeof counting - 1}, {NULL, 0}, {NULL, 0}, 0});
-    napi_value value = script != NULL ? ta_napi_run_in(env, script, context) : NULL;
-    return value != NULL && napi_get_value_uint32(env, value, count) == napi_ok;
-}
-
-/* One run of a script instantiated in `context` without running a
- * statement (`throw 0;` ahead of it): true when it was only that throw;
- * false when instantiating it threw (a redeclaration, a syntax error). */
-static bool ta_napi_probe(ta_napi_native *native, napi_value script, napi_value context) {
-    napi_env env = native->host->env;
-    napi_value thrown = NULL;
-    if (ta_napi_run_in(env, script, context) != NULL) return true;
-    if (napi_get_and_clear_last_exception(env, &thrown) != napi_ok) return false;
-    napi_valuetype type = napi_undefined;
-    double number = -1;
-    return napi_typeof(env, thrown, &type) == napi_ok && type == napi_number &&
-           napi_get_value_double(env, thrown, &number) == napi_ok && number == 0;
-}
-
-bool ta_napi_realm_declares(ta_napi_native *native, ta_napi_chart_of *chart) {
-    napi_env env = native->host->env;
-    chart->declares = chart->lexical = false;
-    chart->hoists = chart->functions = NULL;
-    uint32_t count = ta_image_expression_count(chart->image, chart->chart);
-    napi_value scratch = NULL, context = NULL, kit = NULL, hoists = NULL, strict = NULL, strict_kit = NULL;
-    uint32_t before = 0, after = 0;
-    /* A function declared in a sloppy block (a script in executable
-     * content) is the global's var too (Annex B), and a declaration made
-     * again when the script runs: its name is found as the names a strict
-     * block, which makes no such var, leaves out, in a second scratch
-     * context where every script is instantiated the strict way. */
-    bool blocks = false;
-    for (uint32_t e = 0; e < count && !blocks; e++) {
-        ta_expression_info info;
-        blocks = ta_image_expression(chart->image, (ta_chart_item){chart->chart, e}, &info) == TA_OK &&
-                 info.kind == TA_EXPRESSION_SCRIPT && !ta_napi_strict_directive(info.source);
-    }
-    for (uint32_t e = 0; e < count; e++) {
-        ta_expression_info info;
-        if (ta_image_expression(chart->image, (ta_chart_item){chart->chart, e}, &info) != TA_OK ||
-            (info.kind != TA_EXPRESSION_SCRIPT && info.kind != TA_EXPRESSION_GLOBAL_SCRIPT))
-            continue;
-        if (context == NULL) { /* a scratch context, once per chart that has a script */
-            if ((scratch = ta_napi_realm_new(native)) == NULL ||
-                napi_get_element(env, scratch, TA_NAPI_REALM_CONTEXT, &context) != napi_ok ||
-                napi_get_element(env, scratch, TA_NAPI_REALM_KIT, &kit) != napi_ok ||
-                napi_create_array(env, &hoists) != napi_ok || !ta_napi_global_names(native, context, &before))
-                return false;
-            napi_value made = blocks ? ta_napi_realm_new(native) : NULL;
-            if (blocks && (made == NULL || napi_get_element(env, made, TA_NAPI_REALM_CONTEXT, &strict) != napi_ok ||
-                           napi_get_element(env, made, TA_NAPI_REALM_KIT, &strict_kit) != napi_ok))
-                return false;
-        }
-        /* as the session runs it (ta_napi_evaluate): a script in executable
-         * content in a block, whose lexical declarations are not the global's */
-        static const char ahead[] = "throw 0;\n", ahead_block[] = "throw 0;{\n", ahead_strict[] = "'use strict';throw 0;{\n";
-        bool block = info.kind == TA_EXPRESSION_SCRIPT, directive = block && ta_napi_strict_directive(info.source);
-        ta_napi_script_of block_of = {{directive ? ahead_strict : ahead_block, directive ? sizeof ahead_strict - 1 : sizeof ahead_block - 1},
-                                      info.source, {"\n}", 2}, e};
-        napi_value script = ta_napi_script(native, block ? &block_of
-                                                         : &(ta_napi_script_of){{ahead, sizeof ahead - 1}, info.source, {NULL, 0}, e});
-        if (script == NULL) { /* a syntax error: its evaluation's error.execution */
-            napi_value ignored;
-            napi_get_and_clear_last_exception(env, &ignored);
-            continue;
-        }
-        if (napi_set_element(env, hoists, e, script) != napi_ok) return false;
-        if (strict != NULL) { /* the strict way: a sloppy block's functions make no var there */
-            napi_value strict_script = block && !directive
-                ? ta_napi_script(native, &(ta_napi_script_of){{ahead_strict, sizeof ahead_strict - 1}, info.source, {"\n}", 2}, e})
-                : script;
-            if (strict_script == NULL || !ta_napi_probe(native, strict_script, strict)) { /* not strict code: as it is */
-                napi_value ignored;
-                napi_get_and_clear_last_exception(env, &ignored);
-                ta_napi_probe(native, script, strict);
-                napi_get_and_clear_last_exception(env, &ignored);
-            }
-        }
-        if (!ta_napi_probe(native, script, context)) {
-            chart->declares = chart->lexical = true; /* its declarations clash with the global's */
-            continue;
-        }
-        if (!ta_napi_global_names(native, context, &after)) return false;
-        /* var and function names are the global's now; let, const and class
-         * ones are refused when instantiated again */
-        bool again = ta_napi_probe(native, script, context);
-        chart->declares = chart->declares || after != before || !again;
-        chart->lexical = chart->lexical || !again;
-        before = after;
-    }
-    if (!chart->declares) return true;
-    chart->hoists = hoists;
-    if (strict_kit != NULL) {
-        napi_value strict_names = ta_napi_kit(env, strict_kit, &(ta_napi_kit_call){"globals", 0, {NULL}});
-        chart->functions = strict_names != NULL ? ta_napi_kit(env, kit, &(ta_napi_kit_call){"remade", 1, {strict_names}}) : NULL;
-    } else chart->functions = ta_napi_kit(env, kit, &(ta_napi_kit_call){"functions", 0, {NULL}});
-    return chart->functions != NULL;
-}
-
-bool ta_napi_realm_hoist(ta_napi_native *native, napi_value record, napi_value context) {
-    napi_env env = native->host->env;
-    napi_value hoists, script;
-    uint32_t length = 0;
-    if (napi_get_element(env, record, TA_NAPI_CHART_HOISTS, &hoists) != napi_ok || napi_get_array_length(env, hoists, &length) != napi_ok)
-        return false;
-    for (uint32_t e = 0; e < length; e++) {
-        bool has = false;
-        if (napi_has_element(env, hoists, e, &has) != napi_ok) return false;
-        if (!has) continue;
-        if (napi_get_element(env, hoists, e, &script) != napi_ok) return false;
-        if (!ta_napi_probe(native, script, context)) {
-            napi_throw_error(env, NULL, "a script's declarations could not be made again");
-            return false;
-        }
-    }
-    return true;
 }

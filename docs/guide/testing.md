@@ -20,7 +20,7 @@ between them, and the end.
 
 ```js
 import assert from 'node:assert/strict';
-import { compileCharts, Host, SimulatedClock } from '@tinyactors/node';
+import { compileCharts, Host, SimulatedClock, StaleError } from '@tinyactors/node';
 
 const chart = `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
@@ -46,26 +46,26 @@ function setup() {
   const clock = new SimulatedClock();
   const charges = [];
   const logs = [];
-  const host = new Host({ systemID: 'test', ioProcessors: [{ type: 'urn:example:payments' }] }, {
+  const host = new Host(compiled, {
+    system: 'test',
     clock,
-    ioProcessors: { 'urn:example:payments': (host, send) => charges.push({ at: clock.now, target: send.target }) },
-    log: (host, entry) => logs.push(entry.text),
+    ioProcessors: { 'urn:example:payments': { receive: (send) => charges.push({ at: clock.now, target: send.target }) } },
+    log: (entry) => logs.push(entry.text),
   });
-  host.addImage(compiled.image);
   compiled.close();
   return { host, clock, charges, logs };
 }
 
 /** The actor's state value, read with a typed method. */
-const state = async (host, session) => (await host.actorState({ session })).value;
+const state = async (actor) => (await actor.state()).value;
 
 // It retries every 30 seconds and gives up after three attempts.
 {
   const { host, clock, charges, logs } = setup();
-  const payment = host.spawn(host.chart('payment'), { name: 'payment' });
+  const payment = host.spawn('payment', { name: 'payment' });
   await host.idle();
   assert.deepEqual(charges, [{ at: 0, target: 'card' }]);
-  assert.equal(await state(host, payment), 'charging');
+  assert.equal(await state(payment), 'charging');
 
   clock.increment(30_000);
   await host.idle();
@@ -76,7 +76,7 @@ const state = async (host, session) => (await host.actorState({ session })).valu
   clock.increment(30_000);
   await host.idle();
   assert.deepEqual(logs, ['gave up after 3']);
-  assert.equal(host.actorByName('payment'), undefined, 'a final state ends the actor');
+  assert.throws(() => host.actor('payment'), StaleError, 'a final state ends the actor');
   host.close();
   console.log('ok: retries, then gives up');
 }
@@ -84,11 +84,11 @@ const state = async (host, session) => (await host.actorState({ session })).valu
 // An answer before the timeout ends it, and no timer is left.
 {
   const { host, clock, charges } = setup();
-  const payment = host.spawn(host.chart('payment'), { name: 'payment' });
+  const payment = host.spawn('payment', { name: 'payment' });
   await host.idle();
-  host.send(payment, 'charged');
+  payment.send('charged');
   await host.idle();
-  assert.equal(host.actorByName('payment'), undefined);
+  assert.throws(() => host.actor('payment'), StaleError);
   assert.equal(host.nextDeadline, undefined, 'the timer was cancelled');
   clock.increment(60_000);
   await host.idle();
@@ -103,7 +103,7 @@ ok: retries, then gives up
 ok: an answer ends it
 ```
 
-The test answered by sending `charged` itself with `host.send`, which is
+The test answered by sending `charged` itself with `payment.send`, which is
 what the I/O processor's `send.answer('charged')` would do, without the
 `sendid`. A test may equally answer from the handler.
 
@@ -128,10 +128,9 @@ const compiled = compileCharts([{ name: 'ticker.scxml', text: `
   </state>
 </scxml>` }]);
 const clock = new SimulatedClock();
-const host = new Host({ systemID: 'test' }, { clock, log: (host, entry) => console.log(entry.text, 'at', clock.now) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'test', clock, log: (entry) => console.log(entry.text, 'at', clock.now) });
 compiled.close();
-host.spawn(host.chart('ticker'));
+host.spawn('ticker');
 await host.idle();
 
 clock.increment(3500);             // one jump: one tick
@@ -170,18 +169,17 @@ const compiled = compileCharts([{ name: 'hold.scxml', text: `
   </state>
 </scxml>` }]);
 const clock = new SimulatedClock();
-const host = new Host({ systemID: 'test' }, { clock, log: (host, entry) => console.log(entry.text, 'at', clock.now) });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'test', clock, log: (entry) => console.log(entry.text, 'at', clock.now) });
 compiled.close();
-const actor = host.spawn(host.chart('hold'));
+const actor = host.spawn('hold');
 await host.idle();
 
-host.send(actor, 'reserve');
+actor.send('reserve');
 console.log('nextDeadline right after the input:', host.nextDeadline);
 clock.increment(59_000);          // the input runs now, at 59000: the hold is due at 119000
 await host.idle();
 
-host.send(actor, 'reserve');
+actor.send('reserve');
 await host.idle();                // the input runs at 59000, before the step
 clock.increment(60_000);
 await host.idle();
@@ -203,60 +201,96 @@ Both holds came due at 119000, though the first was given at 0.
 `await host.idle()` waits until the host has nothing to do now and no
 promise your handlers returned is pending. It does not wait for a
 deadline on the runtime's clock, nor for a promise a handler starts and
-does not return, and no call tells you when one actor ends. When a test runs on
-the real clock, wait for the condition itself:
+does not return. When a test runs on the real clock, wait for what it
+asserts: `await actor.done` settles when the actor reaches a top-level
+final state, with its `<donedata>`, and `await actor.ask(event, data)`
+sends an event and settles with the chart's reply.
+
+```js
+import { compileCharts, Host } from '@tinyactors/node';
+
+const compiled = compileCharts([{ name: 'job.scxml', text: `
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       datamodel="ecmascript" name="job" initial="working">
+  <datamodel><data id="progress" expr="0"/></datamodel>
+  <state id="working"><onentry><send event="finish" delay="50ms"/></onentry>
+    <transition event="how"><send event="progress" targetexpr="_event.origin"><content expr="progress"/></send></transition>
+    <transition event="finish" target="done"/>
+  </state>
+  <final id="done"><donedata><content expr="'all done'"/></donedata></final>
+</scxml>` }]);
+const host = new Host(compiled, { system: 'test' });
+compiled.close();
+
+const job = host.spawn('job');
+const [event, data] = await job.ask('how');
+console.log('asked:', event, data);
+await host.idle();
+console.log('after idle():', (await host.actors()).length === 0 ? 'ended' : 'still running');
+console.log('done:', await job.done);
+host.close();
+```
+
+```output
+asked: progress 0
+after idle(): still running
+done: all done
+```
+
+`ask` gives the event an origin the host answers itself: the chart
+replies with `<send targetexpr="_event.origin">`, as it would to another
+actor, and the promise settles with the reply's event name and data.
+`ask(event, data, { signal })` takes an `AbortSignal`; an aborted ask
+rejects with the signal's reason, and its reply, should one come, is
+dropped. A host closed while an ask waits leaves it pending for ever, as
+it does a typed method's promise.
+
+For any other condition, turn the host until it holds:
 
 ```js
 import { compileCharts, Host } from '@tinyactors/node';
 
 /** Turns the host until `condition()` holds, checking every 10 ms. */
 async function until(host, condition, ms = 5000) {
-  for (const end = Date.now() + ms; !condition(); ) {
+  for (const end = Date.now() + ms; !(await condition()); ) {
     if (Date.now() > end) throw new Error('timed out');
     await new Promise((resolve) => setTimeout(resolve, 10));
     await host.idle();
   }
 }
 
-const compiled = compileCharts([{ name: 'job.scxml', text: `
+const compiled = compileCharts([{ name: 'lamp.scxml', text: `
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
-       datamodel="ecmascript" name="job" initial="working">
-  <state id="working"><onentry><send event="finish" delay="50ms"/></onentry>
-    <transition event="finish" target="done"/>
+       datamodel="ecmascript" name="lamp" initial="warming">
+  <state id="warming"><onentry><send event="warm" delay="50ms"/></onentry>
+    <transition event="warm" target="lit"/>
   </state>
-  <final id="done"/>
+  <state id="lit"/>
 </scxml>` }]);
-const host = new Host({ systemID: 'test' });
-host.addImage(compiled.image);
+const host = new Host(compiled, { system: 'test' });
 compiled.close();
 
-host.spawn(host.chart('job'), { name: 'job' });
-await host.idle();
-console.log('after idle():', host.actorByName('job') === undefined ? 'ended' : 'still running');
-await until(host, () => host.actorByName('job') === undefined);
-console.log('after until():', 'ended');
+const lamp = host.spawn('lamp');
+await until(host, async () => (await lamp.state()).value === 'lit');
+console.log('lit');
 host.close();
 ```
 
 ```output
-after idle(): still running
-after until(): ended
+lit
 ```
-
-A chart can also say it is done: a `<send type="urn:test:done">` in its
-final state's `<onentry>`, to an I/O processor the test serves, resolves
-whatever promise the test waits on.
 
 ## Habits that help
 
 - **Await `idle()` after each input** that should have an effect before
   the next assertion. A host runs on the event loop, so nothing has run
-  right after `host.send` returns.
-- **Read state with the typed methods** (`actorState`, `actorContext`)
-  after an `idle()`: they read the host as it is when called
+  right after `actor.send` returns.
+- **Read state with the typed methods** (`actor.state()`,
+  `actor.context()`) after an `idle()`: they read the host as it is when called
   ([Inspecting a host](inspection.md)).
-- **Give actors names** to find them with `actorByName`, and to see that
-  one ended: a final state ends the actor and frees its name.
+- **Give actors names** to find them with `host.actor(name)`, and to see
+  that one ended: a final state ends the actor and frees its name, so
+  `host.actor(name)` throws `StaleError`.
 - **Close every host**, in a `finally` or the test framework's teardown.
   A host on a `SimulatedClock` arms no timer, so a forgotten one does not
   keep the test process alive, but it holds its memory until collected.
@@ -269,4 +303,5 @@ whatever promise the test waits on.
 - **Make an unhandled error fail the test.** A handler that throws is
   reported by the next `await host.idle()`, which rejects
   ([README](../../README.md#errors)), so a test that awaits `idle()`
-  sees it.
+  sees it. A host given `onHandlerError` reports there instead: collect
+  the errors and assert there are none.
